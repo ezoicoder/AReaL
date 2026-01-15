@@ -25,8 +25,54 @@ logger = logging.getLogger("MegatronEngine Test")
 
 
 MODEL_PATH = get_model_path(
-    "/storage/openpsi/models/Qwen__Qwen3-0.6B/", "Qwen/Qwen3-0.6B"
+    "/root/models/Qwen2.5-0.5B", "Qwen/Qwen2.5-0.5B"
 )
+
+# Path to real tree training data
+TREE_DATA_PATH = "/workspace/AReaL/tree-data/math/call2_rank0.pt"
+
+
+@pytest.fixture(scope="module")
+def real_tree_input(device=current_platform.device_type):
+    """Load real tree training data from saved file.
+
+    Returns the full input_data from saved file (no num_samples limit).
+    Additionally, prints out the sequence lengths for inspection.
+    """
+    import os
+    if not os.path.exists(TREE_DATA_PATH):
+        pytest.skip(f"Tree data file not found: {TREE_DATA_PATH}")
+
+    data = torch.load(TREE_DATA_PATH)
+    if "input_data" not in data:
+        pytest.skip(f"No input_data found in {TREE_DATA_PATH}")
+
+    input_data = data["input_data"]
+
+    device_obj = device if isinstance(device, torch.device) else torch.device(device)
+
+    result = {
+        "input_ids": input_data["input_ids"].to(device_obj),
+        "attention_mask": input_data["attention_mask"].to(device_obj),
+    }
+
+    # Output sequence lengths for debugging
+    if "attention_mask" in input_data:
+        attn_mask = input_data["attention_mask"]
+        if attn_mask is not None:
+            seq_lens = attn_mask.sum(dim=1).cpu().tolist()
+            print(f"[real_tree_input] Loaded {attn_mask.shape[0]} sequences.")
+            print(f"[real_tree_input] Sequence lengths: min={min(seq_lens)}, max={max(seq_lens)}, mean={sum(seq_lens)/len(seq_lens):.2f}")
+            # Optionally, print first few lengths for clarity
+            print(f"[real_tree_input] First 10 sequence lengths: {seq_lens[:10]}")
+
+    # Include other fields if present (needed for loss computation)
+    optional_fields = ["loss_mask", "logprobs", "versions", "prox_logp", "returns", "advantages"]
+    for field in optional_fields:
+        if field in input_data:
+            result[field] = input_data[field].to(device_obj)
+
+    return result
 
 
 @pytest.fixture(scope="module")
@@ -886,8 +932,9 @@ fsdp_logger = logging.getLogger("FSDPEngine Test")
 
 
 @pytest.fixture
-def fsdp_engine():
+def fsdp_engine(max_tokens_per_mb):
     fsdp_logger.info(f"torch version={torch.__version__}")
+    fsdp_logger.info(f"FSDP baseline engine using max_tokens_per_mb={max_tokens_per_mb}")
     os.environ.update(
         {
             "WORLD_SIZE": "1",
@@ -901,7 +948,7 @@ def fsdp_engine():
         experiment_name="test",
         trial_name="test",
         path=MODEL_PATH,
-        mb_spec=MicroBatchSpec(max_tokens_per_mb=1024),
+        mb_spec=MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb),
         optimizer=OptimizerConfig(),
         fsdp=FSDPEngineConfig(),
     )
@@ -935,15 +982,28 @@ def _collect_fsdp_parameters(engine: FSDPEngine) -> dict[str, torch.Tensor]:
     return params
 
 
-def test_fsdp_tree_training_forward(fsdp_engine, mock_tree_input):
+def test_fsdp_tree_training_forward(fsdp_engine, real_tree_input, max_tokens_per_mb):
     """Test FSDP tree training forward pass produces correct logprobs."""
+    import time
+    
     fsdp_engine.eval()
+    
+    fsdp_logger.info("=" * 60)
+    fsdp_logger.info("Starting BASELINE engine forward pass...")
+    baseline_start = time.perf_counter()
+    
     logprob_baseline = fsdp_engine.forward_batch(
-        input_=mock_tree_input,
+        input_=real_tree_input,
         aggregate_fn=lambda xs: torch.cat(xs, dim=-1),
     )
+    
+    baseline_end = time.perf_counter()
+    baseline_time = baseline_end - baseline_start
+    fsdp_logger.info(f"BASELINE forward time: {baseline_time:.4f} seconds")
+    fsdp_logger.info("=" * 60)
 
     # Create tree training FSDP engine
+    fsdp_logger.info(f"FSDP tree engine using max_tokens_per_mb={max_tokens_per_mb}")
     os.environ.update(
         {
             "WORLD_SIZE": "1",
@@ -957,7 +1017,7 @@ def test_fsdp_tree_training_forward(fsdp_engine, mock_tree_input):
         experiment_name="test",
         trial_name="test",
         path=MODEL_PATH,
-        mb_spec=MicroBatchSpec(max_tokens_per_mb=1024),
+        mb_spec=MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb),
         optimizer=OptimizerConfig(),
         fsdp=FSDPEngineConfig(),
         enable_tree_training=True,
@@ -970,7 +1030,17 @@ def test_fsdp_tree_training_forward(fsdp_engine, mock_tree_input):
         addr=None, ft_spec=ft_spec, parallel_strategy=alloc_mode.train
     )
     tree_engine.eval()
-    logprob_tree = tree_engine.forward_batch(input_=mock_tree_input)
+    
+    fsdp_logger.info("=" * 60)
+    fsdp_logger.info("Starting TREE engine forward pass...")
+    tree_start = time.perf_counter()
+    
+    logprob_tree = tree_engine.forward_batch(input_=real_tree_input)
+    
+    tree_end = time.perf_counter()
+    tree_time = tree_end - tree_start
+    fsdp_logger.info(f"TREE forward time: {tree_time:.4f} seconds")
+    fsdp_logger.info("=" * 60)
 
     # Check if results match with detailed error reporting
     # The tolerance values are high due to precision problems introduced
@@ -1010,6 +1080,19 @@ def test_fsdp_tree_training_forward(fsdp_engine, mock_tree_input):
             f"mean={abs_diff_all.mean().item():.6f}, median={abs_diff_all.median().item():.6f}"
         )
 
+    # ========== Print timing comparison ==========
+    fsdp_logger.info("")
+    fsdp_logger.info("=" * 60)
+    fsdp_logger.info("PERFORMANCE COMPARISON (Forward Only)")
+    fsdp_logger.info("=" * 60)
+    fsdp_logger.info(f"Baseline engine time: {baseline_time:.4f} seconds")
+    fsdp_logger.info(f"Tree engine time:     {tree_time:.4f} seconds")
+    fsdp_logger.info(f"Time difference:      {tree_time - baseline_time:+.4f} seconds")
+    if baseline_time > 0:
+        speedup = baseline_time / tree_time
+        fsdp_logger.info(f"Speedup ratio:        {speedup:.2f}x")
+    fsdp_logger.info("=" * 60)
+    
     tree_engine.destroy()
 
     assert is_close.all(), (
@@ -1019,12 +1102,15 @@ def test_fsdp_tree_training_forward(fsdp_engine, mock_tree_input):
     )
 
 
-def test_fsdp_tree_training_forward_backward(mock_tree_input):
+def test_fsdp_tree_training_forward_backward(real_tree_input, max_tokens_per_mb):
     """Test FSDP tree training forward-backward pass produces correct gradients."""
+    import time
+    
     def loss_fn(logprobs, entropy, input_data):
         return logprobs.sum()
 
     # ========== Setup baseline FSDP engine ==========
+    fsdp_logger.info(f"FSDP baseline engine using max_tokens_per_mb={max_tokens_per_mb}")
     os.environ.update(
         {
             "WORLD_SIZE": "1",
@@ -1038,7 +1124,7 @@ def test_fsdp_tree_training_forward_backward(mock_tree_input):
         experiment_name="test_baseline",
         trial_name="test",
         path=MODEL_PATH,
-        mb_spec=MicroBatchSpec(max_tokens_per_mb=1024),
+        mb_spec=MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb),
         optimizer=OptimizerConfig(),
         fsdp=FSDPEngineConfig(),
     )
@@ -1053,11 +1139,20 @@ def test_fsdp_tree_training_forward_backward(mock_tree_input):
     baseline_engine.train()
 
     # Run baseline forward-backward
+    fsdp_logger.info("=" * 60)
+    fsdp_logger.info("Starting BASELINE engine forward-backward...")
+    baseline_start = time.perf_counter()
+    
     _ = baseline_engine.train_batch(
-        mock_tree_input,
+        real_tree_input,
         loss_fn=loss_fn,
         loss_weight_fn=lambda x: torch.tensor(1.0, device=baseline_engine.device),
     )
+    
+    baseline_end = time.perf_counter()
+    baseline_time = baseline_end - baseline_start
+    fsdp_logger.info(f"BASELINE forward-backward time: {baseline_time:.4f} seconds")
+    fsdp_logger.info("=" * 60)
 
     # Collect baseline gradients and parameters
     baseline_grads = _collect_fsdp_gradients(baseline_engine)
@@ -1068,6 +1163,7 @@ def test_fsdp_tree_training_forward_backward(mock_tree_input):
     baseline_engine.destroy()
 
     # ========== Setup tree training FSDP engine ==========
+    fsdp_logger.info(f"FSDP tree engine using max_tokens_per_mb={max_tokens_per_mb}")
     os.environ.update(
         {
             "WORLD_SIZE": "1",
@@ -1081,7 +1177,7 @@ def test_fsdp_tree_training_forward_backward(mock_tree_input):
         experiment_name="test_tree",
         trial_name="test",
         path=MODEL_PATH,
-        mb_spec=MicroBatchSpec(max_tokens_per_mb=1024),
+        mb_spec=MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb),
         optimizer=OptimizerConfig(),
         fsdp=FSDPEngineConfig(),
         enable_tree_training=True,
@@ -1095,11 +1191,20 @@ def test_fsdp_tree_training_forward_backward(mock_tree_input):
     tree_engine.train()
 
     # Run tree training forward-backward
+    fsdp_logger.info("=" * 60)
+    fsdp_logger.info("Starting TREE engine forward-backward...")
+    tree_start = time.perf_counter()
+    
     _ = tree_engine.train_batch(
-        mock_tree_input,
+        real_tree_input,
         loss_fn=loss_fn,
         loss_weight_fn=lambda x: torch.tensor(1.0, device=tree_engine.device),
     )
+    
+    tree_end = time.perf_counter()
+    tree_time = tree_end - tree_start
+    fsdp_logger.info(f"TREE forward-backward time: {tree_time:.4f} seconds")
+    fsdp_logger.info("=" * 60)
 
     # Collect tree training gradients and parameters
     tree_grads = _collect_fsdp_gradients(tree_engine)
@@ -1189,6 +1294,19 @@ def test_fsdp_tree_training_forward_backward(mock_tree_input):
                 f"Max diff: {max_diff:.6e}, Mean diff: {mean_diff:.6e}"
             )
 
+    # ========== Print timing comparison ==========
+    fsdp_logger.info("")
+    fsdp_logger.info("=" * 60)
+    fsdp_logger.info("PERFORMANCE COMPARISON")
+    fsdp_logger.info("=" * 60)
+    fsdp_logger.info(f"Baseline engine time: {baseline_time:.4f} seconds")
+    fsdp_logger.info(f"Tree engine time:     {tree_time:.4f} seconds")
+    fsdp_logger.info(f"Time difference:      {tree_time - baseline_time:+.4f} seconds")
+    if baseline_time > 0:
+        speedup = baseline_time / tree_time
+        fsdp_logger.info(f"Speedup ratio:        {speedup:.2f}x")
+    fsdp_logger.info("=" * 60)
+    
     assert len(only_in_baseline) == 0, (
         f"Gradients missing in tree training: {only_in_baseline}"
     )

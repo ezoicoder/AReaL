@@ -495,8 +495,10 @@ class FSDPEngine(TrainEngine):
         for mb_item in mb_list:
             inputs, ctx = self._prepare_mb_inputs(mb_item)
 
-            # XXX: temp hack
-            inputs["full_attention_mask"] = inputs["attention_mask"].clone()
+            # XXX: temp hack - only needed for tree training
+            print(f"enable_tree_training: {self.enable_tree_training}, rank: {dist.get_rank()}")
+            if self.enable_tree_training:
+                inputs["full_attention_mask"] = inputs["attention_mask"].clone()
             with trace_scope("fsdp_engine.forward"):
                 outputs = self.model(**inputs)
             logits = outputs.logits.squeeze(0)
