@@ -474,6 +474,7 @@ def split_padded_tensor_dict_into_mb_list(
     data: dict[str, Any],
     mb_spec: MicroBatchSpec,
     group: dist.ProcessGroup | None = None,
+    one_seq_per_mb: bool = False,
 ) -> MicroBatchList:
     """Split a padded dict of tensors into micro-batches based on the attention mask.
 
@@ -481,6 +482,7 @@ def split_padded_tensor_dict_into_mb_list(
         data (Dict): Dictionary containing padded tensors.
         mb_spec (MicroBatchSpec): Specification for micro-batch splitting.
         group (Optional[dist.ProcessGroup]): Process group for distributed synchronization.
+        one_seq_per_mb (bool): If True, each micro-batch contains only one sequence.
 
     Returns:
         MicroBatchList: A structure containing the split micro-batches and metadata.
@@ -525,13 +527,18 @@ def split_padded_tensor_dict_into_mb_list(
             not_to_split[key] = value
 
     # split
-    group_indices = allocate_balanced_mbs_synced(mb_spec, input_lens, group=group)
-    group_indices = [
-        datapack.flat2d(
-            [list(range(i * granularity, (i + 1) * granularity)) for i in group_index]
-        )
-        for group_index in group_indices
-    ]
+    if one_seq_per_mb:
+        # Single sequence per microbatch mode (assumes granularity=1)
+        group_indices = [[i] for i in range(bs)]
+    else:
+        # Original multi-sequence packing mode
+        group_indices = allocate_balanced_mbs_synced(mb_spec, input_lens, group=group)
+        group_indices = [
+            datapack.flat2d(
+                [list(range(i * granularity, (i + 1) * granularity)) for i in group_index]
+            )
+            for group_index in group_indices
+        ]
     splitted_lens = [
         [seq_lens[i] for i in group_index] for group_index in group_indices
     ]

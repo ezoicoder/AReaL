@@ -42,7 +42,7 @@ from transformers import (
 )
 
 from areal.api.alloc_mode import FSDPParallelStrategy, ParallelStrategy
-from areal.api.cli_args import PerfTracerConfig, TrainEngineConfig
+from areal.api.cli_args import MicroBatchSpec, PerfTracerConfig, TrainEngineConfig
 from areal.api.engine_api import InferenceEngine, TrainEngine
 from areal.api.io_struct import (
     DeviceRuntimeInfo,
@@ -190,6 +190,8 @@ class FSDPEngine(TrainEngine):
 
         self.is_offload: bool = False
         self.enable_tree_training: bool = self.config.enable_tree_training
+        self.enable_tree_attn_training: bool = self.config.enable_tree_attn_training
+        assert not (self.enable_tree_training and self.enable_tree_attn_training), "Tree training and tree attention training cannot be enabled at the same time."
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
         patch_dist_group_timeout(DIST_GROUP_DEFAULT_TIMEOUT)
@@ -520,11 +522,12 @@ class FSDPEngine(TrainEngine):
             }
             loss = process_output_fn(logits, ctx_dict)
             loss_sum += loss if loss is not None else 0.0
-            print(f"[Debug] loss value = {loss}, loss_sum = {loss_sum.item()}")
+            # print(f"[Debug] loss value = {loss}, loss_sum = {loss_sum.item()}")
 
             if not forward_only and loss is not None:
                 with trace_scope("fsdp_engine.backward"):
                     loss.backward()
+        print(f"[Debug] Final loss_sum in forward_backward_batch = {loss_sum.item()}")
 
     def train_batch(
         self,
@@ -542,6 +545,35 @@ class FSDPEngine(TrainEngine):
         total_loss_weight = compute_total_loss_weight(
             mb_list, loss_weight_fn, self.dp_group
         )
+
+        if self.enable_tree_attn_training:
+            input_data = []
+            loss_weight = []
+            for mb_item in mb_list:
+                inputs, ctx = self._prepare_mb_inputs(mb_item)
+                loss_weight.append(loss_weight_fn(ctx.mb_input) / total_loss_weight * self.parallel_helper.dp_size)
+                input_data.append(ctx.mb_input)
+
+            # TODO: replace with the tree attn engine  # step3 之后测试时需替换
+
+            # Step 3: Forward-backward using process_output_fn callback
+            def process_output(
+                logits: torch.Tensor, ctx_dict: dict[str, Any]
+            ) -> torch.Tensor:
+                ctx = FSDPTrainContext(**ctx_dict)
+                return self._compute_logprobs_and_loss(
+                    logits,
+                    ctx,
+                    loss_fn,
+                    loss_weight_fn,
+                    total_loss_weight,
+                    loss_multiplier=self.parallel_helper.dp_size,
+                )
+
+            self.forward_backward_batch(mb_list, process_output, forward_only=False)
+
+            # Step 4: Optimizer step
+            return self.optimizer_step()
 
         # Step 3: Forward-backward using process_output_fn callback
         def process_output(
@@ -610,6 +642,9 @@ class FSDPEngine(TrainEngine):
     ) -> torch.Tensor:
         self._ensure_ready()
 
+        if self.enable_tree_attn_training:
+            # TODO: replace with the tree attn engine  with input_
+            pass
         # Step 1: Prepare sequence lengths
         cu_seqlens = pack_tensor_dict(input_)["cu_seqlens"]
         if output_seqlens is None:
@@ -1247,7 +1282,19 @@ class FSDPEngine(TrainEngine):
         else:
             input_ = amend_position_ids(input_)
 
-        mb_list = split_padded_tensor_dict_into_mb_list(input_, self.config.mb_spec)
+        if self.enable_tree_attn_training:
+            # Force granularity=1 for single-sequence-per-microbatch mode
+            mb_spec = self.config.mb_spec
+            if mb_spec.granularity != 1:
+                self.logger.warning(
+                    f"one_seq_per_mb mode requires granularity=1, but got {mb_spec.granularity}. "
+                    f"Overriding to granularity=1 for tree attention training."
+                )
+                mb_spec = MicroBatchSpec.new(mb_spec, granularity=1)
+            mb_list = split_padded_tensor_dict_into_mb_list(input_, mb_spec, one_seq_per_mb=True)
+            assert len(mb_list.mbs) == input_["input_ids"].shape[0], "Number of micro-batches should be equal to the number of sequences in the input."
+        else:
+            mb_list = split_padded_tensor_dict_into_mb_list(input_, self.config.mb_spec)
         mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
         mb_list = pad_mb_list(
             mb_list,
@@ -1521,8 +1568,8 @@ class FSDPEngine(TrainEngine):
             loss = loss_fn(values, ctx.mb_input)
 
         loss_scale = loss_weight_fn(ctx.mb_input) / total_loss_weight * loss_multiplier
-        print(f"[debug] loss_weight_fn(ctx.mb_input)={loss_weight_fn(ctx.mb_input).item()}, total_loss_weight={total_loss_weight.item()}")
-        print(f"[debug] Loss: {loss.item()}, Loss scale: {loss_scale.item()}, final result: {(loss * loss_scale).item()}")
+        # print(f"[debug] loss_weight_fn(ctx.mb_input)={loss_weight_fn(ctx.mb_input).item()}, total_loss_weight={total_loss_weight.item()}")
+        # print(f"[debug] Loss: {loss.item()}, Loss scale: {loss_scale.item()}, final result: {(loss * loss_scale).item()}")
 
         return loss * loss_scale
 

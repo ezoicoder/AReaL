@@ -781,6 +781,11 @@ class TrainEngineConfig:
         metadata={"help": "Enable tree training with flex attention module."},
     )
 
+    enable_tree_attn_training: bool = field(
+        default=False,
+        metadata={"help": "Enable tree attention (dfs+ stack) training."},
+    )
+
     # Scheduling
     scheduling_spec: tuple[SchedulingSpec, ...] = field(
         default_factory=lambda: (
