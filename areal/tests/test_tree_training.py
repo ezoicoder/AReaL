@@ -1474,6 +1474,9 @@ def test_fsdp_tree_attn_forward_backward(real_tree_input):
     # def loss_fn(logprobs, entropy, input_data):
     #     return -logprobs.mean()
 
+    # def loss_fn(logprobs, entropy, input_data):
+    #     return torch.tensor(0.0, device=logprobs.device, requires_grad=True)
+
     # ========== Setup baseline FSDP engine ==========
     os.environ.update(
         {

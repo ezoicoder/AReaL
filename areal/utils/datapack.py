@@ -4,6 +4,7 @@ from typing import Any
 
 import numba
 import numpy as np
+import torch
 
 
 def flat2d(arr: list[list[Any]]) -> list[Any]:
@@ -206,6 +207,39 @@ def ffd_allocate(
                 f"min_groups {min_groups} and n_groups_divisor {n_groups_divisor}."
             )
     return res
+
+
+def tree_allocate(
+    all_input_ids: list[torch.Tensor],
+    n_groups: int,
+) -> list[list[int]]:
+    """A CPython interface for tree-based sequence allocation.
+    
+    This function should be implemented in C++ for performance.
+    
+    Parameters
+    ----------
+    all_input_ids : list[torch.Tensor]
+        List of unpadded input_ids tensors, each with shape [seq_len].
+    n_groups : int
+        Number of groups (DP ranks) to allocate into.
+        
+    Returns
+    -------
+    list[list[int]]
+        Assignment of sequence indices to each group.
+    """
+    # TODO(agent): This is a placeholder for the C++ implementation.
+    # The user will provide the actual C++ code and CPython binding.
+    try:
+        from areal._C import tree_allocate as _tree_allocate
+        return _tree_allocate(all_input_ids, min_groups)
+    except (ImportError, AttributeError):
+        # Fallback to a simple balanced allocation if C++ is not available
+        # or just raise an error as requested by the user's intent to use C++
+        raise NotImplementedError(
+            "tree_allocate C++ extension not found. Please compile the C++ extension."
+        )
 
 
 if __name__ == "__main__":

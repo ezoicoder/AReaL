@@ -15,7 +15,7 @@ from areal.utils.data import (
     concat_padded_tensors,
     tensor_container_to,
 )
-from areal.utils.datapack import ffd_allocate
+from areal.utils.datapack import ffd_allocate, tree_allocate
 
 
 @dataclass
@@ -51,6 +51,7 @@ def _remove_padding_from_trajectory(d: dict[str, Any]) -> dict[str, Any]:
 def redistribute_trajectories(
     trajectories: list[dict[str, Any]],
     group=None,
+    is_tree_attn_training: bool = False,
 ) -> RedistributedData:
     """Redistribute a list of trajectory dicts across a process group.
 
@@ -65,6 +66,9 @@ def redistribute_trajectories(
         contains tensors with shape [batch_size, seqlen, ...].
     group : dist.ProcessGroup, optional
         The process group for communication. If None, uses the default group.
+    is_tree_attn_training : bool, optional
+        If True, redistributes at the sequence level instead of trajectory level,
+        using a specialized tree-based allocation algorithm. Default is False.
 
     Returns
     -------
@@ -83,6 +87,29 @@ def redistribute_trajectories(
     for traj_list in all_gathered:
         all_data.extend(traj_list)
 
+    if is_tree_attn_training:
+        ## TODO:temp hack
+        pass
+
+        # # Split trajectories into individual sequences for finer granularity
+        # all_sequences = []
+        # for d in all_data:
+        #     batch_size = d["attention_mask"].shape[0]
+        #     for i in range(batch_size):
+        #         seq_d = {
+        #             k: v[i : i + 1] if torch.is_tensor(v) and v.ndim > 0 else v
+        #             for k, v in d.items()
+        #         }
+        #         # Remove padding to get valid tokens only
+        #         seq_d = _remove_padding_from_trajectory(seq_d)
+        #         all_sequences.append(seq_d)
+        # all_data = all_sequences
+
+        # # Prepare input for C++ allocation: list of unpadded input_ids
+        # all_input_ids = [s["input_ids"].squeeze(0) for s in all_data]
+
+        # # Call specialized CPython allocation interface
+        # group_indices = tree_allocate(all_input_ids, dist.get_world_size(group))
     # Compute sequence lengths for load balancing
     seqlens = [d["attention_mask"].sum().item() for d in all_data]
 
@@ -95,6 +122,7 @@ def redistribute_trajectories(
     group_indices = ffd_allocate(
         seqlens, capacity=int(1e12), min_groups=dist.get_world_size(group)
     )
+
     local_indices = group_indices[dist.get_rank(group=group)]
 
     # Concatenate assigned trajectories for this rank
@@ -115,6 +143,7 @@ class DistRolloutCoordinator:
     def _broadcast_and_redistribute_trajectories(
         self,
         trajectories: list[dict[str, Any]] | None,
+        is_tree_attn_training: bool = False,
     ) -> dict[str, Any]:
         """Broadcast and redistribute trajectories across distributed workers.
 
@@ -129,6 +158,8 @@ class DistRolloutCoordinator:
             List of trajectory dicts from data parallel head, None for other ranks.
             Each trajectory is a dict of tensors with shape [batch_size, seqlen, ...],
             where batch_size can vary per trajectory.
+        is_tree_attn_training : bool, optional
+            Whether to use tree-based sequence-level redistribution.
 
         Returns
         -------
@@ -139,6 +170,7 @@ class DistRolloutCoordinator:
             redist = redistribute_trajectories(
                 trajectories,
                 group=self.train_engine.data_parallel_group,
+                is_tree_attn_training=is_tree_attn_training,
             )
             batch = redist.data
         else:
@@ -220,6 +252,7 @@ class DistRolloutCoordinator:
         should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
         group_size: int = 1,
         dynamic_bs: bool = False,
+        is_tree_attn_training: bool = False,
     ) -> dict[str, Any]:
         """Prepare async rollout batch with distributed coordination.
 
@@ -243,6 +276,8 @@ class DistRolloutCoordinator:
             Default is 1 (no grouping).
         dynamic_bs : bool, optional
             If True, enables dynamic batch sizing. Default is False.
+        is_tree_attn_training : bool, optional
+            Whether to use tree-based sequence-level redistribution.
 
         Returns
         -------
@@ -269,4 +304,6 @@ class DistRolloutCoordinator:
                 trajectories, current_platform.current_device()
             )
 
-        return self._broadcast_and_redistribute_trajectories(trajectories)
+        return self._broadcast_and_redistribute_trajectories(
+            trajectories, is_tree_attn_training=is_tree_attn_training
+        )
