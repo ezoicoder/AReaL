@@ -3,7 +3,7 @@ trial_name: run1
 
 cluster:
   fileroot: /storage/openpsi/users/meizhiyu.mzy/experiments
-  n_nodes: 4
+  n_nodes: 2
   n_gpus_per_node: 8
   name_resolve:
     type: nfs
@@ -12,11 +12,11 @@ seed: 1
 total_train_epochs: 10
 total_train_steps: 1000
 tokenizer_path: ${actor.path}
-allocation_mode: sglang.d24+d8
+allocation_mode: sglang:d8+d8
 
 max_turns: 32
 force_turns: 4
-search_client_type: async-search-access
+search_client_type: async-online-search-access
 topk: 10
 judge_engine:
   experiment_name: mzy-asearcher-qwen72b-inst-server-only
@@ -45,17 +45,17 @@ rollout:
 gconfig:
   n_samples: 16
   min_new_tokens: 0
-  max_new_tokens: 1024
+  max_new_tokens: 8192
   greedy: false
   temperature: 1.0
 
 actor:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  path: /storage/openpsi/models/Qwen__Qwen2.5-7B-Instruct/
+  path: /storage/openpsi/models/Qwen__Qwen3-8B/
   init_from_scratch: false
   disable_dropout: true
-  gradient_checkpointing: true  # Enable for 7B to save memory
+  gradient_checkpointing: true
   dtype: bfloat16
   mb_spec:
     max_tokens_per_mb: 16384
@@ -109,6 +109,8 @@ actor:
         WANDB_BASE_URL: http://8.150.1.98:8080
         WANDB_API_KEY: local-8726acfd20a41b5ab8ac35fd51014b15169fa20a
         RAG_SERVER_ADDR_DIR: /storage/openpsi/users/meizhiyu.mzy/workspace/rag_addr
+        JINA_API_KEY: <placeholder_for_jina_api_key>
+        SERPER_API_KEY: <placeholder_for_serper_api_key>
 
 ref:
   experiment_name: ${experiment_name}

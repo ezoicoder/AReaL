@@ -504,9 +504,15 @@ class FSDPEngine(TrainEngine):
         for mb_item in mb_list:
             inputs, ctx = self._prepare_mb_inputs(mb_item)
 
-            # XXX: temp hack
+            # Pass block_mask or attention_mask for tree training
             if self.enable_tree_training:
-                inputs["full_attention_mask"] = inputs["attention_mask"].clone()
+                if "block_mask" in inputs:
+                    # block_mask is pre-created in build_packed_tree_batch
+                    # Pass it directly to the model
+                    inputs["block_mask"] = inputs["block_mask"]
+                elif "attention_mask" in inputs:
+                    # Fallback: when USE_BLOCK_MASK=False, attention_mask is dense
+                    inputs["full_attention_mask"] = inputs["attention_mask"]
             with trace_scope("fsdp_engine.forward"):
                 outputs = self.model(**inputs)
             logits = outputs.logits.squeeze(0)
@@ -554,6 +560,7 @@ class FSDPEngine(TrainEngine):
         )
 
         if self.enable_tree_attn_training:
+            print(f"[Debug] enable_tree_attn_training in train_batch is True")
 
             input_data = []
             for mb_item in mb_list:
@@ -661,6 +668,7 @@ class FSDPEngine(TrainEngine):
         self._ensure_ready()
 
         if self.enable_tree_attn_training:
+            print(f"[Debug] enable_tree_attn_training in forward_batch is True")
             # Tree attention forward: use TreeForwardEngine for batched inference
             # Extract valid sequences and build TokenTrie for shared prefix optimization
             input_ids_batch = input_["input_ids"]  # [batch_size, seq_len]

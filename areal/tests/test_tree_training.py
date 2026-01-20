@@ -29,7 +29,7 @@ MODEL_PATH = get_model_path(
 )
 
 # Path to real tree training data
-TREE_DATA_PATH = "/data/tree/tree-data/tau2/call2_rank0.pt"
+TREE_DATA_PATH = "/data/tree/tree-data/math/call2_rank0.pt"
 
 
 @pytest.fixture(scope="module")
@@ -1491,7 +1491,7 @@ def test_fsdp_tree_attn_forward_backward(real_tree_input):
         experiment_name="test_baseline",
         trial_name="test",
         path=MODEL_PATH,
-        mb_spec=MicroBatchSpec(max_tokens_per_mb=15104),
+        mb_spec=MicroBatchSpec(max_tokens_per_mb=3072),
         optimizer=OptimizerConfig(),
         fsdp=FSDPEngineConfig(),
     )
@@ -1543,7 +1543,7 @@ def test_fsdp_tree_attn_forward_backward(real_tree_input):
         experiment_name="test_tree",
         trial_name="test",
         path=MODEL_PATH,
-        mb_spec=MicroBatchSpec(max_tokens_per_mb=15104),
+        mb_spec=MicroBatchSpec(max_tokens_per_mb=3072),
         optimizer=OptimizerConfig(),
         fsdp=FSDPEngineConfig(),
         enable_tree_attn_training=True,

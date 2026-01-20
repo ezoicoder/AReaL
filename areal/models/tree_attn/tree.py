@@ -358,7 +358,7 @@ def build_packed_tree_batch(
             )
 
         # Validate padding constraints when using block masks
-        from areal.models.tree_attn.module import BLOCK_SIZE, USE_BLOCK_MASK
+        from areal.models.tree_attn.module import BLOCK_SIZE, USE_BLOCK_MASK, create_block_mask_from_dense
         if USE_BLOCK_MASK:
             no_padding = not pad_to_maximum and pad_to_multiple_of <= 1
             if no_padding:
@@ -468,12 +468,25 @@ def build_packed_tree_batch(
                     mask_template.device,
                 )
 
-            # Amend position_ids
+            # Create block mask early and release dense mask memory when USE_BLOCK_MASK is True
+            block_mask = None
+            if USE_BLOCK_MASK:
+                with trace_scope("tree_attn.create_block_mask"):
+                    block_mask = create_block_mask_from_dense(
+                        attention_mask, padded_size, mask_template.device
+                    )
+
+            # Amend position_ids (needs dense attention_mask)
             with trace_scope("tree_attn.get_position_ids"):
                 position_ids = get_packed_tree_position_ids(
                     input_ids,
                     attention_mask,
                 )
+
+            # Release dense attention mask memory after position_ids are computed
+            # when using block masks
+            if USE_BLOCK_MASK:
+                del attention_mask
 
             # Pack extra data
             with trace_scope("tree_attn.pack_extra_data"):
@@ -486,13 +499,23 @@ def build_packed_tree_batch(
                 )
 
             # Build micro-batch dict
-            mb = {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-                "trie_node": trie,
-                **extra_data,
-            }
+            # Store block_mask instead of attention_mask when USE_BLOCK_MASK is True
+            if USE_BLOCK_MASK:
+                mb = {
+                    "input_ids": input_ids,
+                    "block_mask": block_mask,
+                    "position_ids": position_ids,
+                    "trie_node": trie,
+                    **extra_data,
+                }
+            else:
+                mb = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                    "trie_node": trie,
+                    **extra_data,
+                }
             mbs.append(mb)
             padding_lengths.append(padded_size - num_tokens)
             padded_to_lengths.append(padded_size)

@@ -12,11 +12,11 @@ seed: 1
 total_train_epochs: 10
 total_train_steps: 1000
 tokenizer_path: ${actor.path}
-allocation_mode: sglang:d6+d2
+allocation_mode: sglang:d4+d4
 
-max_turns: 16
+max_turns: 32
 force_turns: 4
-search_client_type: async-search-access
+search_client_type: async-online-search-access
 topk: 5
 judge_engine:
   experiment_name: mzy-asearcher-qwen72b-inst-server-only
@@ -29,6 +29,7 @@ judge_engine:
   scheduling_spec: ${actor.scheduling_spec}
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
+dump_dir: /storage/openpsi/users/meizhiyu.mzy/asearcher_dumps/${experiment_name}/${trial_name}
 
 rollout:
   experiment_name: ${experiment_name}
@@ -43,19 +44,19 @@ rollout:
   tokenizer_path: ${tokenizer_path}
 
 gconfig:
-  n_samples: 4
+  n_samples: 8
   min_new_tokens: 0
-  max_new_tokens: 1024
+  max_new_tokens: 8192
   greedy: false
   temperature: 1.0
 
 actor:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  path: /storage/openpsi/models/Qwen__Qwen2-1.5B-Instruct/
+  path: /storage/openpsi/models/Qwen__Qwen3-1.7B/
   init_from_scratch: false
   disable_dropout: true
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   dtype: bfloat16
   mb_spec:
     max_tokens_per_mb: 16384
@@ -92,8 +93,8 @@ actor:
       mem: 32
       cmd: python3 -m areal.scheduler.rpc.rpc_server
       env_vars:
-        # JINA_API_KEY: jina_89db187a69f44004ae58fd7ff1615232FbzlayNZYcsAHd7zW3-1H8KGXmIF
-        SERPER_API_KEY: 607608ef262aa0020bd69512b4c6a60eb53fb4a5
+        JINA_API_KEY: <placeholder_for_jina_api_key>
+        SERPER_API_KEY: <placeholder_for_serper_api_key>
 
 ref:
   experiment_name: ${experiment_name}
@@ -126,7 +127,7 @@ vllm:
 
 # datasets
 train_dataset:
-  batch_size: 16
+  batch_size: 128
   shuffle: true
   pin_memory: true
   type: rl

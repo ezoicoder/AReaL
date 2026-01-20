@@ -18,5 +18,5 @@ srun --mpi=pmi2 -J mzy-asearcher --chdir /storage/openpsi/users/meizhiyu.mzy/wor
     /storage/openpsi/images/areal-latest.sif \
     bash -c "python3 -m areal.launcher.local examples/search_agent/asearcher/train.py \
         --config experiments/asearcher/config.yaml \
-        expr_name=$expr_name \
+        experiment_name=$expr_name \
         trial_name=$trial_name"
