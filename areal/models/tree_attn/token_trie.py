@@ -136,3 +136,64 @@ class TokenTrie:
         self.n_tokens = sum(len(ids) for ids in inputs)
         self.n_leafed_tokens = sum(len(ids) for ids in self.inputs)
         self.n_tree_tokens = self.n_leafed_tokens - sum(self.lcp_lens)
+
+    def try_devide(self, tree_token_limit: int) -> List[List[int]] | None:
+        """
+        Try to divide the sequences such that each part does not exceed
+        the given tree_token_limit.
+        
+        If successful, return the division result (list of original 
+        sequence IDs for each part); otherwise return None.
+        """
+
+        lens = [len(ids) for ids in self.inputs]
+        divs = [-1]
+
+        cur_tree_tokens = lens[0]
+        for i in range(1, len(lens)):
+            new_tree_tokens = lens[i] - self.lcp_lens[i-1]
+            if cur_tree_tokens + new_tree_tokens > tree_token_limit:
+                divs.append(i)
+                cur_tree_tokens = lens[i]
+                if cur_tree_tokens > tree_token_limit:
+                    return None
+            else:
+                cur_tree_tokens += new_tree_tokens
+
+        divs.append(len(lens))
+        
+        parts = []
+        for i in range(len(divs)-1):
+            part = []
+            for j in range(divs[i]+1, divs[i+1]):
+                for attachment in self.attach_lists[j]:
+                    part.append(attachment['_sequence_batch_id'])
+            parts.append(part)
+        
+        return parts
+                
+    def divide(self, n_parts: int):
+        """
+        Divide the sequences into n_parts such that the maximum tree tokens
+        in each part is minimized.
+
+        Returns:
+            parts: List[List[int]]
+                List of parts, where each part is a list of original
+                sequence IDs.
+        """
+        
+        L = self.n_tree_tokens // n_parts
+        R = self.n_tree_tokens
+
+        while L < R:
+            mid = (L + R) // 2
+            parts = self.try_devide(mid)
+            if parts is not None and len(parts) <= n_parts:
+                R = mid
+            else:
+                L = mid + 1
+
+        parts = self.try_devide(R)
+        print(parts)
+        return parts

@@ -88,40 +88,38 @@ def redistribute_trajectories(
         all_data.extend(traj_list)
 
     if is_tree_attn_training:
-        ## TODO:temp hack
-        pass
+        # Split trajectories into individual sequences for finer granularity
+        all_sequences = []
+        for d in all_data:
+            batch_size = d["attention_mask"].shape[0]
+            for i in range(batch_size):
+                seq_d = {
+                    k: v[i : i + 1] if torch.is_tensor(v) and v.ndim > 0 else v
+                    for k, v in d.items()
+                }
+                # Remove padding to get valid tokens only
+                seq_d = _remove_padding_from_trajectory(seq_d)
+                all_sequences.append(seq_d)
+        all_data = all_sequences
 
-        # # Split trajectories into individual sequences for finer granularity
-        # all_sequences = []
-        # for d in all_data:
-        #     batch_size = d["attention_mask"].shape[0]
-        #     for i in range(batch_size):
-        #         seq_d = {
-        #             k: v[i : i + 1] if torch.is_tensor(v) and v.ndim > 0 else v
-        #             for k, v in d.items()
-        #         }
-        #         # Remove padding to get valid tokens only
-        #         seq_d = _remove_padding_from_trajectory(seq_d)
-        #         all_sequences.append(seq_d)
-        # all_data = all_sequences
+        # Prepare input for C++ allocation: list of unpadded input_ids
+        all_input_ids = [s["input_ids"].squeeze(0) for s in all_data]
 
-        # # Prepare input for C++ allocation: list of unpadded input_ids
-        # all_input_ids = [s["input_ids"].squeeze(0) for s in all_data]
+        # Call specialized CPython allocation interface
+        group_indices = tree_allocate(all_input_ids, dist.get_world_size(group))
+    else:
+        # Compute sequence lengths for load balancing
+        seqlens = [d["attention_mask"].sum().item() for d in all_data]
 
-        # # Call specialized CPython allocation interface
-        # group_indices = tree_allocate(all_input_ids, dist.get_world_size(group))
-    # Compute sequence lengths for load balancing
-    seqlens = [d["attention_mask"].sum().item() for d in all_data]
+        # Remove pad positions from each trajectory
+        for d in all_data:
+            _remove_padding_from_trajectory(d)
 
-    # Remove pad positions from each trajectory
-    for d in all_data:
-        _remove_padding_from_trajectory(d)
-
-    # Allocate trajectories to ranks using first-fit-decreasing
-    # No capacity limit leads to balanced partition across this group
-    group_indices = ffd_allocate(
-        seqlens, capacity=int(1e12), min_groups=dist.get_world_size(group)
-    )
+        # Allocate trajectories to ranks using first-fit-decreasing
+        # No capacity limit leads to balanced partition across this group
+        group_indices = ffd_allocate(
+            seqlens, capacity=int(1e12), min_groups=dist.get_world_size(group)
+        )
 
     local_indices = group_indices[dist.get_rank(group=group)]
 
