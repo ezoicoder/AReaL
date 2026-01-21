@@ -1,3 +1,23 @@
+# tree-attn
+**gradient_checkpoint 和 enable_tree_attn_training 不能同时存在**
+
+在 2xA100(40G) 配置上，可用如下方式启动三种不同的训练模式：
+
+```bash
+cd AReaL
+
+# 启动 baseline
+bash examples/multi_turn_math/baseline.sh
+
+# 启动 tree_flex
+bash examples/multi_turn_math/tree_flex.sh
+
+# 启动 tree_attn
+bash examples/multi_turn_math/tree_attn.sh
+```
+
+每个脚本分别对应不同的训练配置和训练模式。
+
 # Training a Multi-Turn GSM8K Math Agent in AReaL
 
 Files in this folder presents an example that train a multi-turn GSM8K math agent from
