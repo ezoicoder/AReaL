@@ -110,7 +110,7 @@ class TokenTrie:
             part = []
             for j in range(divs[i]+1, divs[i+1]):
                 for attachment in self.attach_lists[j]:
-                    part.append(attachment['_sequence_batch_id'])
+                    part.append(attachment[0]['_sequence_batch_id'])
             parts.append(part)
         
         return parts

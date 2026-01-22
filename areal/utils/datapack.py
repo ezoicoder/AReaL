@@ -233,7 +233,17 @@ def tree_allocate(
     """
     print(f"Tree-based sequence allocation: allocating {len(all_input_ids)} sequences into {n_groups} groups")
     trie = TokenTrie(all_input_ids, sorted=False)
-    return trie.divide(n_groups)
+
+    total_sum=0
+    maximum=0
+    Ans=trie.divide(n_groups)
+    for group in Ans:
+        tmp = sum(all_input_ids[i].shape[0] for i in group)
+        total_sum = total_sum + tmp
+        maximum=max(maximum, tmp)
+    assert len(Ans) == n_groups,f"n_groups {n_groups} is not equal to the number of allocated groups {len(Ans)}"
+    print(f"Tree-based sequence allocation: allocating {len(all_input_ids)} sequences into {len(Ans)} groups, sum={total_sum}, maximum={maximum}")
+    return Ans
 
 
 if __name__ == "__main__":
