@@ -114,8 +114,7 @@ from areal.utils.ulysses import (
 )
 
 from areal.models.tree_attn.token_trie import TokenTrie
-from areal.models.tree_attn.tree_backward import TreeBackwardEngine
-from areal.models.tree_attn.tree_forward import TreeForwardEngine
+from areal.models.tree_attn.tree_stack import TreeStackTrainingEngine
 
 
 if TYPE_CHECKING:
@@ -194,9 +193,19 @@ class FSDPEngine(TrainEngine):
         self.dp_rank: int
 
         self.is_offload: bool = False
+        self.is_tree_distribution: bool = self.config.is_tree_distribution
         self.enable_tree_training: bool = self.config.enable_tree_training
-        self.enable_tree_attn_training: bool = self.config.enable_tree_attn_training
-        assert not (self.enable_tree_training and self.enable_tree_attn_training), "Tree training and tree attention training cannot be enabled at the same time."
+        self.stack_depth: int = self.config.stack_depth
+        self.enable_tree_stack_training: bool = self.config.enable_tree_stack_training
+        assert not (self.enable_tree_training and self.enable_tree_stack_training), "Tree training and tree attention training cannot be enabled at the same time."
+
+        if self.enable_tree_stack_training:
+            self.tree_stack_training_engine: TreeStackTrainingEngine
+
+
+        if hasattr(self.model_config, 'torch_dtype') and self.model_config.torch_dtype is not None:
+            self.model_dtype = self.model_config.torch_dtype
+        else: self.model_dtype = torch.bfloat16
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
         patch_dist_group_timeout(DIST_GROUP_DEFAULT_TIMEOUT)
@@ -408,7 +417,7 @@ class FSDPEngine(TrainEngine):
             should_accept_fn=should_accept_fn,
             group_size=group_size,
             dynamic_bs=dynamic_bs,
-            is_tree_attn_training=self.enable_tree_attn_training,
+            is_tree_distribution=self.is_tree_distribution,
         )
 
     def update_weights(self, meta: WeightUpdateMeta):
@@ -517,6 +526,7 @@ class FSDPEngine(TrainEngine):
                 outputs = self.model(**inputs)
             logits = outputs.logits.squeeze(0)
 
+
             # TODO: handle logprobs instead of logits
 
             
@@ -526,6 +536,11 @@ class FSDPEngine(TrainEngine):
                 logits = torch.cat(gathered_logits, dim=0)
 
             # ctx_dict = dataclasses.asdict(ctx)
+            if self.enable_tree_training:
+                if ctx.trie_node is not None:
+                    print(f"[Debug] ctx with enable_tree_training is not None")
+                else:
+                    print(f"[Debug] ctx with enable_tree_training is None")
             ctx_dict = {
                 "model_inputs": ctx.model_inputs,
                 "mb_input": ctx.mb_input,
@@ -554,46 +569,63 @@ class FSDPEngine(TrainEngine):
         # Step 1: Prepare micro-batches
         mb_list = self._prepare_mb_list(input_).to(self.device)
 
+        # total_loss_mask = 0.0
+        # for mb_item in mb_list:
+        #     inputs, ctx = self._prepare_mb_inputs(mb_item)
+        #     total_loss_mask += ctx.mb_input["loss_mask"].count_nonzero().item()
+        # print(f"[Debug] total_loss_mask: {total_loss_mask}")
+
         # Step 2: Compute total loss weight
         total_loss_weight = compute_total_loss_weight(
             mb_list, loss_weight_fn, self.dp_group
         )
 
-        if self.enable_tree_attn_training:
-            print(f"[Debug] enable_tree_attn_training in train_batch is True")
+        if self.enable_tree_stack_training:
+            print(f"[Debug] enable_tree_stack_training in train_batch is True")
+            print(f"[Debug] total_loss_weight: {total_loss_weight}")
 
             input_data = []
             for mb_item in mb_list:
                 inputs, ctx = self._prepare_mb_inputs(mb_item)
-                input_data.append({"original":ctx.mb_input,"scale":loss_weight_fn(ctx.mb_input) / total_loss_weight * self.parallel_helper.dp_size})
+                loss_scale = loss_weight_fn(ctx.mb_input) / total_loss_weight * self.parallel_helper.dp_size
+                # loss_scale = loss_weight_fn(ctx.mb_input)
+                if isinstance(loss_scale, torch.Tensor):
+                    loss_scale = loss_scale.item()
+                inputs, ctx = self._prepare_mb_inputs(mb_item)
+                input_data.append({"original":ctx.mb_input,"scale":loss_scale})
 
             def new_loss_fn(logprobs: torch.Tensor, entropy: torch.Tensor, input_data: dict):
                 # Append zero for padding compatibility (TreeBackwardEngine expects extra position)
+                assert input_data["original"]["cu_seqlens"][-1].item() - 1== logprobs.shape[0], "logprobs shape and cu_seqlens shape do not match"
                 logprobs = torch.cat([logprobs, logprobs.new_zeros(1)], dim=0)
-                return loss_fn(logprobs, entropy, input_data["original"]) * input_data["scale"]
+                res = loss_fn(logprobs, entropy, input_data["original"]) * input_data["scale"]
+                # print(f"[Debug] temporary loss: {res.item()}")
+                # return res * input_data["scale"]
+                return res
             
             # Extract valid sequences from padded input
             input_ids_batch = input_["input_ids"]  # [batch_size, seq_len]
             attention_mask = input_["attention_mask"]  # [batch_size, seq_len]
             
-            max_seq_len = 0
+            total_length=attention_mask.sum().item()
+            print(f"[Debug] total_length: {total_length}")
             input_ids_list = []
             for i in range(input_ids_batch.shape[0]):
                 # Extract valid tokens (where attention_mask == 1)
                 valid_length = attention_mask[i].sum().item()
-                max_seq_len = max(max_seq_len, valid_length)
                 valid_tokens = input_ids_batch[i, :valid_length]
                 input_ids_list.append(valid_tokens)
 
             trie = TokenTrie(input_ids_list, input_data, sorted=False)
-
-            if hasattr(self.model_config, 'torch_dtype') and self.model_config.torch_dtype is not None:
-                    model_dtype = self.model_config.torch_dtype
-            else: model_dtype = torch.bfloat16
  
-            tree_backward_engine = TreeBackwardEngine(self.model, model_dtype, max_seq_len)
+            # 输出模型信息，包含模型类型和参数数量
+            print(f"[Debug][Model Info] Model class: {type(self.model).__name__} in enable_tree_stack_training")
+            total_params = sum(p.numel() for p in self.model.parameters())
+            print(f"[Debug][Model Info] Total parameters: {total_params}")
+            if hasattr(self.model, "config"):
+                print(f"[Debug][Model Info] Model config: {getattr(self.model, 'config')}")
 
-            loss = tree_backward_engine.backward(token_trie = trie,block_size=2048,loss_fn=new_loss_fn)
+            loss = self.tree_stack_training_engine.backward(model=self.model, token_trie = trie, block_size=2048, loss_fn=new_loss_fn)
 
             print(f"[Debug] Final loss_sum in forward_backward_batch = {loss}")
 
@@ -667,8 +699,8 @@ class FSDPEngine(TrainEngine):
     ) -> torch.Tensor:
         self._ensure_ready()
 
-        if self.enable_tree_attn_training:
-            print(f"[Debug] enable_tree_attn_training in forward_batch is True")
+        if self.enable_tree_stack_training:
+            print(f"[Debug] enable_tree_stack_training in forward_batch is True")
             # Tree attention forward: use TreeForwardEngine for batched inference
             # Extract valid sequences and build TokenTrie for shared prefix optimization
             input_ids_batch = input_["input_ids"]  # [batch_size, seq_len]
@@ -687,15 +719,8 @@ class FSDPEngine(TrainEngine):
 
             trie = TokenTrie(input_ids_list, input_data, sorted=False)
 
-            if hasattr(self.model_config, 'torch_dtype') and self.model_config.torch_dtype is not None:
-                model_dtype = self.model_config.torch_dtype
-            else:
-                model_dtype = torch.bfloat16
- 
-            tree_forward_engine = TreeForwardEngine(self.model, model_dtype, max_seq_len)
-
             # TreeForwardEngine returns list of 1D tensors; pad to [batch_size, max_seq_len]
-            output = tree_forward_engine.forward(token_trie=trie)
+            output = self.tree_stack_training_engine.forward(model=self.model, token_trie=trie)
             B = len(output)
             output_padded = torch.zeros((B, max_seq_len), dtype=output[0].dtype, device=output[0].device)
             for i, seq in enumerate(output):
@@ -820,6 +845,9 @@ class FSDPEngine(TrainEngine):
     def _create_device_model(self):
         current_platform.set_device(int(os.environ["LOCAL_RANK"]))
         self.device = torch.device(int(os.environ["LOCAL_RANK"]))
+
+        if self.enable_tree_stack_training:
+            self.tree_stack_training_engine = TreeStackTrainingEngine(self.model_config, self.device, self.model_dtype, self.stack_depth)
 
         dtype = getattr(torch, self.config.dtype)
 
@@ -1294,6 +1322,7 @@ class FSDPEngine(TrainEngine):
             assert BLOCK_SIZE % (tp_size * sp_size) == 0, (
                 f"BLOCK_SIZE ({BLOCK_SIZE}) must be divisible by tensor parallel size ({tp_size})."
             )
+            print(f"enter here with enable_tree_training True")
             mb_list = build_packed_tree_batch(
                 input_,
                 mb_spec=self.config.mb_spec,
@@ -1339,7 +1368,8 @@ class FSDPEngine(TrainEngine):
         else:
             input_ = amend_position_ids(input_)
 
-        if self.enable_tree_attn_training:
+        if self.enable_tree_stack_training:
+            print(f"[Debug] one_seq_per_mb in _prepare_mb_list is True")
             # TreeBackwardEngine supports sequence-level loss calculation based on logprobs and entropy.
             # To enable this, we use one sequence per microbatch (sequence-level decoupling)
             mb_spec = self.config.mb_spec
@@ -1587,9 +1617,12 @@ class FSDPEngine(TrainEngine):
             )
         if not self.config.is_critic:
             if self.enable_tree_training:
+
+                print("enable_tree_training in _compute_logprobs_and_loss is True")
                 # Handle dummy trie (empty tree for DP load balancing)
                 # When trie has no sequences, return zero loss with grad connection
                 if ctx.trie_node is None or not ctx.trie_node.all_sequence_ids:
+                    print(f"enable_tree_trainings here not good")
                     # Return zero loss that maintains gradient connection to logits
                     # This ensures backward() works correctly for FSDP synchronization
                     return logits.sum() * 0.0
@@ -1615,6 +1648,7 @@ class FSDPEngine(TrainEngine):
                     entropy = entropy[: -ctx.pad_length]
                     vocab_min_logits = vocab_min_logits[: -ctx.pad_length]
                     vocab_max_logits = vocab_max_logits[: -ctx.pad_length]
+                # print(f"[Debug] logprobs shape: {logprobs.shape[0]}")
             loss = loss_fn(
                 logprobs,
                 entropy,
@@ -1624,8 +1658,10 @@ class FSDPEngine(TrainEngine):
             values = self._compute_values(logits.squeeze(-1), ctx.ulysses_pad_size)
             if ctx.pad_length > 0:
                 values = values[: -ctx.pad_length]
+
             loss = loss_fn(values, ctx.mb_input)
 
+        # loss_scale = 1.0
         loss_scale = loss_weight_fn(ctx.mb_input) / total_loss_weight * loss_multiplier
         # print(f"[debug] loss_weight_fn(ctx.mb_input)={loss_weight_fn(ctx.mb_input).item()}, total_loss_weight={total_loss_weight.item()}")
         # print(f"[debug] Loss: {loss.item()}, Loss scale: {loss_scale.item()}, final result: {(loss * loss_scale).item()}")

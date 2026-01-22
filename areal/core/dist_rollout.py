@@ -51,7 +51,7 @@ def _remove_padding_from_trajectory(d: dict[str, Any]) -> dict[str, Any]:
 def redistribute_trajectories(
     trajectories: list[dict[str, Any]],
     group=None,
-    is_tree_attn_training: bool = False,
+    is_tree_distribution: bool = False,
 ) -> RedistributedData:
     """Redistribute a list of trajectory dicts across a process group.
 
@@ -66,7 +66,7 @@ def redistribute_trajectories(
         contains tensors with shape [batch_size, seqlen, ...].
     group : dist.ProcessGroup, optional
         The process group for communication. If None, uses the default group.
-    is_tree_attn_training : bool, optional
+    is_tree_distribution : bool, optional
         If True, redistributes at the sequence level instead of trajectory level,
         using a specialized tree-based allocation algorithm. Default is False.
 
@@ -87,7 +87,7 @@ def redistribute_trajectories(
     for traj_list in all_gathered:
         all_data.extend(traj_list)
 
-    if is_tree_attn_training:
+    if is_tree_distribution:
         # Split trajectories into individual sequences for finer granularity
         all_sequences = []
         for d in all_data:
@@ -141,7 +141,7 @@ class DistRolloutCoordinator:
     def _broadcast_and_redistribute_trajectories(
         self,
         trajectories: list[dict[str, Any]] | None,
-        is_tree_attn_training: bool = False,
+        is_tree_distribution: bool = False,
     ) -> dict[str, Any]:
         """Broadcast and redistribute trajectories across distributed workers.
 
@@ -156,7 +156,7 @@ class DistRolloutCoordinator:
             List of trajectory dicts from data parallel head, None for other ranks.
             Each trajectory is a dict of tensors with shape [batch_size, seqlen, ...],
             where batch_size can vary per trajectory.
-        is_tree_attn_training : bool, optional
+        is_ : bool, optional
             Whether to use tree-based sequence-level redistribution.
 
         Returns
@@ -168,7 +168,7 @@ class DistRolloutCoordinator:
             redist = redistribute_trajectories(
                 trajectories,
                 group=self.train_engine.data_parallel_group,
-                is_tree_attn_training=is_tree_attn_training,
+                is_tree_distribution=is_tree_distribution,
             )
             batch = redist.data
         else:
@@ -250,7 +250,7 @@ class DistRolloutCoordinator:
         should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
         group_size: int = 1,
         dynamic_bs: bool = False,
-        is_tree_attn_training: bool = False,
+        is_tree_distribution: bool = False,
     ) -> dict[str, Any]:
         """Prepare async rollout batch with distributed coordination.
 
@@ -274,7 +274,7 @@ class DistRolloutCoordinator:
             Default is 1 (no grouping).
         dynamic_bs : bool, optional
             If True, enables dynamic batch sizing. Default is False.
-        is_tree_attn_training : bool, optional
+        is_tree_distribution : bool, optional
             Whether to use tree-based sequence-level redistribution.
 
         Returns
@@ -303,5 +303,5 @@ class DistRolloutCoordinator:
             )
 
         return self._broadcast_and_redistribute_trajectories(
-            trajectories, is_tree_attn_training=is_tree_attn_training
+            trajectories, is_tree_distribution=is_tree_distribution
         )

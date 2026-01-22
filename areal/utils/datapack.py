@@ -231,6 +231,7 @@ def tree_allocate(
     list[list[int]]
         Assignment of sequence indices to each group.
     """
+    print(f"Tree-based sequence allocation: allocating {len(all_input_ids)} sequences into {n_groups} groups")
     trie = TokenTrie(all_input_ids, sorted=False)
     return trie.divide(n_groups)
 

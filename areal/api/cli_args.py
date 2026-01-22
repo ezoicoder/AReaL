@@ -775,16 +775,29 @@ class TrainEngineConfig:
         metadata={"help": "peft method type. Only LoRA is supported for now."},
     )
 
+    # Distribution
+    is_tree_distribution: bool = field(
+        default=False,
+        metadata={"help": "Whether to use tree distribution."},
+    )
+
     # Tree training
     enable_tree_training: bool = field(
         default=False,
         metadata={"help": "Enable tree training with flex attention module."},
     )
 
-    enable_tree_attn_training: bool = field(
+    enable_tree_stack_training: bool = field(
         default=False,
-        metadata={"help": "Enable tree attention (dfs+ stack) training."},
+        metadata={"help": "Enable tree stack training."},
     )
+
+    stack_depth: int = field(
+        default=16384,
+        metadata={"help": "Stack depth for tree stack training."},
+    )
+
+
 
     # Scheduling
     scheduling_spec: tuple[SchedulingSpec, ...] = field(

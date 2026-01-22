@@ -375,7 +375,7 @@ def grpo_loss_fn(
     """Loss function for actor step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""
     # INSERT_YOUR_CODE
-    print(f"[grpo_loss_fn] input_data keys: {list(input_data.keys())}")
+    # print(f"[grpo_loss_fn] input_data keys: {list(input_data.keys())}")
     old_logp = input_data["logprobs"]
     advantages = input_data["advantages"]
     loss_mask = input_data["loss_mask"].bool()

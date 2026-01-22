@@ -7,11 +7,11 @@ import torch.nn.functional as F
 from math import ceil
 from bisect import bisect_left, bisect_right
 
-from areal.utils.functional.vocab_parallel import gather_logprobs_entropy
+from areal.utils.functional.vocab_parallel import gather_logprobs, gather_logprobs_entropy
 
-def _get_forkpos(lens, lcp_lens, block_size: int) -> set:
+def _get_forkpos(lens, lcp_lens, block_size: int) -> list:
     """
-    Compute all fork positions that TreeBackwardEngine's stack must track.
+    Compute all fork positions that TreeTrainingEngine's stack must track.
 
     Fork positions are token indices where:
     1) Sequences diverge (longest common prefix boundaries)
@@ -28,19 +28,20 @@ def _get_forkpos(lens, lcp_lens, block_size: int) -> set:
             forkpos_list.append(lcp - 1)
 
     # 2. Fork positions induced by block segmentation
-    for i in range(len(lens)):
-        start = 0 if i == len(lcp_lens) else lcp_lens[i]
-        end = lens[i]
+    if block_size is not None:
+        for i in range(len(lens)):
+            start = 0 if i == len(lcp_lens) else lcp_lens[i]
+            end = lens[i]
 
-        pop_len = end - start
-    
-        n_blocks = ceil(pop_len / block_size)
-        block_size_actual = ceil(pop_len / n_blocks)
+            pop_len = end - start
+        
+            n_blocks = ceil(pop_len / block_size)
+            block_size_actual = ceil(pop_len / n_blocks)
 
-        for b in range(n_blocks):
-            pop_start = max(end - (b + 1) * block_size_actual, start)
-            if pop_start > 0:
-                forkpos_list.append(pop_start - 1)
+            for b in range(n_blocks):
+                pop_start = max(end - (b + 1) * block_size_actual, start)
+                if pop_start > 0:
+                    forkpos_list.append(pop_start - 1)
 
     forkpos_list = list(set(forkpos_list))
     forkpos_list.sort()
@@ -48,27 +49,31 @@ def _get_forkpos(lens, lcp_lens, block_size: int) -> set:
     return forkpos_list
 
 
-class TreeBackwardEngine:
+class TreeStackTrainingEngine:
     """
     Engine for backward computation over sequences with shared prefixes.
 
-    TreeBackwardEngine stores only necessary KV caches, logits at fork
+    TreeTrainingEngine stores only necessary KV caches, logits at fork
     positions, log-probs, and entropy to efficiently compute gradients
     for multiple sequences while saving memory.
 
     Supports block-wise popping to reduce GPU memory peak.
     """
-    def __init__(self, model, dtype: torch.dtype, max_seq_len: int):
+    def __init__(self, model_config, device, dtype: torch.dtype, max_seq_len: int, forward_only: bool = False):
         """
-        Initialize the engine with model, dtype, and maximum sequence length.
+        Initialize the engine with model_config, device, dtype, and maximum sequence length.
 
         Buffers for tokens, logprobs, entropy and KV caches are preallocated 
         to max_seq_len.
         """
-        self.model = model
-        self.device = model.device
+        self.model = None
+        self.device = device
         self.dtype = dtype
         self.max_seq_len = max_seq_len
+
+        print(f"[Debug][TreeStackTrainingEngine] model_config: {model_config}")
+        print(f"[Debug][TreeStackTrainingEngine] dtype: {dtype}")
+        print(f"[Debug][TreeStackTrainingEngine] max_seq_len: {max_seq_len}")
 
         # ------------------------------------------------------------------------
         # Initialize static stack buffers
@@ -79,26 +84,30 @@ class TreeBackwardEngine:
         self.tokens        = torch.zeros((max_seq_len), device=self.device, dtype=torch.long)
 
         # Entropy buffer
-        self.entropy       = torch.zeros((max_seq_len), device=self.device, dtype=torch.float32)
-        self.grad_entropy  = torch.zeros((max_seq_len), device=self.device, dtype=dtype)
+        if not forward_only:
+            self.entropy       = torch.zeros((max_seq_len), device=self.device, dtype=torch.float32)
+            self.grad_entropy  = torch.zeros((max_seq_len), device=self.device, dtype=torch.float32)
 
         # Logprob buffer
         self.logprobs      = torch.zeros((max_seq_len), device=self.device, dtype=torch.float32)
-        self.grad_logprobs = torch.zeros((max_seq_len), device=self.device, dtype=dtype)
+        if not forward_only:
+            self.grad_logprobs = torch.zeros((max_seq_len), device=self.device, dtype=torch.float32)
 
         # Fork position logits buffer (store logits only at fork positions, others are None)
-        self.forkpos_list  = []                                                         # List of all fork positions
-        self.forkpos_logits: List[Optional[torch.Tensor]]      = [None] * max_seq_len   # Logits at fork positions for computing logprobs
-        self.grad_forkpos_logits: List[Optional[torch.Tensor]] = [None] * max_seq_len   # Gradients of logits at fork positions
+        self.forkpos_list  = []                                                             # List of all fork positions
+        self.forkpos_logits: List[Optional[torch.Tensor]]          = [None] * max_seq_len   # Logits at fork positions for computing logprobs
+        if not forward_only:
+            self.grad_forkpos_logits: List[Optional[torch.Tensor]] = [None] * max_seq_len   # Gradients of logits at fork positions
 
         # Attachments buffer
         self.attachs       = [] # List of sequences retained in the stack, including (attachments, length)
 
         # KV cache buffers
-        cfg = model.config
-        self.n_layers = cfg.num_hidden_layers
-        n_kv_heads = cfg.num_key_value_heads
-        head_dim = cfg.hidden_size // cfg.num_attention_heads
+        self.n_layers = model_config.num_hidden_layers
+        n_kv_heads = model_config.num_key_value_heads
+        # Compatible with Qwen2.5 and Qwen3 series
+        head_dim = model_config.head_dim if hasattr(model_config, 'head_dim') \
+            else model_config.hidden_size // model_config.num_attention_heads
 
         kv_buffer_shape = (1, n_kv_heads, max_seq_len, head_dim)
 
@@ -112,18 +121,20 @@ class TreeBackwardEngine:
                 for _ in range(self.n_layers)
             ],
         )
-        self.grad_kv = (
-            [
-                torch.zeros(kv_buffer_shape, device=self.device, dtype=dtype)
-                for _ in range(self.n_layers)
-            ],
-            [
-                torch.zeros(kv_buffer_shape, device=self.device, dtype=dtype)
-                for _ in range(self.n_layers)
-            ],
-        )
 
-        print(f"[Debug][TreeBackwardEngine] Model class initialized: {type(self.model).__name__}")
+        if not forward_only:
+            self.grad_kv = (
+                [
+                    torch.zeros(kv_buffer_shape, device=self.device, dtype=dtype)
+                    for _ in range(self.n_layers)
+                ],
+                [
+                    torch.zeros(kv_buffer_shape, device=self.device, dtype=dtype)
+                    for _ in range(self.n_layers)
+                ],
+            )
+
+        self.ret_logprobs = []
     
     def get_forkpos(self, start: int, end: int) -> List[int]:
         """
@@ -135,6 +146,92 @@ class TreeBackwardEngine:
         left = bisect_left(self.forkpos_list, start)
         right = bisect_right(self.forkpos_list, end - 1)
         yield from self.forkpos_list[left:right]
+
+    @torch.no_grad()
+    def push_forward_only(
+        self,
+        new_tokens: torch.LongTensor,
+        attach_list: List[Tuple[dict, int]],
+    ):
+        """
+        Push new tokens into the stack with their attachments.
+
+        Builds cache (KV, logprobs) up to cache_len.
+        Updates logprobs for the previous token.
+
+        Used in inference mode only.
+        """
+        
+        B = new_tokens.numel()
+        assert self.cur_len + B <= self.max_seq_len, (
+            f"Exceeds max_seq_len: cur_len={self.cur_len}, new_tokens={B}, max={self.max_seq_len}"
+        )
+
+        start, end = self.cur_len, self.cur_len + B
+
+        # -------------------------------------------------------------
+        # 1. Build prefix cache from existing KV
+        # -------------------------------------------------------------
+        prefix_cache = DynamicCache()
+        for l in range(self.n_layers):
+            prefix_cache.update(
+                self.kv_cache[0][l][:, :, :start, :],
+                self.kv_cache[1][l][:, :, :start, :],
+                layer_idx=l,
+            )
+
+        # -------------------------------------------------------------
+        # 2. Forward
+        # -------------------------------------------------------------
+        out = self.model(
+            new_tokens.unsqueeze(0),
+            past_key_values=prefix_cache,
+            use_cache=True,
+        )
+        
+        # Compute logprobs and entropy for new tokens
+        logits = out.logits  # [1, B, vocab]
+        logprobs = gather_logprobs(
+            logits=logits,
+            labels=new_tokens[1:].unsqueeze(0),
+        )
+
+        # -------------------------------------------------------------
+        # 3. Write tokens, computed logprobs, and KV cache into stack
+        # -------------------------------------------------------------
+
+        # Write tokens into stack
+        self.tokens[start:end] = new_tokens
+
+        # Write logprobs into stack
+        self.logprobs[start : end-1] = logprobs.squeeze(0)
+        # Fill the logprob of the first token using self.forkpos_logits[start]
+        if start > 0:   
+            pre_logits = self.forkpos_logits[start-1].float()
+            first_token = new_tokens[0].item()
+            pre_logprob = F.log_softmax(pre_logits, dim=-1)[first_token].item()
+            self.logprobs[start-1] = pre_logprob
+
+        # Write KV cache into stack
+        new_cache = out.past_key_values 
+        for l, layer in enumerate(new_cache.layers):
+            self.kv_cache[0][l][:, :, start:end, :] = layer.keys[:, :, start:end, :]
+            self.kv_cache[1][l][:, :, start:end, :] = layer.values[:, :, start:end, :]
+
+        # Write logits into stack (fork positions only)
+        forkpos_slice = self.get_forkpos(start, end)
+        for i in forkpos_slice:
+            self.forkpos_logits[i] = logits[0, i - start].detach().clone()
+
+        # -------------------------------------------------------------
+        # 4. Store logprobs for sequences ending in attach_list
+        # -------------------------------------------------------------
+        for attachment, length in attach_list:
+            seq_id = attachment['_sequence_batch_id']
+            logprobs = self.logprobs[:length-1]
+            self.returns[seq_id] = logprobs.clone()
+
+        self.cur_len += B
 
     def build_cache(self, start: int, end: int):
         """
@@ -418,7 +515,48 @@ class TreeBackwardEngine:
 
         return loss
 
-    def backward(self, token_trie, block_size: int, loss_fn) -> float:
+    @torch.no_grad()
+    def forward(self, model, token_trie):
+        """
+        Perform backward pass over all sequences in a TokenTrie.
+        Compute logprobs for each sequence.
+        The sequence ID is identified by attachment['_sequence_batch_id'], which TokenTrie automatically adds.
+
+        Args:
+            token_trie: TokenTrie containing input sequences and attachs.
+
+        Returns:
+            List of logprob tensors for each sequence in the TokenTrie.
+        """
+
+        self.model = model
+        self.returns = [None] * token_trie.n_sequences
+        self.forkpos_logits = [None] * self.max_seq_len  # Clear forkpos_logits to save memory
+
+        inputs, attach_lists, lcp_lens = token_trie.inputs, token_trie.attach_lists, token_trie.lcp_lens
+
+        self.forkpos_list = _get_forkpos(None, lcp_lens, None)
+
+        for i in range(len(inputs)):
+            input_ids = inputs[i].to(self.device)
+            attach_list = attach_lists[i]
+            seq_len = input_ids.size(0)
+
+            # Pop diverged branch from previous sequence
+            if i > 0:
+                self.cur_len = lcp_lens[i - 1]
+
+            # Push new tokens
+            new_tokens = input_ids[self.cur_len :]
+
+            self.push_forward_only(new_tokens, attach_list)
+
+        self.cur_len = 0
+        self.forkpos_logits = [None] * self.max_seq_len  # Clear forkpos_logits
+
+        return self.returns
+
+    def backward(self, model, token_trie, block_size: int, loss_fn) -> float:
         """
         Perform backward pass over all sequences in a TokenTrie.
 
@@ -434,7 +572,7 @@ class TreeBackwardEngine:
             Total loss accumulated over all sequences.
         """
 
-        print(f"[Debug][TreeBackwardEngine] Backward pass started")
+        self.model = model
 
         total_loss = 0.0
 
