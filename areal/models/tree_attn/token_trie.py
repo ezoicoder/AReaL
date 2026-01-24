@@ -80,6 +80,15 @@ class TokenTrie:
         self.n_leafed_tokens = sum(len(ids) for ids in self.inputs)
         self.n_tree_tokens = self.n_leafed_tokens - sum(self.lcp_lens)
 
+        # Compute the token compression ratio (original tokens / tree tokens) and print it
+        if self.n_tokens > 0:
+            compression_ratio = self.n_tokens / self.n_tree_tokens
+            print(f"[TokenTrie] Token compression ratio: {compression_ratio:.4f} ({self.n_tokens}/{self.n_tree_tokens})")
+            print(f"[TokenTrie] Token compression ratio of leafed sequences: {self.n_leafed_tokens / self.n_tree_tokens:.4f} ({self.n_leafed_tokens}/{self.n_tree_tokens})")
+            print(f"[TokenTrie] Average compressed length of leafed sequences {self.n_tree_tokens / len(self.inputs):.4f}")
+        else:
+            print("[TokenTrie] Warning: n_tokens is zero, cannot compute token compression ratio.")
+
     def try_devide(self, tree_token_limit: int) -> List[List[int]] | None:
         """
         Try to divide the sequences such that each part does not exceed

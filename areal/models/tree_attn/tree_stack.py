@@ -572,7 +572,12 @@ class TreeStackTrainingEngine:
             Total loss accumulated over all sequences.
         """
 
+        print(f"[Debug][TreeBackwardEngine] Backward pass started")
+
         self.model = model
+
+        # Check Flash Attention configuration by unwrapping FSDP/PEFT layers (no new model created)
+        print(f"[Debug][TreeStackTrainingEngine] Initial model type = {type(self.model).__name__}")
 
         total_loss = 0.0
 

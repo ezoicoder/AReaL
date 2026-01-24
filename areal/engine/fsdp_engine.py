@@ -198,6 +198,10 @@ class FSDPEngine(TrainEngine):
         self.stack_depth: int = self.config.stack_depth
         self.enable_tree_stack_training: bool = self.config.enable_tree_stack_training
         assert not (self.enable_tree_training and self.enable_tree_stack_training), "Tree training and tree attention training cannot be enabled at the same time."
+        
+        # NOTE: Tree stack training uses ZeRO-1 (DDP + ZeroRedundancyOptimizer)
+        # - Pure data parallel only (no TP/SP/PP)
+        # - Parameters replicated, gradients all-reduced, optimizer states sharded
 
         if self.enable_tree_stack_training:
             self.tree_stack_training_engine: TreeStackTrainingEngine
@@ -269,11 +273,13 @@ class FSDPEngine(TrainEngine):
         # Monkey patch: replace attention's forward() with
         # Ulysses-compatible version if Ulysses SP is enabled
         # or tree attention based on flex attention.
-        apply_monkey_patch(
-            model=self.model,
-            ulysses_sp_size=self.parallel_helper.sp_size,
-            enable_tree_training=self.enable_tree_training,
-        )
+        if not self.enable_tree_stack_training:
+            # Tree stack training doesn't use Ulysses SP
+            apply_monkey_patch(
+                model=self.model,
+                ulysses_sp_size=self.parallel_helper.sp_size,
+                enable_tree_training=self.enable_tree_training,
+            )
 
         if self.config.use_lora:
             self._apply_peft_wrapper()
@@ -284,35 +290,65 @@ class FSDPEngine(TrainEngine):
             CPUOffloadPolicy() if self.config.fsdp.offload_params else None
         )
         tik = time.perf_counter()
-        # Prepare lora weights synchronization
-        if self.config.use_lora:
-            if dist.get_rank() == 0:
-                full_state = self.model.state_dict()
-            else:
-                full_state = {}
-        # NOTE: This applies FSDP2 with N-D parallelism (DP+SP+TP)
-        parallelize_model(
-            self.model,
-            config=self.config,
-            model_config=self.model_config,
-            nd_device_mesh=self.world_mesh,
-            parallel_helper=self.parallel_helper,
-            cpu_offload=self.cpu_offload,
-            wrap_policy=self.config.fsdp.wrap_policy,
-        )
-        # Synchronize initialized lora weights
-        if self.config.use_lora:
-            fsdp2_load_full_state_dict(
+        
+        if self.enable_tree_stack_training:
+            # ========== ZeRO-1 Path: DDP + ZeroRedundancyOptimizer ==========
+            self.logger.info("Using ZeRO-1 mode (Tree Stack Training): DDP + ZeroRedundancyOptimizer")
+            
+            if self.config.use_lora:
+                raise NotImplementedError("ZeRO-1 mode does not support LoRA yet")
+            
+            # Import ZeRO-1 wrapper
+            from torch.nn.parallel import DistributedDataParallel as DDP
+            
+            # Get device from model
+            device_id = next(self.model.parameters()).device.index
+            
+            # Wrap model with DDP (parameters and gradients are replicated)
+            self.model = DDP(
                 self.model,
-                full_state,
-                self.cpu_offload,
-                tie_word_embeddings=self.model_config.tie_word_embeddings,
+                device_ids=[device_id],
+                broadcast_buffers=True,
+                gradient_as_bucket_view=True,  # Memory optimization
             )
-        self.logger.info(
-            f"Applying FSDP2 with N-D parallelism for {time.perf_counter() - tik:.2f} seconds"
-        )
-
-        self._create_optimizer(ft_spec)
+            
+            self.logger.info(
+                f"Applied DDP wrapper in {time.perf_counter() - tik:.2f} seconds"
+            )
+            
+            # Create optimizer and scheduler through unified method
+            self._create_optimizer(ft_spec)
+        else:
+            # ========== FSDP2 Path (Original) ==========
+            # Prepare lora weights synchronization
+            if self.config.use_lora:
+                if dist.get_rank() == 0:
+                    full_state = self.model.state_dict()
+                else:
+                    full_state = {}
+            # NOTE: This applies FSDP2 with N-D parallelism (DP+SP+TP)
+            parallelize_model(
+                self.model,
+                config=self.config,
+                model_config=self.model_config,
+                nd_device_mesh=self.world_mesh,
+                parallel_helper=self.parallel_helper,
+                cpu_offload=self.cpu_offload,
+                wrap_policy=self.config.fsdp.wrap_policy,
+            )
+            # Synchronize initialized lora weights
+            if self.config.use_lora:
+                fsdp2_load_full_state_dict(
+                    self.model,
+                    full_state,
+                    self.cpu_offload,
+                    tie_word_embeddings=self.model_config.tie_word_embeddings,
+                )
+            self.logger.info(
+                f"Applying FSDP2 with N-D parallelism for {time.perf_counter() - tik:.2f} seconds"
+            )
+            
+            self._create_optimizer(ft_spec)
         self._initialized = True
 
     @property
@@ -466,21 +502,56 @@ class FSDPEngine(TrainEngine):
             self._load_optimizer_state(meta.path)
 
     def optimizer_zero_grad(self):
+        if self.config.disable_optimizer:
+            return  # Skip when optimizer is disabled
         assert self.optimizer is not None
         self.optimizer.zero_grad()
 
     def optimizer_step(self):
+        # When optimizer is disabled, return dummy stats without updating
+        if self.config.disable_optimizer:
+            # Still compute grad_norm for debugging purposes (without clipping)
+            if self.enable_tree_stack_training:
+                # Tree stack training (DDP): use standard grad norm
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    max_norm=float('inf'),
+                )
+            else:
+                # FSDP2: use custom grad norm
+                grad_norm = fsdp2_clip_grad_norm(
+                    list(self.model.parameters()),
+                    max_norm=float('inf'),  # No clipping, just measure
+                    fsdp_group=self.world_mesh["dp_sp"].get_group(),
+                    tp_group=self.world_mesh["tp"].get_group(),
+                    offload_params=self.config.fsdp.offload_params,
+                )
+            return dict(
+                update_successful=0.0,  # Not updated
+                grad_norm=float(grad_norm) if grad_norm is not None else float("nan"),
+                lr=0.0,  # No learning rate when optimizer disabled
+            )
+        
         assert self.optimizer is not None
         assert self.optimizer_config is not None
         assert self.lr_scheduler is not None
 
-        grad_norm = fsdp2_clip_grad_norm(
-            list(self.model.parameters()),
-            max_norm=self.optimizer_config.gradient_clipping,
-            fsdp_group=self.world_mesh["dp_sp"].get_group(),
-            tp_group=self.world_mesh["tp"].get_group(),
-            offload_params=self.config.fsdp.offload_params,
-        )
+        # Gradient clipping
+        if self.enable_tree_stack_training:
+            # Tree stack training (DDP): use standard PyTorch gradient clipping
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                max_norm=self.optimizer_config.gradient_clipping,
+            )
+        else:
+            # FSDP2: use custom gradient clipping
+            grad_norm = fsdp2_clip_grad_norm(
+                list(self.model.parameters()),
+                max_norm=self.optimizer_config.gradient_clipping,
+                fsdp_group=self.world_mesh["dp_sp"].get_group(),
+                tp_group=self.world_mesh["tp"].get_group(),
+                offload_params=self.config.fsdp.offload_params,
+            )
 
         if not math.isfinite(grad_norm):
             self.optimizer_zero_grad()
@@ -563,17 +634,14 @@ class FSDPEngine(TrainEngine):
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     ) -> dict[str, float]:
+
+        # Step 0: Initialize
         self._ensure_ready()
         self.optimizer_zero_grad()
 
         # Step 1: Prepare micro-batches
         mb_list = self._prepare_mb_list(input_).to(self.device)
-
-        # total_loss_mask = 0.0
-        # for mb_item in mb_list:
-        #     inputs, ctx = self._prepare_mb_inputs(mb_item)
-        #     total_loss_mask += ctx.mb_input["loss_mask"].count_nonzero().item()
-        # print(f"[Debug] total_loss_mask: {total_loss_mask}")
+        print(f"[Debug] length of mb_list: {len(mb_list)}")
 
         # Step 2: Compute total loss weight
         total_loss_weight = compute_total_loss_weight(
@@ -581,33 +649,32 @@ class FSDPEngine(TrainEngine):
         )
 
         if self.enable_tree_stack_training:
+            # ========== Tree Stack Training Path ==========
             print(f"[Debug] enable_tree_stack_training in train_batch is True")
             print(f"[Debug] total_loss_weight: {total_loss_weight}")
 
+            # Step 3a: Prepare input data for tree training
             input_data = []
             for mb_item in mb_list:
                 inputs, ctx = self._prepare_mb_inputs(mb_item)
                 loss_scale = loss_weight_fn(ctx.mb_input) / total_loss_weight * self.parallel_helper.dp_size
-                # loss_scale = loss_weight_fn(ctx.mb_input)
                 if isinstance(loss_scale, torch.Tensor):
                     loss_scale = loss_scale.item()
                 inputs, ctx = self._prepare_mb_inputs(mb_item)
-                input_data.append({"original":ctx.mb_input,"scale":loss_scale})
+                input_data.append({"original": ctx.mb_input, "scale": loss_scale})
 
+            # Step 3b: Define loss function
             def new_loss_fn(logprobs: torch.Tensor, entropy: torch.Tensor, input_data: dict):
                 # Append zero for padding compatibility (TreeBackwardEngine expects extra position)
-                assert input_data["original"]["cu_seqlens"][-1].item() - 1== logprobs.shape[0], "logprobs shape and cu_seqlens shape do not match"
                 logprobs = torch.cat([logprobs, logprobs.new_zeros(1)], dim=0)
                 res = loss_fn(logprobs, entropy, input_data["original"]) * input_data["scale"]
-                # print(f"[Debug] temporary loss: {res.item()}")
-                # return res * input_data["scale"]
                 return res
-            
-            # Extract valid sequences from padded input
+                # return logprobs.sum()
+
+            # Step 3c: Extract valid sequences
             input_ids_batch = input_["input_ids"]  # [batch_size, seq_len]
             attention_mask = input_["attention_mask"]  # [batch_size, seq_len]
-            
-            total_length=attention_mask.sum().item()
+            total_length = attention_mask.sum().item()
             print(f"[Debug] total_length: {total_length}")
             input_ids_list = []
             for i in range(input_ids_batch.shape[0]):
@@ -616,22 +683,35 @@ class FSDPEngine(TrainEngine):
                 valid_tokens = input_ids_batch[i, :valid_length]
                 input_ids_list.append(valid_tokens)
 
+            # Step 3d: Build trie
             trie = TokenTrie(input_ids_list, input_data, sorted=False)
- 
-            # 输出模型信息，包含模型类型和参数数量
-            print(f"[Debug][Model Info] Model class: {type(self.model).__name__} in enable_tree_stack_training")
-            total_params = sum(p.numel() for p in self.model.parameters())
-            print(f"[Debug][Model Info] Total parameters: {total_params}")
-            if hasattr(self.model, "config"):
-                print(f"[Debug][Model Info] Model config: {getattr(self.model, 'config')}")
 
-            loss = self.tree_stack_training_engine.backward(model=self.model, token_trie = trie, block_size=2048, loss_fn=new_loss_fn)
+            # Step 4a: Tree backward with ZeRO-1 (DDP) gradient synchronization
+            # Tree stack training always uses ZeRO-1 (enforced by __init__ check)
+            # Use no_sync() to disable automatic gradient synchronization
+            with self.model.no_sync():
+                loss = self.tree_stack_training_engine.backward(
+                    model=self.model,
+                    token_trie=trie,
+                    block_size=3072,
+                    loss_fn=new_loss_fn
+                )
+
+            # After all backwards complete, manually synchronize gradients
+            # so all ranks get the globally averaged gradients
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    dist.all_reduce(param.grad, group=self.dp_group)
+                    param.grad.div_(self.parallel_helper.dp_size)
 
             print(f"[Debug] Final loss_sum in forward_backward_batch = {loss}")
 
-            # Step 4: Optimizer step
-            return self.optimizer_step()
+            # Step 5a: Optimizer step
+            result = self.optimizer_step()
 
+            return result
+
+        # ========== Regular Training Path ==========
         # Step 3: Forward-backward using process_output_fn callback
         def process_output(
             logits: torch.Tensor, ctx_dict: dict[str, Any]
@@ -646,10 +726,13 @@ class FSDPEngine(TrainEngine):
                 loss_multiplier=self.parallel_helper.dp_size,
             )
 
+        # Step 4: Forward-backward batch
         self.forward_backward_batch(mb_list, process_output, forward_only=False)
 
-        # Step 4: Optimizer step
-        return self.optimizer_step()
+        # Step 5: Optimizer step
+        result = self.optimizer_step()
+
+        return result
 
     @torch.no_grad()
     def eval_batch(
@@ -892,6 +975,8 @@ class FSDPEngine(TrainEngine):
             f"Model creation and loading time: {time.perf_counter() - tik}"
         )
         self.model = model
+        print(f"Unwrapped Model type: {type(self.model).__name__} (module: {type(self.model).__module__})")
+        
 
     def _apply_peft_wrapper(self):
         config = self.config
@@ -922,6 +1007,10 @@ class FSDPEngine(TrainEngine):
             self.model.print_trainable_parameters()
 
     def _create_optimizer(self, ft_spec: FinetuneSpec) -> None:
+        # Skip optimizer creation if disabled (for testing/debugging)
+        if self.config.disable_optimizer:
+            self.logger.info("Optimizer creation disabled (disable_optimizer=True)")
+            return
         if self.optimizer_config is None:
             return
         assert self.model is not None
@@ -941,32 +1030,79 @@ class FSDPEngine(TrainEngine):
         beta1 = self.optimizer_config.beta1
         beta2 = self.optimizer_config.beta2
         eps = self.optimizer_config.eps
-        if self.optimizer_config.type == "adam":
-            self.optimizer = torch.optim.AdamW(
+        
+        # For Zero1 (Tree Stack Training), wrap optimizer with ZeroRedundancyOptimizer
+        if self.enable_tree_stack_training:
+            from torch.distributed.optim import ZeroRedundancyOptimizer
+            
+            # Determine base optimizer class
+            if self.optimizer_config.type == "adam":
+                optimizer_class = torch.optim.AdamW
+                optimizer_kwargs = {
+                    "lr": lr,
+                    "weight_decay": weight_decay,
+                    "betas": (beta1, beta2),
+                    "eps": eps,
+                    # VLM with tensor parallelism is incompatible with fused AdamW
+                    "fused": not (self.is_vision_model and self.parallel_helper.tp_enabled),
+                }
+            elif self.optimizer_config.type == "adam_bf16":
+                optimizer_class = AnyPrecisionAdamW
+                optimizer_kwargs = {
+                    "lr": lr,
+                    "weight_decay": weight_decay,
+                    "betas": (beta1, beta2),
+                    "eps": eps,
+                    "momentum_dtype": "bfloat16",
+                    "variance_dtype": "bfloat16",
+                }
+            else:  # sgd
+                optimizer_class = torch.optim.SGD
+                optimizer_kwargs = {
+                    "lr": lr,
+                    "weight_decay": weight_decay,
+                }
+            
+            # Wrap with ZeroRedundancyOptimizer (optimizer states are sharded)
+            self.optimizer = ZeroRedundancyOptimizer(
                 self.model.parameters(),
-                lr=lr,
-                weight_decay=weight_decay,
-                betas=(beta1, beta2),
-                eps=eps,
-                # VLM with tensor parallelism is incompatible with fused AdamW
-                fused=not (self.is_vision_model and self.parallel_helper.tp_enabled),
+                optimizer_class=optimizer_class,
+                parameters_as_bucket_view=True,  # Memory optimization
+                **optimizer_kwargs,
             )
-        elif self.optimizer_config.type == "adam_bf16":
-            self.optimizer = AnyPrecisionAdamW(
-                self.model.parameters(),
-                lr=lr,
-                weight_decay=weight_decay,
-                betas=(beta1, beta2),
-                eps=eps,
-                momentum_dtype="bfloat16",
-                variance_dtype="bfloat16",
+            
+            self.logger.info(
+                f"Applied ZeroRedundancyOptimizer with {optimizer_class.__name__}"
             )
         else:
-            self.optimizer = torch.optim.SGD(
-                self.model.parameters(),
-                lr=lr,
-                weight_decay=weight_decay,
-            )
+            # Standard FSDP2 optimizer creation
+            if self.optimizer_config.type == "adam":
+                self.optimizer = torch.optim.AdamW(
+                    self.model.parameters(),
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    betas=(beta1, beta2),
+                    eps=eps,
+                    # VLM with tensor parallelism is incompatible with fused AdamW
+                    fused=not (self.is_vision_model and self.parallel_helper.tp_enabled),
+                )
+            elif self.optimizer_config.type == "adam_bf16":
+                self.optimizer = AnyPrecisionAdamW(
+                    self.model.parameters(),
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    betas=(beta1, beta2),
+                    eps=eps,
+                    momentum_dtype="bfloat16",
+                    variance_dtype="bfloat16",
+                )
+            else:
+                self.optimizer = torch.optim.SGD(
+                    self.model.parameters(),
+                    lr=lr,
+                    weight_decay=weight_decay,
+                )
+        
         total_train_steps = ft_spec.total_train_steps
         num_warmup_steps = int(
             self.optimizer_config.warmup_steps_proportion * total_train_steps
@@ -1231,15 +1367,28 @@ class FSDPEngine(TrainEngine):
             raise RuntimeError("Model not initialized")
         os.makedirs(path, exist_ok=True)
 
-        # FSDP2 checkpoint saving
-        # Get full state dict with FSDP2
-        options = StateDictOptions(full_state_dict=True, cpu_offload=True)
-        state_dict = get_model_state_dict(self.model, options=options)
+        if self.enable_tree_stack_training:
+            # Tree stack training (DDP): get state_dict from module
+            if dist.get_rank() == 0:
+                # DDP wraps the model, need to access .module
+                if hasattr(self.model, 'module'):
+                    state_dict = self.model.module.state_dict()
+                else:
+                    state_dict = self.model.state_dict()
+        else:
+            # FSDP2 checkpoint saving
+            # Get full state dict with FSDP2
+            options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+            state_dict = get_model_state_dict(self.model, options=options)
 
         # save huggingface model on rank 0
         if dist.get_rank() == 0:
             os.makedirs(path, exist_ok=True)
-            self.model.save_pretrained(path, state_dict=state_dict)
+            # Get the unwrapped model for save_pretrained
+            if self.enable_tree_stack_training and hasattr(self.model, 'module'):
+                self.model.module.save_pretrained(path, state_dict=state_dict)
+            else:
+                self.model.save_pretrained(path, state_dict=state_dict)
             self.model_config.save_pretrained(path)
             if tokenizer is not None:
                 tokenizer.save_pretrained(path)
@@ -1253,13 +1402,25 @@ class FSDPEngine(TrainEngine):
             full_state = get_state_dict_from_repo_id_or_path(path)
         else:
             full_state = {}
-
-        fsdp2_load_full_state_dict(
-            self.model,
-            full_state,
-            self.cpu_offload,
-            tie_word_embeddings=self.model_config.tie_word_embeddings,
-        )
+        
+        if self.enable_tree_stack_training:
+            # Tree stack training (DDP): directly load state_dict with broadcast
+            if dist.get_rank() == 0:
+                # Load to the unwrapped model
+                if hasattr(self.model, 'module'):
+                    self.model.module.load_state_dict(full_state)
+                else:
+                    self.model.load_state_dict(full_state)
+            # DDP will broadcast parameters automatically
+            dist.barrier(group=self.cpu_group)
+        else:
+            # FSDP2: use fsdp2_load_full_state_dict
+            fsdp2_load_full_state_dict(
+                self.model,
+                full_state,
+                self.cpu_offload,
+                tie_word_embeddings=self.model_config.tie_word_embeddings,
+            )
 
     def _save_to_dcp(
         self,
@@ -1291,24 +1452,44 @@ class FSDPEngine(TrainEngine):
     def _save_optimizer_state(self, path: str):
         assert self.optimizer is not None
         assert dist.is_initialized()
-        rank = dist.get_rank()
-        shard_path = os.path.join(
-            path, f"optim_world_size_{self.world_size}_rank_{rank}.pt"
-        )
-        state_dict = self.optimizer.state_dict()
-        torch.save(state_dict, shard_path)
-        dist.barrier(group=self.cpu_group)
+        
+        if self.enable_tree_stack_training:
+            # Tree stack training (ZeroRedundancyOptimizer): consolidate state to rank 0
+            if dist.get_rank() == 0:
+                self.optimizer.consolidate_state_dict(to=0)
+                state_dict = self.optimizer.state_dict()
+                torch.save(state_dict, os.path.join(path, "optimizer.pt"))
+            dist.barrier(group=self.cpu_group)
+        else:
+            # FSDP2: save sharded optimizer state
+            rank = dist.get_rank()
+            shard_path = os.path.join(
+                path, f"optim_world_size_{self.world_size}_rank_{rank}.pt"
+            )
+            state_dict = self.optimizer.state_dict()
+            torch.save(state_dict, shard_path)
+            dist.barrier(group=self.cpu_group)
 
     def _load_optimizer_state(self, path: str):
         assert self.optimizer is not None
         assert dist.is_initialized()
-        rank = dist.get_rank()
-        shard_path = os.path.join(
-            path, f"optim_world_size_{self.world_size}_rank_{rank}.pt"
-        )
-        optimizer_state_dict = torch.load(shard_path, weights_only=False)
-        self.optimizer.load_state_dict(optimizer_state_dict)
-        dist.barrier(group=self.cpu_group)
+        
+        if self.enable_tree_stack_training:
+            # Tree stack training (ZeroRedundancyOptimizer): load from consolidated state
+            optimizer_path = os.path.join(path, "optimizer.pt")
+            if dist.get_rank() == 0:
+                state_dict = torch.load(optimizer_path, weights_only=False)
+                self.optimizer.load_state_dict(state_dict)
+            dist.barrier(group=self.cpu_group)
+        else:
+            # FSDP2: load sharded optimizer state
+            rank = dist.get_rank()
+            shard_path = os.path.join(
+                path, f"optim_world_size_{self.world_size}_rank_{rank}.pt"
+            )
+            optimizer_state_dict = torch.load(shard_path, weights_only=False)
+            self.optimizer.load_state_dict(optimizer_state_dict)
+            dist.barrier(group=self.cpu_group)
 
     def _prepare_mb_list(self, input_: dict[str, Any]) -> MicroBatchList:
         assert "attention_mask" in input_ and "input_ids" in input_

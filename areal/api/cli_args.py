@@ -789,7 +789,12 @@ class TrainEngineConfig:
 
     enable_tree_stack_training: bool = field(
         default=False,
-        metadata={"help": "Enable tree stack training."},
+        metadata={
+            "help": (
+                "Enable tree stack training. "
+                "Uses ZeRO-1 (DDP + ZeroRedundancyOptimizer) for pure data parallel training."
+            )
+        },
     )
 
     stack_depth: int = field(
@@ -798,6 +803,11 @@ class TrainEngineConfig:
     )
 
 
+    ### Disable optimizer
+    disable_optimizer: bool = field(
+        default=False,
+        metadata={"help": "Disable optimizer for unit test."},
+    )
 
     # Scheduling
     scheduling_spec: tuple[SchedulingSpec, ...] = field(

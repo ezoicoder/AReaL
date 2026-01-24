@@ -1,7 +1,8 @@
 import os
+import time
 from contextlib import contextmanager
 from importlib.metadata import version as get_version
-from typing import Optional, Callable, Any
+from typing import Optional, Callable, Any, Tuple
 
 import pytest
 import torch
@@ -27,12 +28,53 @@ from areal.engine.ppo.actor import grpo_loss_fn
 logger = logging.getLogger("MegatronEngine Test")
 
 MODEL_PATH = get_model_path(
-    "/data/tree/models/Qwen3-0.6B", "Qwen/Qwen3-0.6B"
+    "/data/tree/models/Qwen3-8B", "Qwen/Qwen3-8B"
 )
 
 # Path to real tree training data
-TREE_DATA_PATH = "/data/tree/tree-data/tau2/call2_rank0.pt"
+TREE_DATA_PATH = "/data/tree/tree-data/tau2-16k-small/call2_rank0.pt"
 
+
+# =============================================================================
+# Memory tracking utilities
+# =============================================================================
+
+def reset_peak_memory():
+    """Reset CUDA peak memory statistics."""
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.synchronize()
+
+def get_memory_stats(stage_name: str) -> dict:
+    """Get current CUDA memory statistics.
+    
+    Args:
+        stage_name: Name of the current stage (for logging)
+        
+    Returns:
+        Dictionary with memory stats in GB
+    """
+    torch.cuda.synchronize()
+    stats = {
+        "stage": stage_name,
+        "allocated_gb": torch.cuda.memory_allocated() / 1024**3,
+        "reserved_gb": torch.cuda.memory_reserved() / 1024**3,
+        "peak_allocated_gb": torch.cuda.max_memory_allocated() / 1024**3,
+    }
+    return stats
+
+def log_memory_stats(stats: dict, logger_instance):
+    """Log memory statistics in a formatted way.
+    
+    Args:
+        stats: Dictionary with memory stats from get_memory_stats
+        logger_instance: Logger to use for output
+    """
+    logger_instance.info(f"\n{'='*60}")
+    logger_instance.info(f"Memory Stats - {stats['stage']}")
+    logger_instance.info(f"  Allocated: {stats['allocated_gb']:.2f} GB")
+    logger_instance.info(f"  Reserved:  {stats['reserved_gb']:.2f} GB")
+    logger_instance.info(f"  Peak:      {stats['peak_allocated_gb']:.2f} GB")
+    logger_instance.info(f"{'='*60}\n")
 
 # =============================================================================
 # Engine setup helpers and context managers
@@ -43,10 +85,12 @@ def setup_engine(
     engine_class,
     experiment_name: str,
     master_port: str,
-    max_tokens_per_mb: int = 15104,
+    max_tokens_per_mb: int = 16384,
     enable_tree_training: bool = False,
     enable_tree_stack_training: bool = False,
+    gradient_checkpointing: bool = False,
     model_path: str = MODEL_PATH,
+    disable_optimizer: bool = True,
 ):
     """Context manager to setup and teardown an engine (FSDP or Megatron).
     
@@ -57,7 +101,9 @@ def setup_engine(
         max_tokens_per_mb: Maximum tokens per microbatch
         enable_tree_training: Whether to enable tree training mode
         enable_tree_stack_training: Whether to enable tree attention training mode
+        gradient_checkpointing: Whether to enable gradient checkpointing
         model_path: Path to the model
+        disable_optimizer: Whether to disable optimizer (for gradient-only tests)
         
     Yields:
         Initialized engine instance
@@ -85,9 +131,11 @@ def setup_engine(
         trial_name="test",
         path=model_path,
         mb_spec=MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb),
-        optimizer=OptimizerConfig(),
+        optimizer=None if disable_optimizer else OptimizerConfig(),
         enable_tree_training=enable_tree_training,
         enable_tree_stack_training=enable_tree_stack_training,
+        gradient_checkpointing=gradient_checkpointing,
+        disable_optimizer=disable_optimizer,
         **engine_specific_config,
     )
     
@@ -109,8 +157,8 @@ def run_forward_pass(
     engine,
     input_data: dict[str, torch.Tensor],
     aggregate_fn: Optional[Callable] = None,
-) -> torch.Tensor:
-    """Run forward pass and return logprobs.
+) -> Tuple[torch.Tensor, float]:
+    """Run forward pass and return logprobs with timing.
     
     Args:
         engine: Engine instance (FSDP or Megatron)
@@ -118,16 +166,26 @@ def run_forward_pass(
         aggregate_fn: Optional aggregation function for output
         
     Returns:
-        Log probabilities tensor
+        Tuple of (log probabilities tensor, elapsed time in seconds)
     """
     engine.eval()
     
+    # Synchronize before timing
+    torch.cuda.synchronize()
+    start_time = time.time()
+    
     if isinstance(engine, FSDPEngine):
-        return engine.forward_batch(input_=input_data, aggregate_fn=aggregate_fn)
+        result = engine.forward_batch(input_=input_data, aggregate_fn=aggregate_fn)
     elif isinstance(engine, MegatronEngine):
-        return engine.forward(input_=input_data, aggregate_fn=aggregate_fn)
+        result = engine.forward(input_=input_data, aggregate_fn=aggregate_fn)
     else:
         raise ValueError(f"Unknown engine type: {type(engine)}")
+    
+    # Synchronize after computation
+    torch.cuda.synchronize()
+    elapsed_time = time.time() - start_time
+    
+    return result, elapsed_time
 
 
 def run_train_batch(
@@ -135,8 +193,8 @@ def run_train_batch(
     input_data: dict[str, torch.Tensor],
     loss_fn: Callable,
     loss_weight_fn: Callable,
-) -> Any:
-    """Run training batch (forward + backward).
+) -> Tuple[Any, float]:
+    """Run training batch (forward + backward) with timing.
     
     Args:
         engine: Engine instance (FSDP or Megatron)
@@ -145,14 +203,25 @@ def run_train_batch(
         loss_weight_fn: Loss weight function
         
     Returns:
-        Training result
+        Tuple of (training result, elapsed time in seconds)
     """
     engine.train()
-    return engine.train_batch(
+    
+    # Synchronize before timing
+    torch.cuda.synchronize()
+    start_time = time.time()
+    
+    result = engine.train_batch(
         input_data,
         loss_fn=loss_fn,
         loss_weight_fn=loss_weight_fn,
     )
+    
+    # Synchronize after computation
+    torch.cuda.synchronize()
+    elapsed_time = time.time() - start_time
+    
+    return result, elapsed_time
 
 
 # =============================================================================
@@ -170,51 +239,40 @@ def run_train_batch(
 #     return res
 
 from functools import partial
-# loss_fn = partial(
-#     grpo_loss_fn,
-#     eps_clip=0.2,  # insert appropriate values for your test case
-#     eps_clip_higher=None,
-#     c_clip=None,
-#     behav_imp_weight_cap=None,
-#     m2_threshold=None,
-#     importance_sampling_level="token",
-#     current_version=None,
-#     prox_logp_method="recompute",
-#     use_sapo_loss=False,
-#     sapo_tau_pos=1.0,
-#     sapo_tau_neg=1.05,
-#     use_decoupled_loss=False,
-#     vocab_min_logits=None,
-#     vocab_max_logits=None,
-# )
+loss_fn = partial(
+    grpo_loss_fn,
+    eps_clip=0.2,  # insert appropriate values for your test case
+    eps_clip_higher=None,
+    c_clip=None,
+    behav_imp_weight_cap=None,
+    m2_threshold=None,
+    importance_sampling_level="token",
+    current_version=None,
+    prox_logp_method="recompute",
+    use_sapo_loss=False,
+    sapo_tau_pos=1.0,
+    sapo_tau_neg=1.05,
+    use_decoupled_loss=False,
+    vocab_min_logits=None,
+    vocab_max_logits=None,
+)
 
 # def loss_fn(logprobs, entropy, input_data):
 #     return entropy.sum() / input_data["loss_mask"].count_nonzero()
 
-def loss_fn(logprobs, entropy, input_data):
-    # Create a mask with 1s everywhere except for positions x-1 for x in cu_seqlens, which are 0
-    # cu_seqlens = input_data["cu_seqlens"]
-    # mask = torch.ones_like(logprobs, dtype=logprobs.dtype)
-    # for x in cu_seqlens:
-    #     if x.item() > 0 and (x.item() - 1) < mask.numel():
-    #         mask[x.item() - 1] = 0
-    # mask = mask.detach()  # Only mask is detached, will not affect logprobs autograd
-    # logprobs = logprobs * mask
-    return logprobs.sum() / input_data["loss_mask"].count_nonzero()
+# def loss_fn(logprobs, entropy, input_data):
+#     # Create a mask with 1s everywhere except for positions x-1 for x in cu_seqlens, which are 0
+#     cu_seqlens = input_data["cu_seqlens"]
+#     mask = torch.ones_like(logprobs, dtype=logprobs.dtype)
+#     for x in cu_seqlens:
+#         if x.item() > 0 and (x.item() - 1) < mask.numel():
+#             mask[x.item() - 1] = 0
+#     mask = mask.detach()  # Only mask is detached, will not affect logprobs autograd
+#     logprobs = logprobs * mask
+#     return logprobs.sum() / input_data["loss_mask"].count_nonzero()
 
 def loss_weight_fn(input_data):
     """Default weight function based on attention_mask sum"""
-    # print(f"[Debug] input_data keys: {list(input_data.keys())}")
-    # print(f"[Debug] shape of full attention_mask: {input_data['loss_mask'].shape,input_data["loss_mask"].sum().item()}")
-    # print(f"[Debug] shape of input_ids: {input_data['input_ids'].shape}")
-
-
-    # print(f"[Debug] cu_seqlens: {input_data['cu_seqlens']}")
-
-    # print(f"[Debug] keys of input_data: {input_data.keys()}")
-
-    # 取 cu_seqlens 的最后一项
-    # return input_data["loss_mask"].count_nonzero()
     return input_data["loss_mask"].count_nonzero()
 
 
@@ -279,11 +337,14 @@ def _assert_logprobs_close(
 
 
 @pytest.fixture(scope="module")
-def real_tree_input(device=current_platform.device_type):
+def real_tree_input(prefix_len):
     """Load real tree training data from saved file.
 
-    Returns the full input_data from saved file (no num_samples limit).
+    Returns the full input_data from saved file (or prefix if prefix_len != -1).
     Additionally, prints out the sequence lengths for inspection.
+    
+    Args:
+        prefix_len: Number of sequences to keep. If -1, keep all sequences.
     """
     import os
     if not os.path.exists(TREE_DATA_PATH):
@@ -295,6 +356,7 @@ def real_tree_input(device=current_platform.device_type):
 
     input_data = data["input_data"]
 
+    device = current_platform.device_type
     device_obj = device if isinstance(device, torch.device) else torch.device(device)
 
     # Output sequence lengths for debugging
@@ -302,168 +364,29 @@ def real_tree_input(device=current_platform.device_type):
         attn_mask = input_data["attention_mask"]
         if attn_mask is not None:
             seq_lens = attn_mask.sum(dim=1).cpu().tolist()
-            print(f"[real_tree_input] Loaded {attn_mask.shape[0]} sequences.")
+            total_sequences = attn_mask.shape[0]
+            print(f"[real_tree_input] Loaded {total_sequences} sequences.")
             print(f"[real_tree_input] Sequence lengths: min={min(seq_lens)}, max={max(seq_lens)}, mean={sum(seq_lens)/len(seq_lens):.2f}")
             # Optionally, print first few lengths for clarity
             print(f"[real_tree_input] First 10 sequence lengths: {seq_lens[:10]}")
+            
+            # Apply prefix_len filter if specified
+            if prefix_len != -1:
+                print(f"[real_tree_input] Applying prefix_len={prefix_len}, keeping first {prefix_len} sequences")
 
-    # Load all fields present in input_data
+    # Load all fields present in input_data and apply prefix_len filter
     result = {}
     for field, value in input_data.items():
         if isinstance(value, torch.Tensor):
-            result[field] = value.to(device_obj)
+            # Apply prefix_len filter if not -1
+            if prefix_len != -1 and value.size(0) >= prefix_len:
+                result[field] = value[:prefix_len].to(device_obj)
+            else:
+                result[field] = value.to(device_obj)
         else:
             result[field] = value
 
     return result
-
-# @pytest.fixture(scope="module")
-# def real_tree_input_prefix(device=current_platform.device_type):
-#     """Load real tree training data from saved file, keeping only the first item for each tensor field."""
-#     import os
-#     if not os.path.exists(TREE_DATA_PATH):
-#         pytest.skip(f"Tree data file not found: {TREE_DATA_PATH}")
-
-#     data = torch.load(TREE_DATA_PATH)
-#     if "input_data" not in data:
-#         pytest.skip(f"No input_data found in {TREE_DATA_PATH}")
-
-#     input_data = data["input_data"]
-#     device_obj = device if isinstance(device, torch.device) else torch.device(device)
-
-#     # Output sequence lengths for debugging
-#     if "attention_mask" in input_data:
-#         attn_mask = input_data["attention_mask"]
-#         if attn_mask is not None:
-#             seq_lens = attn_mask.sum(dim=1).cpu().tolist()
-#             print(f"[real_tree_input] Loaded {attn_mask.shape[0]} sequences.")
-#             print(f"[real_tree_input] Sequence lengths: min={min(seq_lens)}, max={max(seq_lens)}, mean={sum(seq_lens)/len(seq_lens):.2f}")
-#             print(f"[real_tree_input] First 10 sequence lengths: {seq_lens[:10]}")
-
-#     # Load all fields present in input_data, for each tensor keep only first item along dim=0
-#     result = {}
-#     for field, value in input_data.items():
-#         if isinstance(value, torch.Tensor):
-#             value = value[:2].to(device_obj)
-#             result[field] = value
-#         else:
-#             result[field] = value
-
-#     return result
-
-@pytest.fixture(scope="module")
-def mock_tree_input(
-    batch_size=16,
-    tree_tokens=8192,
-    total_tokens=16384,
-    device=current_platform.device_type,
-):
-    if batch_size <= 0:
-        raise ValueError("batch_size must be positive")
-    if total_tokens < tree_tokens:
-        raise ValueError("total_tokens must be >= tree_tokens")
-    if total_tokens < batch_size:
-        raise ValueError(
-            "total_tokens must be >= batch_size to allocate at least one token per sequence"
-        )
-
-    device = device if isinstance(device, torch.device) else torch.device(device)
-    lengths = [tree_tokens]
-    remaining_tokens = total_tokens - tree_tokens
-    remaining_slots = batch_size - 1
-
-    if remaining_slots:
-        if remaining_tokens < remaining_slots:
-            raise ValueError("Not enough tokens available for the requested batch size")
-        for index in range(remaining_slots):
-            slots_left = remaining_slots - index - 1
-            max_assignable = min(tree_tokens, remaining_tokens - slots_left)
-            share = max(1, min(max_assignable, remaining_tokens // (slots_left + 1)))
-            lengths.append(share)
-            remaining_tokens -= share
-        if remaining_tokens != 0:
-            lengths[-1] += remaining_tokens
-            remaining_tokens = 0
-    else:
-        if total_tokens != tree_tokens:
-            raise ValueError("total_tokens must equal tree_tokens when batch_size is 1")
-
-    lengths = [int(length) for length in lengths]
-    if sum(lengths) != total_tokens:
-        raise RuntimeError("Token length allocation mismatch")
-
-    base_tokens = torch.arange(1, tree_tokens + 1, dtype=torch.long, device=device)
-    max_len = max(lengths)
-    input_ids = torch.full((batch_size, max_len), 0, dtype=torch.long, device=device)
-    attention_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=device)
-
-    sequences = []
-    for idx, length in enumerate(lengths):
-        seq_tokens = base_tokens[:length]
-        input_ids[idx, :length] = seq_tokens
-        attention_mask[idx, :length] = True
-        sequences.append(seq_tokens.tolist())
-
-    def _count_unique_nodes(seqs: list[list[int]]) -> int:
-        root: dict[int, dict] = {}
-        count = 0
-        for seq in seqs:
-            node = root
-            for token in seq:
-                if token not in node:
-                    node[token] = {}
-                    count += 1
-                node = node[token]
-        return count
-
-    unique_nodes = _count_unique_nodes(sequences)
-    if unique_nodes != tree_tokens:
-        raise RuntimeError(
-            f"Constructed tree has {unique_nodes} tokens, expected {tree_tokens}"
-        )
-
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "loss_mask": attention_mask.clone(),
-    }
-
-
-# Cannot use a "module" scope since process groups can only be initialized once.
-@pytest.fixture
-def engine():
-    logger.info(f"megatron.core version={get_version('megatron.core')}")
-    os.environ.update(
-        {
-            "WORLD_SIZE": "1",
-            "RANK": "0",
-            "LOCAL_RANK": "0",
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": "7777",
-        }
-    )
-    config = TrainEngineConfig(
-        experiment_name="test",
-        trial_name="test",
-        path=MODEL_PATH,
-        mb_spec=MicroBatchSpec(max_tokens_per_mb=1024),
-        optimizer=OptimizerConfig(),
-        megatron=MegatronEngineConfig(
-            use_deterministic_algorithms=True,
-        ),
-    )
-    alloc_mode = AllocationMode.from_str("d1p1t1")
-    ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=128, train_batch_size=8)
-    engine = MegatronEngine(config)
-    engine.create_process_group(alloc_mode.train)
-    engine.initialize(addr=None, ft_spec=ft_spec, parallel_strategy=alloc_mode.train)
-    logger.info(f"mcore GPTModel initialized: {engine.model}")
-    try:
-        yield engine
-    finally:
-        engine.destroy()
-        assert not dist.is_initialized()
-
 
 def _collect_gradients(engine) -> dict[str, torch.Tensor]:
     grads = {}
@@ -509,11 +432,13 @@ def _compare_and_assert_gradients(
 ) -> None:
     """Compare gradients between baseline and tree training engines and assert they match.
     
+    All tensors are expected to be CPU tensors (detached).
+    
     Args:
-        baseline_grads: Gradients from baseline engine
-        tree_grads: Gradients from tree training engine
-        baseline_params: Parameters from baseline engine
-        tree_params: Parameters from tree training engine
+        baseline_grads: Gradients from baseline engine (CPU tensors)
+        tree_grads: Gradients from tree training engine (CPU tensors)
+        baseline_params: Parameters from baseline engine (CPU tensors)
+        tree_params: Parameters from tree training engine (CPU tensors)
         logger_instance: Logger instance for logging messages
         max_mismatch_prints: Maximum number of detailed mismatch logs to print
         mean_rel_diff_threshold: Threshold for mean relative difference to trigger mismatch
@@ -535,7 +460,7 @@ def _compare_and_assert_gradients(
         logger_instance.warning(f"Gradients only in tree training: {only_in_tree}")
 
     common_keys = baseline_keys & tree_keys
-    logger_instance.info(f"Comparing {len(common_keys)} common gradient tensors")
+    logger_instance.info(f"Comparing {len(common_keys)} common gradient tensors on CPU")
 
     # Check for NaN and zero gradients
     nan_in_baseline = []
@@ -567,9 +492,9 @@ def _compare_and_assert_gradients(
             total_count = tree_grads[name].numel()
             logger_instance.info(f"  {name}: {nan_count}/{total_count} NaN values")
 
-    # Check for NaN in updated parameters
-    nan_params_baseline = _check_nan_params(baseline_params, "BASELINE FSDP PARAMS")
-    nan_params_tree = _check_nan_params(tree_params, "TREE TRAINING FSDP PARAMS")
+    # Check for NaN in updated parameters (if provided)
+    nan_params_baseline = _check_nan_params(baseline_params, "BASELINE FSDP PARAMS") if baseline_params else []
+    nan_params_tree = _check_nan_params(tree_params, "TREE TRAINING FSDP PARAMS") if tree_params else []
 
     mismatched_params = []
     max_diff_overall = 0.0
@@ -585,6 +510,7 @@ def _compare_and_assert_gradients(
             )
             continue
 
+        # All operations on CPU tensors now
         diff = (baseline_grad - tree_grad).abs()
         max_diff = diff.max().item()
         mean_diff = diff.mean().item()
@@ -608,22 +534,11 @@ def _compare_and_assert_gradients(
             
             # Only print detailed info for the first few mismatches
             if mismatch_print_count < max_mismatch_prints:
-                # Extract local tensor from DTensor if needed
-                def to_local_tensor(t):
-                    """Convert DTensor to local tensor, or return as-is if already local."""
-                    if hasattr(t, '_local_tensor'):
-                        return t._local_tensor.cpu()
-                    return t.cpu()
-                
-                baseline_grad_local = to_local_tensor(baseline_grad)
-                tree_grad_local = to_local_tensor(tree_grad)
-                rel_diff_local = to_local_tensor(rel_diff)
-                
                 # Find the position with max relative difference
-                max_rel_diff_idx = rel_diff_local.argmax()
-                max_rel_diff_pos = torch.unravel_index(max_rel_diff_idx, baseline_grad_local.shape)
-                baseline_at_max = baseline_grad_local[max_rel_diff_pos].item()
-                tree_at_max = tree_grad_local[max_rel_diff_pos].item()
+                max_rel_diff_idx = rel_diff.argmax()
+                max_rel_diff_pos = torch.unravel_index(max_rel_diff_idx, baseline_grad.shape)
+                baseline_at_max = baseline_grad[max_rel_diff_pos].item()
+                tree_at_max = tree_grad[max_rel_diff_pos].item()
                 
                 logger_instance.info(
                     f"Gradient mismatch for {name}: "
@@ -636,8 +551,6 @@ def _compare_and_assert_gradients(
                     f"Max rel diff at position {max_rel_diff_pos}: baseline={baseline_at_max:.6e}, tree={tree_at_max:.6e}"
                 )
                 
-                # Clean up local tensors to free memory
-                del baseline_grad_local, tree_grad_local, rel_diff_local
                 mismatch_print_count += 1
 
     assert len(only_in_baseline) == 0, (
@@ -1109,36 +1022,81 @@ def fsdp_engine(max_tokens_per_mb):
 
 
 def _collect_fsdp_gradients(engine: FSDPEngine) -> dict[str, torch.Tensor]:
-    """Collect gradients from FSDP engine."""
+    """Collect gradients from FSDP engine and immediately offload to CPU.
+    
+    Handles both regular tensors and DTensors (FSDP2) and DDP-wrapped models.
+    
+    Args:
+        engine: FSDP engine
+        
+    Returns:
+        Dictionary of CPU tensors (detached, local tensors extracted from DTensor).
+        Parameter names have DDP's 'module.' prefix removed for consistency.
+    """
     grads = {}
+    dtensor_count = 0
     for name, param in engine.model.named_parameters():
         if param.grad is not None:
-            grads[name] = param.grad.clone().detach()
+            # Remove DDP's 'module.' prefix for consistency with FSDP2
+            clean_name = name.replace("module.", "", 1) if name.startswith("module.") else name
+            
+            # Check if this is a DTensor (FSDP2)
+            if hasattr(param.grad, '_local_tensor'):
+                # Extract local tensor from DTensor
+                grads[clean_name] = param.grad._local_tensor.detach().cpu()
+                dtensor_count += 1
+            else:
+                # Regular tensor (DDP or standard)
+                grads[clean_name] = param.grad.detach().cpu()
+    
+    if dtensor_count > 0:
+        fsdp_logger.debug(f"Collected {dtensor_count} DTensor gradients (extracted to local tensors)")
+    
     return grads
 
 
 def _collect_fsdp_parameters(engine: FSDPEngine) -> dict[str, torch.Tensor]:
-    """Collect parameters from FSDP engine."""
+    """Collect parameters from FSDP engine and immediately offload to CPU.
+    
+    Handles both regular tensors and DTensors (FSDP2) and DDP-wrapped models.
+    
+    Args:
+        engine: FSDP engine
+        
+    Returns:
+        Dictionary of CPU tensors (detached, local tensors extracted from DTensor).
+        Parameter names have DDP's 'module.' prefix removed for consistency.
+    """
     params = {}
+    dtensor_count = 0
     for name, param in engine.model.named_parameters():
-        params[name] = param.data.clone()
+        # Remove DDP's 'module.' prefix for consistency with FSDP2
+        clean_name = name.replace("module.", "", 1) if name.startswith("module.") else name
+        
+        # Check if this is a DTensor (FSDP2)
+        if hasattr(param.data, '_local_tensor'):
+            # Extract local tensor from DTensor
+            params[clean_name] = param.data._local_tensor.detach().cpu()
+            dtensor_count += 1
+        else:
+            # Regular tensor (DDP or standard)
+            params[clean_name] = param.data.detach().cpu()
+    
+    if dtensor_count > 0:
+        fsdp_logger.debug(f"Collected {dtensor_count} DTensor parameters (extracted to local tensors)")
+    
     return params
 
 
-def test_fsdp_tree_training_forward(fsdp_engine, real_tree_input, max_tokens_per_mb):
+### Never use gradient checkpointing for tree stack training
+def test_fsdp_flex_forward(fsdp_engine, real_tree_input, max_tokens_per_mb):
     """Test FSDP tree training forward pass produces correct logprobs."""
-    import time
-    
     # Run baseline forward pass
-    torch.cuda.synchronize()
-    baseline_start = time.time()
-    logprob_baseline = run_forward_pass(
+    logprob_baseline, baseline_time = run_forward_pass(
         fsdp_engine,
         real_tree_input,
         aggregate_fn=lambda xs: torch.cat(xs, dim=-1),
     )
-    torch.cuda.synchronize()
-    baseline_time = time.time() - baseline_start
     fsdp_logger.info(f"Baseline forward_batch time: {baseline_time:.4f}s")
     print("logprob_baseline shape:", logprob_baseline.shape)
 
@@ -1150,11 +1108,7 @@ def test_fsdp_tree_training_forward(fsdp_engine, real_tree_input, max_tokens_per
         max_tokens_per_mb=max_tokens_per_mb,
         enable_tree_training=True,
     ) as tree_engine:
-        torch.cuda.synchronize()
-        tree_start = time.time()
-        logprob_tree = run_forward_pass(tree_engine, real_tree_input)
-        torch.cuda.synchronize()
-        tree_time = time.time() - tree_start
+        logprob_tree, tree_time = run_forward_pass(tree_engine, real_tree_input)
         fsdp_logger.info(f"Tree training forward_batch time: {tree_time:.4f}s")
         
         speedup = baseline_time / tree_time
@@ -1164,20 +1118,14 @@ def test_fsdp_tree_training_forward(fsdp_engine, real_tree_input, max_tokens_per
         # Compare results
         _assert_logprobs_close(logprob_tree, logprob_baseline, fsdp_logger)
 
-def test_fsdp_tree_stack_training_forward(fsdp_engine, real_tree_input, max_tokens_per_mb):
+def test_fsdp_stack_forward(fsdp_engine, real_tree_input, max_tokens_per_mb):
     """Test FSDP tree attention training forward pass produces correct logprobs."""
-    import time
-    
     # Run baseline forward pass
-    torch.cuda.synchronize()
-    baseline_start = time.time()
-    logprob_baseline = run_forward_pass(
+    logprob_baseline, baseline_time = run_forward_pass(
         fsdp_engine,
         real_tree_input,
         aggregate_fn=lambda xs: torch.cat(xs, dim=-1),
     )
-    torch.cuda.synchronize()
-    baseline_time = time.time() - baseline_start
     fsdp_logger.info(f"Baseline forward_batch time: {baseline_time:.4f}s")
     print("logprob_baseline shape:", logprob_baseline.shape)
 
@@ -1189,13 +1137,9 @@ def test_fsdp_tree_stack_training_forward(fsdp_engine, real_tree_input, max_toke
         max_tokens_per_mb=max_tokens_per_mb,
         enable_tree_stack_training=True,
     ) as tree_engine:
-        torch.cuda.synchronize()
-        tree_start = time.time()
-        logprob_tree = run_forward_pass(tree_engine, real_tree_input)
-        torch.cuda.synchronize()
-        tree_time = time.time() - tree_start
+        logprob_tree, tree_time = run_forward_pass(tree_engine, real_tree_input)
         fsdp_logger.info(f"Tree attention forward_batch time: {tree_time:.4f}s")
-        
+
         speedup = baseline_time / tree_time
         fsdp_logger.info(f"Speedup (baseline/tree_stack): {speedup:.2f}x")
         print("logprob_tree shape:", logprob_tree.shape)
@@ -1203,83 +1147,145 @@ def test_fsdp_tree_stack_training_forward(fsdp_engine, real_tree_input, max_toke
         # Compare results
         _assert_logprobs_close(logprob_tree, logprob_baseline, fsdp_logger)
 
-def test_fsdp_tree_training_backward(real_tree_input, max_tokens_per_mb):
+def test_fsdp_flex_backward(real_tree_input, max_tokens_per_mb, is_gradient_checkpointing):
     """Test FSDP tree training forward-backward pass produces correct gradients."""
-    import time
-
-    # Run baseline training
+    # Run baseline training FIRST
+    reset_peak_memory()
     with setup_engine(
         FSDPEngine,
         experiment_name="test_baseline",
         master_port="7782",
         max_tokens_per_mb=max_tokens_per_mb,
+        gradient_checkpointing=is_gradient_checkpointing,
     ) as baseline_engine:
-        torch.cuda.synchronize()
-        baseline_start = time.time()
-        _ = run_train_batch(baseline_engine, real_tree_input, loss_fn, loss_weight_fn)
-        torch.cuda.synchronize()
-        baseline_time = time.time() - baseline_start
+        _, baseline_time = run_train_batch(baseline_engine, real_tree_input, loss_fn, loss_weight_fn)
         fsdp_logger.info(f"Baseline train_batch time: {baseline_time:.4f}s")
+        
+        # Get and log memory stats for baseline
+        baseline_mem_stats = get_memory_stats("Baseline Training")
+        log_memory_stats(baseline_mem_stats, fsdp_logger)
 
+        # Collect gradients and params, automatically offloaded to CPU
         baseline_grads = _collect_fsdp_gradients(baseline_engine)
         baseline_params = _collect_fsdp_parameters(baseline_engine)
-        fsdp_logger.info(f"Collected {len(baseline_grads)} gradients from baseline FSDP engine")
+        
+        fsdp_logger.info(f"[Baseline] Collected {len(baseline_grads)} gradients (detached, on CPU)")
+        
+        # Check NaN in baseline params immediately
+        nan_params_baseline = _check_nan_params(baseline_params, "BASELINE FSDP PARAMS")
+        assert len(nan_params_baseline) == 0, f"NaN parameters in baseline: {nan_params_baseline}"
+        del baseline_params  # Free CPU memory
 
-    # Run tree training
+    # Force garbage collection and clear CUDA cache to free all GPU memory
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    
+    # Report memory status after cleanup
+    mem_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+    mem_reserved = torch.cuda.memory_reserved() / 1024**3
+    mem_max = torch.cuda.max_memory_allocated() / 1024**3
+    fsdp_logger.info(f"[Cleanup] After GC and cache clear - Allocated: {mem_allocated:.2f} GB, Reserved: {mem_reserved:.2f} GB, Peak: {mem_max:.2f} GB")
+    
+    time.sleep(1)  # Wait to observe memory release
+
+    # Run flatten tree training SECOND
+    reset_peak_memory()
     with setup_engine(
         FSDPEngine,
         experiment_name="test_tree",
         master_port="7783",
         max_tokens_per_mb=max_tokens_per_mb,
+        gradient_checkpointing=is_gradient_checkpointing,
         enable_tree_training=True,
     ) as tree_engine:
-        torch.cuda.synchronize()
-        tree_start = time.time()
-        _ = run_train_batch(tree_engine, real_tree_input, loss_fn, loss_weight_fn)
-        torch.cuda.synchronize()
-        tree_time = time.time() - tree_start
+        _, tree_time = run_train_batch(tree_engine, real_tree_input, loss_fn, loss_weight_fn)
         fsdp_logger.info(f"Tree training train_batch time: {tree_time:.4f}s")
         
         speedup = baseline_time / tree_time
         fsdp_logger.info(f"Speedup (baseline/tree): {speedup:.2f}x")
+        
+        # Get and log memory stats for tree training
+        tree_mem_stats = get_memory_stats("Flex Tree Training")
+        log_memory_stats(tree_mem_stats, fsdp_logger)
 
+        # Collect gradients and params, automatically offloaded to CPU
         tree_grads = _collect_fsdp_gradients(tree_engine)
         tree_params = _collect_fsdp_parameters(tree_engine)
-        fsdp_logger.info(f"Collected {len(tree_grads)} gradients from tree training FSDP engine")
+        
+        fsdp_logger.info(f"[Tree] Collected {len(tree_grads)} gradients (detached, on CPU)")
+        
+        # Check NaN in tree params immediately
+        nan_params_tree = _check_nan_params(tree_params, "TREE TRAINING FSDP PARAMS")
+        assert len(nan_params_tree) == 0, f"NaN parameters in tree training: {nan_params_tree}"
+        del tree_params  # Free CPU memory
+    
+    # Log comparison of memory usage
+    mem_savings = baseline_mem_stats['peak_allocated_gb'] - tree_mem_stats['peak_allocated_gb']
+    mem_ratio = tree_mem_stats['peak_allocated_gb'] / baseline_mem_stats['peak_allocated_gb']
+    fsdp_logger.info(f"\n{'='*60}")
+    fsdp_logger.info(f"Memory Comparison (Baseline vs Flex Tree)")
+    fsdp_logger.info(f"  Memory savings: {mem_savings:.2f} GB")
+    fsdp_logger.info(f"  Memory ratio:   {mem_ratio:.2%}")
+    fsdp_logger.info(f"{'='*60}\n")
 
-    # Compare gradients
+    # Compare gradients directly on CPU (params already checked and freed)
+
+    fsdp_logger.info(f"[Comparison] Comparing gradients on CPU...")
     _compare_and_assert_gradients(
         baseline_grads=baseline_grads,
         tree_grads=tree_grads,
-        baseline_params=baseline_params,
-        tree_params=tree_params,
+        baseline_params={},  # Already checked and freed
+        tree_params={},  # Already checked and freed
         logger_instance=fsdp_logger,
     )
 
-def test_fsdp_tree_stack_training_backward(real_tree_input, max_tokens_per_mb):
+def test_fsdp_stack_backward(real_tree_input, max_tokens_per_mb, is_gradient_checkpointing):
     """Test FSDP tree attention training forward-backward pass produces correct gradients."""
-    import time
-
-    # Run baseline training
+    # Run baseline training FIRST
+    reset_peak_memory()
     with setup_engine(
         FSDPEngine,
         experiment_name="test_baseline",
         master_port="7782",
+        gradient_checkpointing=is_gradient_checkpointing,
         max_tokens_per_mb=max_tokens_per_mb,
     ) as baseline_engine:
-        torch.cuda.synchronize()
-        baseline_start = time.time()
-        _ = run_train_batch(baseline_engine, real_tree_input, loss_fn, loss_weight_fn)
-        torch.cuda.synchronize()
-        baseline_time = time.time() - baseline_start
+        _, baseline_time = run_train_batch(baseline_engine, real_tree_input, loss_fn, loss_weight_fn)
         fsdp_logger.info(f"Baseline train_batch time: {baseline_time:.4f}s")
+        
+        # Get and log memory stats for baseline
+        baseline_mem_stats = get_memory_stats("Baseline Training")
+        log_memory_stats(baseline_mem_stats, fsdp_logger)
 
+        # Collect gradients and params, automatically offloaded to CPU
         baseline_grads = _collect_fsdp_gradients(baseline_engine)
         baseline_params = _collect_fsdp_parameters(baseline_engine)
-        fsdp_logger.info(f"Collected {len(baseline_grads)} gradients from baseline FSDP engine")
+        
+        fsdp_logger.info(f"[Baseline] Collected {len(baseline_grads)} gradients (detached, on CPU)")
+        
+        # Check NaN in baseline params immediately
+        nan_params_baseline = _check_nan_params(baseline_params, "BASELINE FSDP PARAMS")
+        assert len(nan_params_baseline) == 0, f"NaN parameters in baseline: {nan_params_baseline}"
+        del baseline_params  # Free CPU memory
 
-    # Run tree stack training
+    # Force garbage collection and clear CUDA cache to free all GPU memory
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    
+    # Report memory status after cleanup
+    mem_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+    mem_reserved = torch.cuda.memory_reserved() / 1024**3
+    mem_max = torch.cuda.max_memory_allocated() / 1024**3
+    fsdp_logger.info(f"[Cleanup] After GC and cache clear - Allocated: {mem_allocated:.2f} GB, Reserved: {mem_reserved:.2f} GB, Peak: {mem_max:.2f} GB")
+    
+    time.sleep(1)  # Wait to observe memory release
 
+    # Run tree stack training SECOND
+    reset_peak_memory()
     with setup_engine(
         FSDPEngine,
         experiment_name="test_tree_stack",
@@ -1287,25 +1293,145 @@ def test_fsdp_tree_stack_training_backward(real_tree_input, max_tokens_per_mb):
         max_tokens_per_mb=max_tokens_per_mb,
         enable_tree_stack_training=True,
     ) as tree_engine:
-        torch.cuda.synchronize()
-        tree_start = time.time()
-        _ = run_train_batch(tree_engine, real_tree_input, loss_fn, loss_weight_fn)
-        torch.cuda.synchronize()
-        tree_time = time.time() - tree_start
-        fsdp_logger.info(f"Tree attention train_batch time: {tree_time:.4f}s")
+        _, tree_time = run_train_batch(tree_engine, real_tree_input, loss_fn, loss_weight_fn)
+        fsdp_logger.info(f"Tree stack train_batch time: {tree_time:.4f}s")
         
         speedup = baseline_time / tree_time
         fsdp_logger.info(f"Speedup (baseline/tree_stack): {speedup:.2f}x")
+        
+        # Get and log memory stats for tree stack training
+        tree_mem_stats = get_memory_stats("Tree Stack Training")
+        log_memory_stats(tree_mem_stats, fsdp_logger)
 
+        # Collect gradients and params, automatically offloaded to CPU
         tree_grads = _collect_fsdp_gradients(tree_engine)
         tree_params = _collect_fsdp_parameters(tree_engine)
-        fsdp_logger.info(f"Collected {len(tree_grads)} gradients from tree attention FSDP engine")
+        
+        fsdp_logger.info(f"[TreeStack] Collected {len(tree_grads)} gradients (detached, on CPU)")
+        
+        # Check NaN in tree params immediately
+        nan_params_tree = _check_nan_params(tree_params, "TREE STACK FSDP PARAMS")
+        assert len(nan_params_tree) == 0, f"NaN parameters in tree stack: {nan_params_tree}"
+        del tree_params  # Free CPU memory
+    
+    # Log comparison of memory usage
+    mem_savings = baseline_mem_stats['peak_allocated_gb'] - tree_mem_stats['peak_allocated_gb']
+    mem_ratio = tree_mem_stats['peak_allocated_gb'] / baseline_mem_stats['peak_allocated_gb']
+    fsdp_logger.info(f"\n{'='*60}")
+    fsdp_logger.info(f"Memory Comparison (Baseline vs Tree Stack)")
+    fsdp_logger.info(f"  Memory savings: {mem_savings:.2f} GB")
+    fsdp_logger.info(f"  Memory ratio:   {mem_ratio:.2%}")
+    fsdp_logger.info(f"{'='*60}\n")
 
-    # Compare gradients
+    # Compare gradients directly on CPU (params already checked and freed)
+    fsdp_logger.info(f"[Comparison] Comparing gradients on CPU...")
     _compare_and_assert_gradients(
         baseline_grads=baseline_grads,
         tree_grads=tree_grads,
-        baseline_params=baseline_params,
-        tree_params=tree_params,
+        baseline_params={},  # Already checked and freed
+        tree_params={},  # Already checked and freed
         logger_instance=fsdp_logger,
     )
+
+def test_flex(real_tree_input, max_tokens_per_mb, is_gradient_checkpointing):
+    """Test flex (flatten tree) training and record execution time.
+    
+    This test runs flex tree training mode and records the training time.
+    """
+    reset_peak_memory()
+    with setup_engine(
+        FSDPEngine,
+        experiment_name="test_flex",
+        master_port="7784",
+        max_tokens_per_mb=max_tokens_per_mb,
+        gradient_checkpointing=is_gradient_checkpointing,
+        enable_tree_training=True,
+    ) as flex_engine:
+        _, flex_time = run_train_batch(flex_engine, real_tree_input, loss_fn, loss_weight_fn)
+        
+        # Get and log memory stats
+        flex_mem_stats = get_memory_stats("Flex Tree Training")
+        
+        fsdp_logger.info(f"\n{'='*60}")
+        fsdp_logger.info(f"Flex tree training time: {flex_time:.4f}s")
+        fsdp_logger.info(f"Peak memory usage: {flex_mem_stats['peak_allocated_gb']:.2f} GB")
+        fsdp_logger.info(f"{'='*60}\n")
+        
+        log_memory_stats(flex_mem_stats, fsdp_logger)
+
+
+def test_stack(real_tree_input, max_tokens_per_mb):
+    """Test stack (tree attention) training and record execution time.
+    
+    This test runs stack tree training mode and records the training time.
+    Note: Stack training does not support gradient checkpointing.
+    """
+    reset_peak_memory()
+    with setup_engine(
+        FSDPEngine,
+        experiment_name="test_stack",
+        master_port="7785",
+        max_tokens_per_mb=max_tokens_per_mb,
+        enable_tree_stack_training=True,
+    ) as stack_engine:
+        _, stack_time = run_train_batch(stack_engine, real_tree_input, loss_fn, loss_weight_fn)
+        
+        # Get and log memory stats
+        stack_mem_stats = get_memory_stats("Tree Stack Training")
+        
+        fsdp_logger.info(f"\n{'='*60}")
+        fsdp_logger.info(f"Stack tree training time: {stack_time:.4f}s")
+        fsdp_logger.info(f"Peak memory usage: {stack_mem_stats['peak_allocated_gb']:.2f} GB")
+        fsdp_logger.info(f"{'='*60}\n")
+        
+        log_memory_stats(stack_mem_stats, fsdp_logger)
+
+
+def test_baseline(real_tree_input, max_tokens_per_mb, is_gradient_checkpointing):
+    """Test baseline (standard) training and record execution time.
+    
+    This test runs baseline training mode without any tree optimizations
+    and records the training time for comparison purposes.
+    """
+    reset_peak_memory()
+    with setup_engine(
+        FSDPEngine,
+        experiment_name="test_baseline",
+        master_port="7786",
+        max_tokens_per_mb=max_tokens_per_mb,
+        gradient_checkpointing=is_gradient_checkpointing,
+        enable_tree_training=False,
+        enable_tree_stack_training=False,
+    ) as baseline_engine:
+        _, baseline_time = run_train_batch(baseline_engine, real_tree_input, loss_fn, loss_weight_fn)
+        
+        # Get and log memory stats
+        baseline_mem_stats = get_memory_stats("Baseline Training")
+        
+        fsdp_logger.info(f"\n{'='*60}")
+        fsdp_logger.info(f"Baseline training time: {baseline_time:.4f}s")
+        fsdp_logger.info(f"Peak memory usage: {baseline_mem_stats['peak_allocated_gb']:.2f} GB")
+        fsdp_logger.info(f"{'='*60}\n")
+        
+        log_memory_stats(baseline_mem_stats, fsdp_logger)
+
+"""
+A100(80G):
+AREAL_FLEX_ATTENTION_BLOCK_SIZE=64 python -m pytest areal/tests/test_tree_training.py::test_fsdp_flex_backward -v -s --max-tokens-per-mb 16384
+
+python -m pytest areal/tests/test_tree_training.py::test_fsdp_stack_backward -v -s --max-tokens-per-mb 16384
+
+AREAL_FLEX_ATTENTION_BLOCK_SIZE=64 python -m pytest areal/tests/test_tree_training.py::test_fsdp_flex_forward -v -s --max-tokens-per-mb 16384
+
+python -m pytest areal/tests/test_tree_training.py::test_fsdp_stack_forward -v -s --max-tokens-per-mb 16384
+
+AREAL_FLEX_ATTENTION_BLOCK_SIZE=64 python -m pytest areal/tests/test_tree_training.py::test_flex -v -s --max-tokens-per-mb 16384
+
+python -m pytest areal/tests/test_tree_training.py::test_stack -v -s --max-tokens-per-mb 16384
+
+python -m pytest areal/tests/test_tree_training.py::test_baseline -v -s --max-tokens-per-mb 16384 --prefix-len 10
+
+AREAL_FLEX_ATTENTION_BLOCK_SIZE=64 python -m pytest areal/tests/test_tree_training.py::test_fsdp_flex_backward -v -s --max-tokens-per-mb 39936 --prefix-len 10
+
+AREAL_FLEX_ATTENTION_BLOCK_SIZE=64 python -m pytest areal/tests/test_tree_training.py::test_fsdp_flex_backward -v -s --max-tokens-per-mb 16384 --prefix-len 10
+"""
