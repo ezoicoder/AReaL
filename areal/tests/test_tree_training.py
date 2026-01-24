@@ -32,7 +32,7 @@ MODEL_PATH = get_model_path(
 )
 
 # Path to real tree training data
-TREE_DATA_PATH = "/data/tree/tree-data/tau2-16k-small/call2_rank0.pt"
+TREE_DATA_PATH = "/data/tree/tree-data/tau2-16k-small/call2.pt"
 
 
 # =============================================================================

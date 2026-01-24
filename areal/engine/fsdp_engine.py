@@ -626,14 +626,25 @@ class FSDPEngine(TrainEngine):
             if not forward_only and loss is not None:
                 with trace_scope("fsdp_engine.backward"):
                     loss.backward()
-        print(f"[Debug] Final loss_sum in forward_backward_batch = {loss_sum.item()}")
+        if isinstance(loss_sum, torch.Tensor):loss_sum = loss_sum.item()
+        print(f"[Debug] Final loss_sum in train_batch = {loss_sum}")
+        return loss_sum
 
     def train_batch(
         self,
         input_: dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
-    ) -> dict[str, float]:
+        required_loss: bool = False,
+    ) -> dict[str, float] | tuple[dict[str, float], float]:
+
+        # Save input_ to a .pt file for this rank, after moving to cpu (deepcopy for safety)
+        # import copy
+        # input_cpu_copy = copy.deepcopy(input_)
+        # input_cpu_copy = {"input_data": input_cpu_copy}
+        # save_path = f"/tmp/input_rank_{self.rank}.pt"
+        # torch.save(input_cpu_copy, save_path)
+
 
         # Step 0: Initialize
         self._ensure_ready()
@@ -699,17 +710,27 @@ class FSDPEngine(TrainEngine):
 
             # After all backwards complete, manually synchronize gradients
             # so all ranks get the globally averaged gradients
+            import time
+            torch.cuda.synchronize()
+            sync_start_time = time.time()
             for param in self.model.parameters():
                 if param.grad is not None:
                     dist.all_reduce(param.grad, group=self.dp_group)
                     param.grad.div_(self.parallel_helper.dp_size)
+            torch.cuda.synchronize()
+            sync_end_time = time.time()
+            print(f"[Debug][TreeStack] Gradient sync (all_reduce) time: {sync_end_time - sync_start_time:.4f}s")
 
-            print(f"[Debug] Final loss_sum in forward_backward_batch = {loss}")
+            if isinstance(loss, torch.Tensor):loss = loss.item()
+            print(f"[Debug] Final loss_sum in train_batch = {loss}")
 
             # Step 5a: Optimizer step
             result = self.optimizer_step()
 
-            return result
+            if required_loss:
+                return result,loss
+            else:
+                return result
 
         # ========== Regular Training Path ==========
         # Step 3: Forward-backward using process_output_fn callback
@@ -727,12 +748,15 @@ class FSDPEngine(TrainEngine):
             )
 
         # Step 4: Forward-backward batch
-        self.forward_backward_batch(mb_list, process_output, forward_only=False)
+        loss = self.forward_backward_batch(mb_list, process_output, forward_only=False)
 
         # Step 5: Optimizer step
         result = self.optimizer_step()
 
-        return result
+        if required_loss:
+            return result,loss
+        else:
+            return result
 
     @torch.no_grad()
     def eval_batch(

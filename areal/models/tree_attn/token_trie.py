@@ -77,6 +77,7 @@ class TokenTrie:
         # -------- statistics --------
         self.n_sequences = len(inputs)
         self.n_tokens = sum(len(ids) for ids in inputs)
+        self.max_seq_len = max(len(ids) for ids in inputs)
         self.n_leafed_tokens = sum(len(ids) for ids in self.inputs)
         self.n_tree_tokens = self.n_leafed_tokens - sum(self.lcp_lens)
 
@@ -99,7 +100,7 @@ class TokenTrie:
         """
 
         lens = [len(ids) for ids in self.inputs]
-        divs = [-1]
+        divs = [0]
 
         cur_tree_tokens = lens[0]
         for i in range(1, len(lens)):
@@ -117,7 +118,7 @@ class TokenTrie:
         parts = []
         for i in range(len(divs)-1):
             part = []
-            for j in range(divs[i]+1, divs[i+1]):
+            for j in range(divs[i], divs[i+1]):
                 for attachment in self.attach_lists[j]:
                     part.append(attachment[0]['_sequence_batch_id'])
             parts.append(part)
@@ -129,8 +130,10 @@ class TokenTrie:
         Divide the sequences into n_parts such that the maximum tree tokens
         in each part is minimized.
         """
-        
-        L = self.n_tree_tokens // n_parts
+        assert n_parts > 0, f"n_parts {n_parts} is not greater than 0"
+        assert n_parts <= self.n_sequences, f"n_parts {n_parts} is not less than or equal to n_sequences {self.n_sequences}"
+
+        L = max(self.n_tree_tokens // n_parts, self.max_seq_len)
         R = self.n_tree_tokens
 
         while L < R:
@@ -143,4 +146,14 @@ class TokenTrie:
 
         parts = self.try_devide(R)
         print(parts)
+        if len(parts) < n_parts:
+            print(f"warning: len(parts) {len(parts)} is less than n_parts {n_parts}")
+            pos = 0
+            rem = n_parts - len(parts)
+            for i in range(rem):
+                while len(parts[pos]) <= 1: pos = pos +1
+                last_elem = parts[pos].pop()
+                parts.append([last_elem])
+
+        assert len(parts) == n_parts, f"len(parts) {len(parts)} is not equal to n_parts {n_parts}"
         return parts
