@@ -1172,7 +1172,28 @@ class FSDPEngine(TrainEngine):
             set_ulysses_sequence_parallel_group(self.sp_group)
 
     def _get_model_name_parameters(self) -> Iterator[tuple[str, nn.Parameter]]:
+        """Iterate over model parameters with correct naming.
+        
+        For ZeRO-1 (DDP) mode, strips 'module.' prefix added by DDP wrapper
+        to match inference engine's parameter names. For FSDP2 mode, parameter
+        names are already correct (fully_shard is in-place and preserves names).
+        """
         name_params_iterator = self.model.named_parameters()
+        
+        # Handle ZeRO-1 (DDP) mode: strip 'module.' prefix to match inference engine
+        # DDP wraps the model and adds 'module.' prefix to all parameter names,
+        # but the inference engine expects the original names without this prefix.
+        if self.enable_tree_stack_training and hasattr(self.model, 'module'):
+            for name, value in name_params_iterator:
+                # Remove DDP-added 'module.' prefix
+                if name.startswith("module."):
+                    new_name = name[len("module."):]
+                else:
+                    new_name = name
+                yield new_name, value
+            return
+        
+        # Handle vision model naming conventions
         if self.is_vision_model and is_qwen_vl_model(self.model_config.model_type):
             for name, value in name_params_iterator:
                 new_name = name.replace("model.", "", 1).replace(
@@ -1192,6 +1213,8 @@ class FSDPEngine(TrainEngine):
                     )
                 yield new_name, value
         else:
+            # FSDP2 mode: parameter names are already correct
+            # fully_shard is in-place and doesn't add any prefix
             yield from name_params_iterator
 
     def _get_full_tensor(self, param: nn.Parameter) -> torch.Tensor:
@@ -1326,12 +1349,18 @@ class FSDPEngine(TrainEngine):
             # For full model, iterate over all parameters
             param_iterator = self._get_model_name_parameters()
 
+        param_count = 0
         for name, param in param_iterator:
             tensor = self._get_full_tensor(param)
 
             # Ranks other than 0 only help to get the full tensor
             if not main_rank:
                 continue
+
+            # Log first few parameter names for debugging
+            if param_count < 3 and self.enable_tree_stack_training:
+                self.logger.info(f"[ZeRO-1 xccl] Sending parameter: {name}, shape: {tensor.shape}")
+            param_count += 1
 
             tensor_size = tensor.numel() * tensor.element_size()
 
@@ -1392,14 +1421,16 @@ class FSDPEngine(TrainEngine):
         os.makedirs(path, exist_ok=True)
 
         if self.enable_tree_stack_training:
-            print(f"[Debug][Zero1] _save_model_to_hf with path: {path}")
             # Tree stack training (DDP): get state_dict from module
+            # Access .module to get state_dict without 'module.' prefix
             if dist.get_rank() == 0:
                 # DDP wraps the model, need to access .module
                 if hasattr(self.model, 'module'):
                     state_dict = self.model.module.state_dict()
+                    self.logger.info("[ZeRO-1 disk] Saving state_dict from model.module (DDP unwrapped)")
                 else:
                     state_dict = self.model.state_dict()
+                    self.logger.info("[ZeRO-1 disk] Saving state_dict from model directly")
         else:
             # FSDP2 checkpoint saving
             # Get full state dict with FSDP2

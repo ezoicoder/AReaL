@@ -13,5 +13,4 @@ script -f -c "python3 -m areal.launcher.local examples/multi_turn_math/gsm8k_rl_
         actor.gradient_checkpointing=False \
         +actor.enable_tree_stack_training=True \
         +actor.pad_to_maximum=True \
-        +actor.is_tree_distribution=True \
-        +actor.weight_update_mode=disk" ${LOG_FILE} \
+        +actor.is_tree_distribution=True" ${LOG_FILE} \
