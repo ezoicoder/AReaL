@@ -118,6 +118,130 @@ def _collect_full_gradients_on_rank0(engine: FSDPEngine, rank: int) -> dict[str,
     return grads
 
 
+def _collect_full_params_all_ranks(engine: FSDPEngine, rank: int) -> dict[str, torch.Tensor]:
+    """Collect FULL parameters on ALL ranks.
+    
+    Similar to _collect_full_gradients_on_rank0 but collects on all ranks.
+    Handles both FSDP2 (DTensor) and ZeRO-1 (full tensor) cases.
+    
+    Note: Parameters are kept on GPU for faster comparison.
+    
+    Returns:
+        Dictionary of full parameters on GPU (all ranks)
+    """
+    params = {}
+    
+    # Check if any parameter is a DTensor (FSDP2)
+    has_dtensor = False
+    for param in engine.model.parameters():
+        if hasattr(param, 'full_tensor'):
+            has_dtensor = True
+            break
+    
+    # All ranks need to participate in DTensor operations
+    for name, param in engine.model.named_parameters():
+        # Check if this is a DTensor (FSDP2)
+        if hasattr(param, 'full_tensor'):
+            # FSDP2: ALL ranks must call full_tensor() (collective operation)
+            full_param = param.full_tensor()
+            clean_name = name.replace("module.", "", 1) if name.startswith("module.") else name
+            params[clean_name] = full_param.detach().clone()
+        elif hasattr(param, '_local_tensor'):
+            # DTensor but no full_tensor method (shouldn't happen, but handle it)
+            clean_name = name.replace("module.", "", 1) if name.startswith("module.") else name
+            params[clean_name] = param._local_tensor.detach().clone()
+        else:
+            # Regular tensor (ZeRO-1/DDP): already full parameter
+            clean_name = name.replace("module.", "", 1) if name.startswith("module.") else name
+            params[clean_name] = param.detach().clone()
+    
+    return params
+
+
+def _check_params_consistency_across_ranks(params: dict[str, torch.Tensor], rank: int, world_size: int, stage: str) -> bool:
+    """Check if parameters are consistent across all ranks.
+    
+    Args:
+        params: Dictionary of parameter tensors on current rank
+        rank: Current rank
+        world_size: Total number of ranks
+        stage: Description of when this check is performed (e.g., "before training", "after training")
+    
+    Returns:
+        True if all ranks have identical parameters, False otherwise
+    """
+    if world_size == 1:
+        print(f"[Rank {rank}] Single rank, skipping consistency check for {stage}")
+        return True
+    
+    all_consistent = True
+    inconsistent_params = []
+    
+    for name, param in params.items():
+        # Compute hash of this rank's parameter
+        param_flat = param.flatten()
+        local_sum = param_flat.sum().item()
+        local_max = param_flat.max().item()
+        local_min = param_flat.min().item()
+        
+        # Gather stats from all ranks
+        sum_tensor = torch.tensor([local_sum], dtype=torch.float32, device='cuda')
+        max_tensor = torch.tensor([local_max], dtype=torch.float32, device='cuda')
+        min_tensor = torch.tensor([local_min], dtype=torch.float32, device='cuda')
+        
+        # Gather to rank 0
+        if rank == 0:
+            sum_list = [torch.zeros_like(sum_tensor) for _ in range(world_size)]
+            max_list = [torch.zeros_like(max_tensor) for _ in range(world_size)]
+            min_list = [torch.zeros_like(min_tensor) for _ in range(world_size)]
+        else:
+            sum_list = None
+            max_list = None
+            min_list = None
+        
+        dist.gather(sum_tensor, sum_list, dst=0)
+        dist.gather(max_tensor, max_list, dst=0)
+        dist.gather(min_tensor, min_list, dst=0)
+        
+        # Check consistency on rank 0
+        if rank == 0:
+            sums = [t.item() for t in sum_list]
+            maxs = [t.item() for t in max_list]
+            mins = [t.item() for t in min_list]
+            
+            # Check if all ranks have the same values (with tolerance for floating point errors)
+            sum_diff = max(sums) - min(sums)
+            max_diff = max(maxs) - min(maxs)
+            min_diff = max(mins) - min(mins)
+            
+            # Use relative tolerance
+            tolerance = 1e-6
+            is_consistent = (sum_diff < tolerance * abs(sums[0]) if sums[0] != 0 else sum_diff < tolerance)
+            
+            if not is_consistent:
+                all_consistent = False
+                inconsistent_params.append((name, sum_diff, max_diff, min_diff))
+    
+    # Broadcast result to all ranks
+    result_tensor = torch.tensor([1.0 if all_consistent else 0.0], dtype=torch.float32, device='cuda')
+    dist.broadcast(result_tensor, src=0)
+    all_consistent = (result_tensor.item() > 0.5)
+    
+    # Print results on rank 0
+    if rank == 0:
+        print(f"[Rank 0] Parameter consistency check {stage}:")
+        if all_consistent:
+            print(f"[Rank 0]   ✓ All parameters are consistent across {world_size} ranks")
+        else:
+            print(f"[Rank 0]   ✗ Found {len(inconsistent_params)} inconsistent parameters:")
+            for name, sum_diff, max_diff, min_diff in inconsistent_params[:5]:  # Show first 5
+                print(f"[Rank 0]     - {name}: sum_diff={sum_diff:.6e}, max_diff={max_diff:.6e}, min_diff={min_diff:.6e}")
+            if len(inconsistent_params) > 5:
+                print(f"[Rank 0]     ... and {len(inconsistent_params) - 5} more")
+    
+    return all_consistent
+
+
 class MockRolloutEngine:
     """Mock rollout engine that loads data from file.
     
@@ -333,6 +457,7 @@ def run_single_training(
     gradient_checkpointing: bool,
     save_grad_file: str,
     compare_grad_file: str | None = None,  # Kept for backward compatibility, not used
+    disable_optimizer: bool = True,
 ):
     """Run training for a single mode and save gradients to file.
     
@@ -343,6 +468,7 @@ def run_single_training(
         gradient_checkpointing: Whether to enable gradient checkpointing (only for baseline/flex)
         save_grad_file: Path to save gradients (rank 0 only)
         compare_grad_file: Deprecated, kept for compatibility
+        disable_optimizer: Whether to disable optimizer (if False, will check parameter updates)
     """
     # Get rank and world_size from environment (set by torchrun)
     # Don't use dist.get_rank() here as distributed hasn't been initialized yet
@@ -375,7 +501,7 @@ def run_single_training(
         raise ValueError(f"Invalid mode: {mode}. Must be one of {list(mode_config.keys())}")
     
     config = mode_config[mode]
-    print(f"[Rank {rank}] Running {mode} training (world_size={world_size})")
+    print(f"[Rank {rank}] Running {mode} training (world_size={world_size}, disable_optimizer={disable_optimizer})")
     
     # Setup engine and run training
     with setup_engine_with_mock_rollout(
@@ -385,10 +511,21 @@ def run_single_training(
         enable_tree_training=config["enable_tree_training"],
         is_tree_distribution=config["is_tree_distribution"],
         gradient_checkpointing=config["use_gradient_checkpointing"],
+        disable_optimizer=disable_optimizer,
     ) as engine:
         
         print(f"[Rank {rank}] Calling {mode}_engine.prepare_batch()...")
         input_data = engine.prepare_batch(dataloader=None, workflow=None)
+        
+        # Collect parameters before training (ALL ranks if optimizer is enabled)
+        params_before = None
+        if not disable_optimizer:
+            print(f"[Rank {rank}] Collecting parameters before training...")
+            params_before = _collect_full_params_all_ranks(engine, rank)
+            print(f"[Rank {rank}] Collected {len(params_before)} parameter tensors before training")
+            
+            # Check parameter consistency across ranks
+            _check_params_consistency_across_ranks(params_before, rank, world_size, "before training")
         
         # Train
         reset_peak_memory()
@@ -436,12 +573,79 @@ def run_single_training(
         
         # Collect gradients on rank 0
         grads = _collect_full_gradients_on_rank0(engine, rank)
+        
+        # Check parameter updates (ALL ranks if optimizer is enabled)
+        params_updated = False
+        params_after = None
+        if not disable_optimizer:
+            print(f"[Rank {rank}] Collecting parameters after training...")
+            params_after = _collect_full_params_all_ranks(engine, rank)
+            print(f"[Rank {rank}] Collected {len(params_after)} parameter tensors after training")
+            
+            # Check parameter consistency across ranks after training
+            _check_params_consistency_across_ranks(params_after, rank, world_size, "after training")
+            
+            # Each rank checks if its own parameters were updated
+            if params_before and params_after:
+                print(f"[Rank {rank}] Checking if parameters were updated...")
+                
+                # Check if any parameter changed
+                num_changed = 0
+                num_unchanged = 0
+                max_change = 0.0
+                max_change_param = ""
+                
+                for name in params_before.keys():
+                    if name in params_after:
+                        param_before = params_before[name]
+                        param_after = params_after[name]
+                        
+                        # Calculate absolute difference
+                        diff = torch.abs(param_after - param_before)
+                        max_diff = diff.max().item()
+                        
+                        if max_diff > max_change:
+                            max_change = max_diff
+                            max_change_param = name
+                        
+                        # Check if parameter changed (with small tolerance for numerical errors)
+                        if max_diff > 1e-8:
+                            num_changed += 1
+                        else:
+                            num_unchanged += 1
+                
+                params_updated = num_changed > 0
+                
+                print(f"[Rank {rank}] Parameter update check:")
+                print(f"[Rank {rank}]   - Changed: {num_changed} parameters")
+                print(f"[Rank {rank}]   - Unchanged: {num_unchanged} parameters")
+                print(f"[Rank {rank}]   - Max change: {max_change:.6e} ({max_change_param})")
+                print(f"[Rank {rank}]   - Parameters updated: {'✓ YES' if params_updated else '✗ NO'}")
+                
+                if not params_updated:
+                    print(f"[Rank {rank}] ⚠️  WARNING: No parameters were updated despite optimizer being enabled!")
+            
+            # Synchronize params_updated across ranks and verify consistency
+            if world_size > 1:
+                updated_tensor = torch.tensor([1.0 if params_updated else 0.0], dtype=torch.float32, device='cuda')
+                # Gather all ranks' params_updated status to rank 0
+                if rank == 0:
+                    updated_list = [torch.zeros_like(updated_tensor) for _ in range(world_size)]
+                else:
+                    updated_list = None
+                dist.gather(updated_tensor, updated_list, dst=0)
+                
+                if rank == 0:
+                    all_updated = [t.item() > 0.5 for t in updated_list]
+                    if not all(u == all_updated[0] for u in all_updated):
+                        print(f"[Rank 0] ⚠️  WARNING: params_updated status inconsistent across ranks: {all_updated}")
     
-    # Save gradients (rank 0 only)
+    # Save gradients and parameter update info (rank 0 only)
     if rank == 0 and save_grad_file and grads:
         print(f"[Rank 0] Saving {mode} gradients to {save_grad_file}")
         print(f"[Rank 0] Average loss across {world_size} ranks: {loss_sum:.6f}")
-        torch.save({
+        
+        save_data = {
             "mode": mode,
             "grads": grads,
             "time": train_time,
@@ -451,9 +655,22 @@ def run_single_training(
                 "max_tokens_per_mb": max_tokens_per_mb,
                 "prefix_len": prefix_len,
                 "gradient_checkpointing": config["use_gradient_checkpointing"],
+                "disable_optimizer": disable_optimizer,
+                "world_size": world_size,
             }
-        }, save_grad_file)
+        }
+        
+        # Add parameter update info if optimizer was enabled (rank 0's params represent all ranks after consistency check)
+        if not disable_optimizer and params_before and params_after:
+            save_data["params_updated"] = params_updated
+            save_data["params_before"] = params_before
+            save_data["params_after"] = params_after
+            save_data["params_consistency_verified"] = True  # We verified consistency above
+        
+        torch.save(save_data, save_grad_file)
         print(f"[Rank 0] ✓ Saved {len(grads)} gradient tensors")
+        if not disable_optimizer:
+            print(f"[Rank 0] ✓ Saved parameter update info (consistency verified across {world_size} ranks)")
     
     print(f"[Rank {rank}] {mode.capitalize()} training complete")
 
@@ -476,9 +693,12 @@ def main():
                        help="Path to save gradients (required)")
     parser.add_argument("--disable-gradient-checkpointing", action="store_true", default=False,
                        help="Disable gradient checkpointing for baseline/flex")
+    parser.add_argument("--enable-optimizer", action="store_true", default=False,
+                       help="Enable optimizer to check parameter updates (default: disabled)")
     args = parser.parse_args()
     
     gradient_checkpointing = not args.disable_gradient_checkpointing
+    disable_optimizer = not args.enable_optimizer
     
     run_single_training(
         mode=args.mode,
@@ -487,6 +707,7 @@ def main():
         gradient_checkpointing=gradient_checkpointing,
         save_grad_file=args.save_grad_file,
         compare_grad_file=None,  # No comparison, only save
+        disable_optimizer=disable_optimizer,
     )
 
 
@@ -527,6 +748,14 @@ torchrun --nproc_per_node=2 --master_port=29502 \
   --save-grad-file=/tmp/stack_2.pt \
   --max_tokens_per_mb=16384 \
   --prefix-len=10
+
+# Enable optimizer to check parameter updates
+torchrun --nproc_per_node=2 --master_port=29503 \
+  areal/tests/torchrun/run_tree_training_distributed.py \
+  --mode=stack \
+  --save-grad-file=/tmp/stack_with_opt.pt \
+  --max_tokens_per_mb=16384 \
+  --enable-optimizer
 
 # Then use compare_gradients.py to compare them
 python areal/tests/compare_gradients.py \

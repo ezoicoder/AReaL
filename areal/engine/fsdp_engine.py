@@ -1392,6 +1392,7 @@ class FSDPEngine(TrainEngine):
         os.makedirs(path, exist_ok=True)
 
         if self.enable_tree_stack_training:
+            print(f"[Debug][Zero1] _save_model_to_hf with path: {path}")
             # Tree stack training (DDP): get state_dict from module
             if dist.get_rank() == 0:
                 # DDP wraps the model, need to access .module
@@ -1428,6 +1429,7 @@ class FSDPEngine(TrainEngine):
             full_state = {}
         
         if self.enable_tree_stack_training:
+            print(f"[Debug][Zero1] _load_model_from_hf with path: {path}")
             # Tree stack training (DDP): directly load state_dict with broadcast
             if dist.get_rank() == 0:
                 # Load to the unwrapped model
@@ -1435,7 +1437,13 @@ class FSDPEngine(TrainEngine):
                     self.model.module.load_state_dict(full_state)
                 else:
                     self.model.load_state_dict(full_state)
-            # DDP will broadcast parameters automatically
+            
+            # Manually broadcast parameters from rank 0 to all ranks
+            # NOTE: DDP only broadcasts during initialization, not after load_state_dict
+            # We must manually broadcast to ensure all ranks have the same parameters
+            for param in self.model.parameters():
+                dist.broadcast(param.data, src=0, group=self.dp_group)
+            
             dist.barrier(group=self.cpu_group)
         else:
             # FSDP2: use fsdp2_load_full_state_dict
