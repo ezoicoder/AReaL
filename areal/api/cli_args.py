@@ -802,6 +802,10 @@ class TrainEngineConfig:
         metadata={"help": "Stack depth for tree stack training."},
     )
 
+    stack_block_size:int = field(
+        default=4096,
+        metadata={"help": "Stack block size for tree stack training."},
+    )
 
     ### Disable optimizer
     disable_optimizer: bool = field(

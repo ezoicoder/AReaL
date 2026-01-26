@@ -51,7 +51,7 @@ def loss_weight_fn(input_data):
 logger = logging.getLogger("TreeTrainingDistributed")
 
 MODEL_PATH = get_model_path(
-    "/data/tree/models/Qwen3-0.6B", "Qwen/Qwen3-0.6B"
+    "/data/tree/models/Qwen3-8B", "Qwen/Qwen3-8B"
 )
 
 # Path to real tree training data (prefix, each rank will append _rank{R}.pt)
@@ -412,6 +412,8 @@ def setup_engine_with_mock_rollout(
         gradient_checkpointing=actual_gradient_checkpointing,
         disable_optimizer=disable_optimizer,
         is_tree_distribution=is_tree_distribution,
+        stack_block_size=stack_block_size,
+        stack_depth=stack_depth,
         fsdp=FSDPEngineConfig(),
     )
     
@@ -534,6 +536,8 @@ def run_single_training(
         start = time.time()
         
         _,loss = engine.train_batch(input_data, loss_fn=loss_fn, loss_weight_fn=loss_weight_fn, required_loss=True)
+        if repeat:
+            _,loss = engine.train_batch(input_data, loss_fn=loss_fn, loss_weight_fn=loss_weight_fn, required_loss=True)
         
         torch.cuda.synchronize()
         local_train_time = time.time() - start
@@ -695,8 +699,21 @@ def main():
                        help="Disable gradient checkpointing for baseline/flex")
     parser.add_argument("--enable-optimizer", action="store_true", default=False,
                        help="Enable optimizer to check parameter updates (default: disabled)")
+    parser.add_argument("--stack-block-size", type=int, default=4096,
+                       help="Stack block size for tree stack training")
+    parser.add_argument("--stack-depth", type=int, default=16384,
+                       help="Stack depth for tree stack training")
+    parser.add_argument("--repeat", action="store_true", default=False,
+                       help="Repeat the training")
     args = parser.parse_args()
     
+    global stack_block_size
+    global stack_depth
+    global repeat
+    stack_block_size = args.stack_block_size
+    stack_depth = args.stack_depth
+    repeat = args.repeat
+
     gradient_checkpointing = not args.disable_gradient_checkpointing
     disable_optimizer = not args.enable_optimizer
     
@@ -720,6 +737,16 @@ Usage examples:
 # Save baseline gradients (single GPU)
 torchrun --nproc_per_node=1 --master_port=29500 \
   areal/tests/torchrun/run_tree_training_distributed.py \
+  --mode=stack \
+  --save-grad-file=/tmp/stack.pt \
+  --prefix-len=1 \
+  --stack-block-size=1024 \
+  --stack-depth=16384 \
+  --repeat
+
+# Save baseline gradients (single GPU)
+torchrun --nproc_per_node=1 --master_port=29500 \
+  areal/tests/torchrun/run_tree_training_distributed.py \
   --mode=baseline \
   --save-grad-file=/tmp/baseline.pt \
   --max_tokens_per_mb=16384 \
@@ -738,7 +765,6 @@ torchrun --nproc_per_node=1 --master_port=29502 \
   areal/tests/torchrun/run_tree_training_distributed.py \
   --mode=stack \
   --save-grad-file=/tmp/stack_1.pt \
-  --max_tokens_per_mb=16384 \
   --prefix-len=10
 
 # Save stack gradients (2 GPUs) - prefix-len must result in batch size divisible by 2

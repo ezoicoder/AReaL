@@ -196,12 +196,19 @@ class FSDPEngine(TrainEngine):
         self.is_tree_distribution: bool = self.config.is_tree_distribution
         self.enable_tree_training: bool = self.config.enable_tree_training
         self.stack_depth: int = self.config.stack_depth
+        self.stack_block_size: int = self.config.stack_block_size
+        
+        print(f"Stack depth: {self.stack_depth}, Stack block size: {self.stack_block_size}")
+
         self.enable_tree_stack_training: bool = self.config.enable_tree_stack_training
         assert not (self.enable_tree_training and self.enable_tree_stack_training), "Tree training and tree attention training cannot be enabled at the same time."
         
-        # NOTE: Tree stack training uses ZeRO-1 (DDP + ZeroRedundancyOptimizer)
-        # - Pure data parallel only (no TP/SP/PP)
-        # - Parameters replicated, gradients all-reduced, optimizer states sharded
+
+        # NOTE: Tree stack training uses a custom ZeRO-1 variant:
+        # - Model parameters: replicated across ranks (no wrapper)
+        # - Gradients: manually all-reduced in train_batch()
+        # - Optimizer states: sharded via ZeroRedundancyOptimizer
+        # This saves ~1x model size VRAM compared to DDP (no gradient buckets).
 
         if self.enable_tree_stack_training:
             self.tree_stack_training_engine: TreeStackTrainingEngine
@@ -292,31 +299,15 @@ class FSDPEngine(TrainEngine):
         tik = time.perf_counter()
         
         if self.enable_tree_stack_training:
-            # ========== ZeRO-1 Path: DDP + ZeroRedundancyOptimizer ==========
-            self.logger.info("Using ZeRO-1 mode (Tree Stack Training): DDP + ZeroRedundancyOptimizer")
+            # ========== ZeRO-1 Path ==========
+            self.logger.info("Using custom ZeRO-1 mode (Tree Stack Training)")
             
             if self.config.use_lora:
                 raise NotImplementedError("ZeRO-1 mode does not support LoRA yet")
             
-            # Import ZeRO-1 wrapper
-            from torch.nn.parallel import DistributedDataParallel as DDP
+            self.logger.info("Model unwrapped, using manual grad sync + ZeroRedundancyOptimizer")
             
-            # Get device from model
-            device_id = next(self.model.parameters()).device.index
-            
-            # Wrap model with DDP (parameters and gradients are replicated)
-            self.model = DDP(
-                self.model,
-                device_ids=[device_id],
-                broadcast_buffers=True,
-                gradient_as_bucket_view=True,  # Memory optimization
-            )
-            
-            self.logger.info(
-                f"Applied DDP wrapper in {time.perf_counter() - tik:.2f} seconds"
-            )
-            
-            # Create optimizer and scheduler through unified method
+            # Create optimizer and scheduler
             self._create_optimizer(ft_spec)
         else:
             # ========== FSDP2 Path (Original) ==========
@@ -510,26 +501,23 @@ class FSDPEngine(TrainEngine):
     def optimizer_step(self):
         # When optimizer is disabled, return dummy stats without updating
         if self.config.disable_optimizer:
-            # Still compute grad_norm for debugging purposes (without clipping)
             if self.enable_tree_stack_training:
-                # Tree stack training (DDP): use standard grad norm
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     max_norm=float('inf'),
                 )
             else:
-                # FSDP2: use custom grad norm
                 grad_norm = fsdp2_clip_grad_norm(
                     list(self.model.parameters()),
-                    max_norm=float('inf'),  # No clipping, just measure
+                    max_norm=float('inf'),
                     fsdp_group=self.world_mesh["dp_sp"].get_group(),
                     tp_group=self.world_mesh["tp"].get_group(),
                     offload_params=self.config.fsdp.offload_params,
                 )
             return dict(
-                update_successful=0.0,  # Not updated
+                update_successful=0.0,
                 grad_norm=float(grad_norm) if grad_norm is not None else float("nan"),
-                lr=0.0,  # No learning rate when optimizer disabled
+                lr=0.0,
             )
         
         assert self.optimizer is not None
@@ -538,13 +526,11 @@ class FSDPEngine(TrainEngine):
 
         # Gradient clipping
         if self.enable_tree_stack_training:
-            # Tree stack training (DDP): use standard PyTorch gradient clipping
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
                 max_norm=self.optimizer_config.gradient_clipping,
             )
         else:
-            # FSDP2: use custom gradient clipping
             grad_norm = fsdp2_clip_grad_norm(
                 list(self.model.parameters()),
                 max_norm=self.optimizer_config.gradient_clipping,
@@ -697,19 +683,15 @@ class FSDPEngine(TrainEngine):
             # Step 3d: Build trie
             trie = TokenTrie(input_ids_list, input_data, sorted=False)
 
-            # Step 4a: Tree backward with ZeRO-1 (DDP) gradient synchronization
-            # Tree stack training always uses ZeRO-1 (enforced by __init__ check)
-            # Use no_sync() to disable automatic gradient synchronization
-            with self.model.no_sync():
-                loss = self.tree_stack_training_engine.backward(
-                    model=self.model,
-                    token_trie=trie,
-                    block_size=3072,
-                    loss_fn=new_loss_fn
-                )
+            # Step 4a: Tree backward
+            loss = self.tree_stack_training_engine.backward(
+                model=self.model,
+                token_trie=trie,
+                block_size=self.config.stack_block_size,
+                loss_fn=new_loss_fn
+            )
 
-            # After all backwards complete, manually synchronize gradients
-            # so all ranks get the globally averaged gradients
+            # Step 4b: Manual gradient synchronization across DP ranks
             import time
             torch.cuda.synchronize()
             sync_start_time = time.time()
@@ -1174,18 +1156,14 @@ class FSDPEngine(TrainEngine):
     def _get_model_name_parameters(self) -> Iterator[tuple[str, nn.Parameter]]:
         """Iterate over model parameters with correct naming.
         
-        For ZeRO-1 (DDP) mode, strips 'module.' prefix added by DDP wrapper
-        to match inference engine's parameter names. For FSDP2 mode, parameter
-        names are already correct (fully_shard is in-place and preserves names).
+        For ZeRO-1 mode, strips 'module.' prefix if present (for backward compatibility).
+        For FSDP2 mode, parameter names are preserved by fully_shard.
         """
         name_params_iterator = self.model.named_parameters()
         
-        # Handle ZeRO-1 (DDP) mode: strip 'module.' prefix to match inference engine
-        # DDP wraps the model and adds 'module.' prefix to all parameter names,
-        # but the inference engine expects the original names without this prefix.
+        # Handle ZeRO-1: strip 'module.' prefix if wrapper exists
         if self.enable_tree_stack_training and hasattr(self.model, 'module'):
             for name, value in name_params_iterator:
-                # Remove DDP-added 'module.' prefix
                 if name.startswith("module."):
                     new_name = name[len("module."):]
                 else:
@@ -1421,16 +1399,12 @@ class FSDPEngine(TrainEngine):
         os.makedirs(path, exist_ok=True)
 
         if self.enable_tree_stack_training:
-            # Tree stack training (DDP): get state_dict from module
-            # Access .module to get state_dict without 'module.' prefix
+            # ZeRO-1: get state_dict from model (check for wrapper for backward compatibility)
             if dist.get_rank() == 0:
-                # DDP wraps the model, need to access .module
                 if hasattr(self.model, 'module'):
                     state_dict = self.model.module.state_dict()
-                    self.logger.info("[ZeRO-1 disk] Saving state_dict from model.module (DDP unwrapped)")
                 else:
                     state_dict = self.model.state_dict()
-                    self.logger.info("[ZeRO-1 disk] Saving state_dict from model directly")
         else:
             # FSDP2 checkpoint saving
             # Get full state dict with FSDP2
@@ -1460,18 +1434,14 @@ class FSDPEngine(TrainEngine):
             full_state = {}
         
         if self.enable_tree_stack_training:
-            print(f"[Debug][Zero1] _load_model_from_hf with path: {path}")
-            # Tree stack training (DDP): directly load state_dict with broadcast
+            # ZeRO-1: load on rank 0 and broadcast to all ranks
             if dist.get_rank() == 0:
-                # Load to the unwrapped model
                 if hasattr(self.model, 'module'):
                     self.model.module.load_state_dict(full_state)
                 else:
                     self.model.load_state_dict(full_state)
             
-            # Manually broadcast parameters from rank 0 to all ranks
-            # NOTE: DDP only broadcasts during initialization, not after load_state_dict
-            # We must manually broadcast to ensure all ranks have the same parameters
+            # Broadcast parameters from rank 0
             for param in self.model.parameters():
                 dist.broadcast(param.data, src=0, group=self.dp_group)
             
