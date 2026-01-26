@@ -6,6 +6,7 @@ fully reusing the production code path including prepare_batch().
 """
 import argparse
 import os
+import sys
 import time
 from contextlib import contextmanager
 from typing import Any
@@ -50,12 +51,17 @@ def loss_weight_fn(input_data):
 # Create logger for distributed tests
 logger = logging.getLogger("TreeTrainingDistributed")
 
+def print_flush(msg):
+    """Print with immediate flush to ensure output ordering in distributed setting."""
+    print(msg)
+    sys.stdout.flush()
+
 MODEL_PATH = get_model_path(
-    "/data/tree/models/Qwen3-8B", "Qwen/Qwen3-8B"
+    "/data/tree/models/Qwen2.5-1.5B-Instruct", "Qwen/Qwen2.5-1.5B-Instruct"
 )
 
 # Path to real tree training data (prefix, each rank will append _rank{R}.pt)
-TREE_DATA_PATH = "/data/tree/tree-data/tau2-16k-small/call2.pt"
+TREE_DATA_PATH = "/data/tree/tree-data/tau2-16k-small/call2_rank0.pt"
 
 
 def _collect_full_gradients_on_rank0(engine: FSDPEngine, rank: int) -> dict[str, torch.Tensor] | None:
@@ -434,6 +440,12 @@ def setup_engine_with_mock_rollout(
     
     try:
         yield engine
+    except Exception as e:
+        # Print exception details before cleanup
+        import traceback
+        print_flush(f"[Rank {rank}] ⚠️  EXCEPTION in engine context: {type(e).__name__}: {e}")
+        print_flush(f"[Rank {rank}] Traceback:\n{traceback.format_exc()}")
+        raise  # Re-raise to let outer code handle it
     finally:
         # Clean up engine resources
         print(f"[Rank {rank}] Destroying engine: {experiment_name}")
@@ -460,6 +472,7 @@ def run_single_training(
     save_grad_file: str,
     compare_grad_file: str | None = None,  # Kept for backward compatibility, not used
     disable_optimizer: bool = True,
+    skip_param_comparison: bool = False,
 ):
     """Run training for a single mode and save gradients to file.
     
@@ -471,6 +484,7 @@ def run_single_training(
         save_grad_file: Path to save gradients (rank 0 only)
         compare_grad_file: Deprecated, kept for compatibility
         disable_optimizer: Whether to disable optimizer (if False, will check parameter updates)
+        skip_param_comparison: If True, skip parameter collection/comparison (for memory profiling only)
     """
     # Get rank and world_size from environment (set by torchrun)
     # Don't use dist.get_rank() here as distributed hasn't been initialized yet
@@ -519,15 +533,17 @@ def run_single_training(
         print(f"[Rank {rank}] Calling {mode}_engine.prepare_batch()...")
         input_data = engine.prepare_batch(dataloader=None, workflow=None)
         
-        # Collect parameters before training (ALL ranks if optimizer is enabled)
+        # Collect parameters before training (ALL ranks if optimizer is enabled and comparison is not skipped)
         params_before = None
-        if not disable_optimizer:
+        if not disable_optimizer and not skip_param_comparison:
             print(f"[Rank {rank}] Collecting parameters before training...")
             params_before = _collect_full_params_all_ranks(engine, rank)
             print(f"[Rank {rank}] Collected {len(params_before)} parameter tensors before training")
             
             # Check parameter consistency across ranks
             _check_params_consistency_across_ranks(params_before, rank, world_size, "before training")
+        elif not disable_optimizer and skip_param_comparison:
+            print(f"[Rank {rank}] Optimizer enabled but parameter comparison skipped (--enable-optimizer-no-comp)")
         
         # Train
         reset_peak_memory()
@@ -536,7 +552,7 @@ def run_single_training(
         start = time.time()
         
         _,loss = engine.train_batch(input_data, loss_fn=loss_fn, loss_weight_fn=loss_weight_fn, required_loss=True)
-        if repeat:
+        for _ in range(repeat):
             _,loss = engine.train_batch(input_data, loss_fn=loss_fn, loss_weight_fn=loss_weight_fn, required_loss=True)
         
         torch.cuda.synchronize()
@@ -578,10 +594,10 @@ def run_single_training(
         # Collect gradients on rank 0
         grads = _collect_full_gradients_on_rank0(engine, rank)
         
-        # Check parameter updates (ALL ranks if optimizer is enabled)
+        # Check parameter updates (ALL ranks if optimizer is enabled and comparison is not skipped)
         params_updated = False
         params_after = None
-        if not disable_optimizer:
+        if not disable_optimizer and not skip_param_comparison:
             print(f"[Rank {rank}] Collecting parameters after training...")
             params_after = _collect_full_params_all_ranks(engine, rank)
             print(f"[Rank {rank}] Collected {len(params_after)} parameter tensors after training")
@@ -660,12 +676,14 @@ def run_single_training(
                 "prefix_len": prefix_len,
                 "gradient_checkpointing": config["use_gradient_checkpointing"],
                 "disable_optimizer": disable_optimizer,
+                "skip_param_comparison": skip_param_comparison,
                 "world_size": world_size,
             }
         }
         
-        # Add parameter update info if optimizer was enabled (rank 0's params represent all ranks after consistency check)
-        if not disable_optimizer and params_before and params_after:
+        # Add parameter update info if optimizer was enabled and comparison was not skipped
+        # (rank 0's params represent all ranks after consistency check)
+        if not disable_optimizer and not skip_param_comparison and params_before and params_after:
             save_data["params_updated"] = params_updated
             save_data["params_before"] = params_before
             save_data["params_after"] = params_after
@@ -673,8 +691,10 @@ def run_single_training(
         
         torch.save(save_data, save_grad_file)
         print(f"[Rank 0] ✓ Saved {len(grads)} gradient tensors")
-        if not disable_optimizer:
+        if not disable_optimizer and not skip_param_comparison:
             print(f"[Rank 0] ✓ Saved parameter update info (consistency verified across {world_size} ranks)")
+        elif not disable_optimizer and skip_param_comparison:
+            print(f"[Rank 0] ✓ Optimizer enabled for memory profiling (parameter comparison skipped)")
     
     print(f"[Rank {rank}] {mode.capitalize()} training complete")
 
@@ -699,13 +719,19 @@ def main():
                        help="Disable gradient checkpointing for baseline/flex")
     parser.add_argument("--enable-optimizer", action="store_true", default=False,
                        help="Enable optimizer to check parameter updates (default: disabled)")
+    parser.add_argument("--enable-optimizer-no-comp", action="store_true", default=False,
+                       help="Enable optimizer only for memory profiling, skip parameter collection/comparison (default: disabled)")
     parser.add_argument("--stack-block-size", type=int, default=4096,
                        help="Stack block size for tree stack training")
     parser.add_argument("--stack-depth", type=int, default=16384,
                        help="Stack depth for tree stack training")
-    parser.add_argument("--repeat", action="store_true", default=False,
+    parser.add_argument("--repeat", type=int, default=0,
                        help="Repeat the training")
     args = parser.parse_args()
+    
+    # Check mutual exclusivity of --enable-optimizer and --enable-optimizer-no-comp
+    if args.enable_optimizer and args.enable_optimizer_no_comp:
+        parser.error("--enable-optimizer and --enable-optimizer-no-comp cannot be used together")
     
     global stack_block_size
     global stack_depth
@@ -715,7 +741,8 @@ def main():
     repeat = args.repeat
 
     gradient_checkpointing = not args.disable_gradient_checkpointing
-    disable_optimizer = not args.enable_optimizer
+    disable_optimizer = not (args.enable_optimizer or args.enable_optimizer_no_comp)
+    skip_param_comparison = args.enable_optimizer_no_comp  # Skip comparison when using no-comp mode
     
     run_single_training(
         mode=args.mode,
@@ -725,6 +752,7 @@ def main():
         save_grad_file=args.save_grad_file,
         compare_grad_file=None,  # No comparison, only save
         disable_optimizer=disable_optimizer,
+        skip_param_comparison=skip_param_comparison,
     )
 
 
@@ -734,23 +762,22 @@ if __name__ == "__main__":
 """
 Usage examples:
 
-# Save baseline gradients (single GPU)
-torchrun --nproc_per_node=1 --master_port=29500 \
+torchrun --nproc_per_node=2 --master_port=29500 \
   areal/tests/torchrun/run_tree_training_distributed.py \
+  --prefix-len=20 \
   --mode=stack \
+  --stack-block-size=768 \
   --save-grad-file=/tmp/stack.pt \
-  --prefix-len=1 \
-  --stack-block-size=1024 \
-  --stack-depth=16384 \
-  --repeat
+  --enable-optimizer \
+  --repeat=2
 
 # Save baseline gradients (single GPU)
 torchrun --nproc_per_node=1 --master_port=29500 \
   areal/tests/torchrun/run_tree_training_distributed.py \
+  --prefix-len 20 \
   --mode=baseline \
   --save-grad-file=/tmp/baseline.pt \
-  --max_tokens_per_mb=16384 \
-  --prefix-len=30
+  --max_tokens_per_mb=16384
 
 # Save flex gradients (single GPU)
 AREAL_FLEX_ATTENTION_BLOCK_SIZE=64 torchrun --nproc_per_node=1 --master_port=29501 \
@@ -782,6 +809,14 @@ torchrun --nproc_per_node=2 --master_port=29503 \
   --save-grad-file=/tmp/stack_with_opt.pt \
   --max_tokens_per_mb=16384 \
   --enable-optimizer
+
+# Enable optimizer only for memory profiling (skip parameter collection/comparison)
+torchrun --nproc_per_node=2 --master_port=29504 \
+  areal/tests/torchrun/run_tree_training_distributed.py \
+  --mode=stack \
+  --save-grad-file=/tmp/stack_mem_profile.pt \
+  --max_tokens_per_mb=16384 \
+  --enable-optimizer-no-comp
 
 # Then use compare_gradients.py to compare them
 python areal/tests/compare_gradients.py \

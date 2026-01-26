@@ -122,6 +122,9 @@ class TreeStackTrainingEngine:
             ],
         )
 
+        kv_total_bytes = sum(x.numel() * x.element_size() for x in self.kv_cache[0] + self.kv_cache[1])
+        grad_kv_total_bytes = 0
+
         if not forward_only:
             self.grad_kv = (
                 [
@@ -133,6 +136,14 @@ class TreeStackTrainingEngine:
                     for _ in range(self.n_layers)
                 ],
             )
+            grad_kv_total_bytes = sum(x.numel() * x.element_size() for x in self.grad_kv[0] + self.grad_kv[1])
+
+        total_bytes = kv_total_bytes + grad_kv_total_bytes
+        print(
+            f"[Debug][TreeStackTrainingEngine] kv_cache + grad_kv total size: "
+            f"{total_bytes / (1024**2):.2f} MB "
+            f"(kv_cache: {kv_total_bytes / (1024**2):.2f} MB, grad_kv: {grad_kv_total_bytes / (1024**2):.2f} MB)"
+        )
 
         self.ret_logprobs = []
     

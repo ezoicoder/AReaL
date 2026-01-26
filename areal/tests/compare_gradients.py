@@ -7,7 +7,7 @@ and compares them for correctness.
 Usage:
     python areal/tests/compare_gradients.py \
         --reference /tmp/baseline.pt \
-        --compare /tmp/flex.pt
+        --compare /tmp/stack.pt
 
     python areal/tests/compare_gradients.py \
         --reference /tmp/baseline.pt \

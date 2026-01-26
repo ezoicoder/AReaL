@@ -498,6 +498,33 @@ class FSDPEngine(TrainEngine):
         assert self.optimizer is not None
         self.optimizer.zero_grad()
 
+    def _get_optimizer_memory_mb(self) -> float:
+        """Calculate local optimizer state memory usage in MB.
+        
+        For FSDP2, this returns the sharded optimizer state size on current rank.
+        For ZeRO-1 (Tree Stack Training with ZeroRedundancyOptimizer), 
+        this returns the local shard size.
+        """
+        if self.optimizer is None:
+            return 0.0
+        
+        total_bytes = 0
+        
+        # For ZeroRedundancyOptimizer, access the underlying optimizer's state
+        if self.enable_tree_stack_training and hasattr(self.optimizer, 'optim'):
+            # ZeroRedundancyOptimizer stores the actual optimizer in self.optim
+            optimizer_to_check = self.optimizer.optim
+        else:
+            optimizer_to_check = self.optimizer
+        
+        # Count state tensors
+        for param_state in optimizer_to_check.state.values():
+            for state_key, state_value in param_state.items():
+                if isinstance(state_value, torch.Tensor):
+                    total_bytes += state_value.numel() * state_value.element_size()
+        
+        return total_bytes / (1024 * 1024)  # Convert to MB
+
     def optimizer_step(self):
         # When optimizer is disabled, return dummy stats without updating
         if self.config.disable_optimizer:
@@ -546,6 +573,13 @@ class FSDPEngine(TrainEngine):
             with trace_scope("fsdp_engine.step"):
                 self.optimizer.step()
             update_successful = True
+
+        # Calculate and log optimizer memory usage
+        optim_mem_mb = self._get_optimizer_memory_mb()
+        mode_str = "ZeRO-1" if self.enable_tree_stack_training else "FSDP2"
+        self.logger.info(
+            f"[{mode_str}] Optimizer local memory: {optim_mem_mb:.2f} MB (rank {self.rank})"
+        )
 
         current_lr = self.lr_scheduler.get_last_lr()[0]
         return dict(
