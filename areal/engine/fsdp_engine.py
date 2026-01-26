@@ -194,6 +194,7 @@ class FSDPEngine(TrainEngine):
 
         self.is_offload: bool = False
         self.is_tree_distribution: bool = self.config.is_tree_distribution
+        self.dump_dir: str | None = self.config.dump_dir
         self.enable_tree_training: bool = self.config.enable_tree_training
         self.stack_depth: int = self.config.stack_depth
         self.stack_block_size: int = self.config.stack_block_size
@@ -445,6 +446,7 @@ class FSDPEngine(TrainEngine):
             group_size=group_size,
             dynamic_bs=dynamic_bs,
             is_tree_distribution=self.is_tree_distribution,
+            dump_dir=self.dump_dir,
         )
 
     def update_weights(self, meta: WeightUpdateMeta):
@@ -656,7 +658,12 @@ class FSDPEngine(TrainEngine):
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
         required_loss: bool = False,
+        required_token_trie_info: bool = False,
     ) -> dict[str, float] | tuple[dict[str, float], float]:
+
+        # Check: if required_token_trie_info is True, required_loss must also be True
+        if required_token_trie_info and not required_loss:
+            raise ValueError("If required_token_trie_info=True, required_loss must also be True.")
 
         # Save input_ to a .pt file for this rank, after moving to cpu (deepcopy for safety)
         # import copy
@@ -717,13 +724,16 @@ class FSDPEngine(TrainEngine):
             # Step 3d: Build trie
             trie = TokenTrie(input_ids_list, input_data, sorted=False)
 
-            # Step 4a: Tree backward
+            token_trie_info = trie.count_tokens_information()
+            
             loss = self.tree_stack_training_engine.backward(
                 model=self.model,
                 token_trie=trie,
                 block_size=self.config.stack_block_size,
                 loss_fn=new_loss_fn
             )
+
+            if required_token_trie_info:return token_trie_info,loss # when requiring token_trie_info ,we don't sync gradients
 
             # Step 4b: Manual gradient synchronization across DP ranks
             import time
@@ -737,16 +747,18 @@ class FSDPEngine(TrainEngine):
             sync_end_time = time.time()
             print(f"[Debug][TreeStack] Gradient sync (all_reduce) time: {sync_end_time - sync_start_time:.4f}s")
 
-            if isinstance(loss, torch.Tensor):loss = loss.item()
+            if isinstance(loss, torch.Tensor):
+                loss = loss.item()
             print(f"[Debug] Final loss_sum in train_batch = {loss}")
 
             # Step 5a: Optimizer step
             result = self.optimizer_step()
 
             if required_loss:
-                return result,loss
+                return result, loss
             else:
                 return result
+
 
         # ========== Regular Training Path ==========
         # Step 3: Forward-backward using process_output_fn callback

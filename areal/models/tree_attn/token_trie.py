@@ -77,18 +77,34 @@ class TokenTrie:
         # -------- statistics --------
         self.n_sequences = len(inputs)
         self.n_tokens = sum(len(ids) for ids in inputs)
-        self.max_seq_len = max(len(ids) for ids in inputs)
+        self.max_seq_len = max(len(ids) for ids in inputs) if len(inputs) > 0 else 0
         self.n_leafed_tokens = sum(len(ids) for ids in self.inputs)
         self.n_tree_tokens = self.n_leafed_tokens - sum(self.lcp_lens)
-
+        
         # Compute the token compression ratio (original tokens / tree tokens) and print it
-        if self.n_tokens > 0:
+        if self.n_tokens > 0 and self.n_tree_tokens > 0:
             compression_ratio = self.n_tokens / self.n_tree_tokens
             print(f"[TokenTrie] Token compression ratio: {compression_ratio:.4f} ({self.n_tokens}/{self.n_tree_tokens})")
             print(f"[TokenTrie] Token compression ratio of leafed sequences: {self.n_leafed_tokens / self.n_tree_tokens:.4f} ({self.n_leafed_tokens}/{self.n_tree_tokens})")
             print(f"[TokenTrie] Average compressed length of leafed sequences {self.n_tree_tokens / len(self.inputs):.4f}")
         else:
-            print("[TokenTrie] Warning: n_tokens is zero, cannot compute token compression ratio.")
+            print("[TokenTrie] Warning: n_tokens or n_tree_tokens is zero, cannot compute token compression ratio.")
+
+    def count_tokens_information(self) -> dict:
+        """
+        返回 token 的统计信息，用 Dict。
+        """
+        info = {
+            "n_sequences": self.n_sequences,
+            "n_tokens": self.n_tokens,
+            "max_seq_len": self.max_seq_len,
+            "n_leafed_tokens": self.n_leafed_tokens,
+            "n_tree_tokens": self.n_tree_tokens,
+            "compression_ratio": self.n_tokens / self.n_tree_tokens if self.n_tree_tokens > 0 else None,
+            "leafed_compression_ratio": self.n_leafed_tokens / self.n_tree_tokens if self.n_tree_tokens > 0 else None,
+            "avg_compressed_length_leafed": self.n_tree_tokens / len(self.inputs) if len(self.inputs) > 0 else None,
+        }
+        return info
 
     def try_devide(self, tree_token_limit: int) -> List[List[int]] | None:
         """

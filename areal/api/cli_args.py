@@ -780,6 +780,10 @@ class TrainEngineConfig:
         default=False,
         metadata={"help": "Whether to use tree distribution."},
     )
+    dump_dir: str | None = field(
+        default=None,
+        metadata={"help": "Directory path to dump sequences (call_0.pt, call_1.pt, ...). Only on rank 0. If None, no dumping."},
+    )
 
     # Tree training
     enable_tree_training: bool = field(
