@@ -10,5 +10,6 @@ echo "Logging to: ${LOG_FILE}"
 
 script -f -c "python3 -m areal.launcher.local examples/multi_turn_math/gsm8k_rl_mt.py --config examples/multi_turn_math/gsm8k_grpo_attn.yaml \
         experiment_name=math trial_name=${TRIAL_NAME} \
+        train_dataset.batch_size=8 \
         +actor.pad_to_maximum=True \
         +actor.dump_dir=/data/tree/tree-data/gsm8k" ${LOG_FILE}

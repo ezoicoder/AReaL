@@ -96,8 +96,33 @@ def redistribute_trajectories(
     for traj_list in all_gathered:
         all_data.extend(traj_list)
 
-    # Prepare sequences list for dumping (if needed)
-    sequences_to_dump = None
+    # Dump trajectories if requested (only on rank 0, before processing)
+    if dump_dir is not None and dist.get_rank(group=group) == 0:
+        _redistribute_call_counter += 1
+        if _redistribute_call_counter <= 50:
+            os.makedirs(dump_dir, exist_ok=True)
+            for traj_id, traj in enumerate(all_data):
+                # Extract all valid sequences from this trajectory
+                valid_sequences = []
+                batch_size = traj["input_ids"].shape[0]
+                for i in range(batch_size):
+                    # Clone to avoid affecting downstream operations
+                    seq_input_ids = traj["input_ids"][i].clone()
+                    if "attention_mask" in traj:
+                        mask = traj["attention_mask"][i]
+                        valid_len = int(mask.sum().item())
+                        seq_input_ids = seq_input_ids[:valid_len]
+                    valid_sequences.append(seq_input_ids)
+                
+                # Save this trajectory's sequences
+                dump_filename = os.path.join(
+                    dump_dir, 
+                    f"call_{_redistribute_call_counter}_{traj_id}.pt"
+                )
+                torch.save(valid_sequences, dump_filename)
+            
+            print(f"[Rank 0] Dumped {len(all_data)} trajectories to {dump_dir}/ "
+                  f"(call_{_redistribute_call_counter}_*.pt)")
     
     if is_tree_distribution:
         # Split trajectories into individual sequences for finer granularity
@@ -116,8 +141,6 @@ def redistribute_trajectories(
 
         # Prepare input for C++ allocation: list of unpadded input_ids
         all_input_ids = [s["input_ids"].squeeze(0) for s in all_data]
-        import copy
-        sequences_to_dump = copy.deepcopy(all_input_ids)
 
         # Call specialized CPython allocation interface
         group_indices = tree_allocate(all_input_ids, dist.get_world_size(group))
@@ -129,35 +152,11 @@ def redistribute_trajectories(
         for d in all_data:
             _remove_padding_from_trajectory(d)
 
-        # Extract sequences for dumping (if needed)
-        if dump_dir is not None:
-            sequences_to_dump = []
-            for d in all_data:
-                batch_size = d["input_ids"].shape[0]
-                for i in range(batch_size):
-                    # Extract individual sequence and remove padding
-                    seq_input_ids = d["input_ids"][i]
-                    if "attention_mask" in d:
-                        mask = d["attention_mask"][i]
-                        valid_len = int(mask.sum().item())
-                        seq_input_ids = seq_input_ids[:valid_len]
-                    sequences_to_dump.append(seq_input_ids)
-
         # Allocate trajectories to ranks using first-fit-decreasing
         # No capacity limit leads to balanced partition across this group
         group_indices = ffd_allocate(
             seqlens, capacity=int(1e12), min_groups=dist.get_world_size(group)
         )
-    
-    # Dump sequences if requested (only on rank 0)
-    if dump_dir is not None and sequences_to_dump is not None and dist.get_rank(group=group) == 0:
-        # Create directory if it doesn't exist
-        _redistribute_call_counter += 1
-        if _redistribute_call_counter <= 50:
-            os.makedirs(dump_dir, exist_ok=True)
-            dump_filename = os.path.join(dump_dir, f"call_{_redistribute_call_counter}.pt")
-            torch.save(sequences_to_dump, dump_filename)
-            print(f"[Rank 0] Dumped sequences to {dump_filename} (num_sequences={len(sequences_to_dump)})")
 
     local_indices = group_indices[dist.get_rank(group=group)]
 
