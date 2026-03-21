@@ -40,6 +40,8 @@ from areal.engine.core.train_engine import (
     reorder_and_pad_outputs,
 )
 from areal.engine.fsdp_utils.grad import fsdp2_clip_grad_norm
+from areal.experimental.dta.token_trie import TokenTrie
+from areal.experimental.dta.tree_training_engine import TreeTrainingEngine as DTAEngine
 from areal.experimental.engine.archon_checkpoint import (
     load_from_dcp,
     load_model_from_hf,
@@ -147,7 +149,12 @@ class ArchonEngine(TrainEngine):
         self.config = config
         self.optimizer_config = config.optimizer
         self.enable_tree_training = config.enable_tree_training
-
+        self.enable_dta = config.enable_dta
+        assert not (self.enable_tree_training and self.enable_dta), (
+            "Tree training and DTA cannot be enabled at the same time."
+        )
+        if self.enable_dta:
+            self.dta_engine: DTAEngine
         # Model Configuration (loaded during __init__)
         self.model_config: PretrainedConfig = AutoConfig.from_pretrained(
             pretrained_model_name_or_path=self.config.path,
@@ -473,6 +480,85 @@ class ArchonEngine(TrainEngine):
             mb_list, loss_weight_fn, self.data_parallel_group
         )
 
+        if self.enable_dta:
+            # ========== DTA Path ==========
+            self.logger.info("enable_dta in train_batch is True")
+            self.logger.info(f"total_loss_weight: {total_loss_weight}")
+
+            # Step 3a: Prepare input data for tree training
+            input_data = []
+            for mb_item in mb_list:
+                inputs, ctx = self._prepare_mb_inputs(mb_item)
+                loss_scale = (
+                    loss_weight_fn(ctx.mb_input)
+                    / total_loss_weight
+                    * self.data_parallel_world_size
+                )
+                if isinstance(loss_scale, torch.Tensor):
+                    loss_scale = loss_scale.item()
+                inputs, ctx = self._prepare_mb_inputs(mb_item)
+                input_data.append({"original": ctx.mb_input, "scale": loss_scale})
+
+            # Step 3b: Define loss function
+            def new_loss_fn(
+                logprobs: torch.Tensor, entropy: torch.Tensor, input_data: dict
+            ):
+                # Append zero for padding compatibility (TreeBackwardEngine expects extra position)
+                logprobs = torch.cat([logprobs, logprobs.new_zeros(1)], dim=0)
+                res = (
+                    loss_fn(logprobs, entropy, input_data["original"])
+                    * input_data["scale"]
+                )
+                return res
+                # return logprobs.sum()
+
+            # Step 3c: Extract valid sequences
+            input_ids_batch = input_["input_ids"]  # [batch_size, seq_len]
+            attention_mask = input_["attention_mask"]  # [batch_size, seq_len]
+            total_length = attention_mask.sum().item()
+            self.logger.info(f"total_length: {total_length}")
+            input_ids_list = []
+            for i in range(input_ids_batch.shape[0]):
+                # Extract valid tokens (where attention_mask == 1)
+                valid_length = attention_mask[i].sum().item()
+                valid_tokens = input_ids_batch[i, :valid_length]
+                input_ids_list.append(valid_tokens)
+
+            # Step 3d: Build trie
+            trie = TokenTrie(input_ids_list, input_data, sorted=False)
+
+            # token_trie_info = trie.count_tokens_information()
+
+            _ = self.dta_engine.backward(
+                model=self.model,
+                token_trie=trie,
+                block_size=self.config.dta_block_size,
+                loss_fn=new_loss_fn,
+            )
+
+            # if required_token_trie_info:return token_trie_info,loss # when requiring token_trie_info ,we don't sync gradients
+
+            # Step 4b: Manual gradient synchronization across DP ranks
+            # import time
+            # torch.cuda.synchronize()
+            # sync_start_time = time.time()
+            # for param in self.model.parameters():
+            #     if param.grad is not None:
+            #         dist.all_reduce(param.grad, group=self.data_parallel_group)
+            #         param.grad.div_(self.data_parallel_world_size)
+            # torch.cuda.synchronize()
+            # sync_end_time = time.time()
+            # print(f"[Debug][TreeStack] Gradient sync (all_reduce) time: {sync_end_time - sync_start_time:.4f}s")
+
+            # if isinstance(loss, torch.Tensor):
+            #     loss = loss.item()
+            # print(f"[Debug] Final loss_sum in train_batch = {loss}")
+
+            # Step 5a: Optimizer step
+            result = self.optimizer_step()
+
+            return result
+
         def process_output(
             logits: torch.Tensor, ctx_dict: dict[str, Any]
         ) -> torch.Tensor:
@@ -539,6 +625,37 @@ class ArchonEngine(TrainEngine):
     ) -> torch.Tensor:
         """Forward pass without gradient computation."""
         assert self._initialized
+
+        if self.enable_dta:
+            self.logger.info("enable_dta in forward_batch is True")
+            # DTA forward: use DTAEngine for batched inference
+            # Extract valid sequences and build TokenTrie for shared prefix optimization
+            input_ids_batch = input_["input_ids"]  # [batch_size, seq_len]
+            attention_mask = input_["attention_mask"]  # [batch_size, seq_len]
+
+            max_seq_len = 0
+            input_ids_list = []
+            input_data = []
+            for i in range(input_ids_batch.shape[0]):
+                # Extract valid tokens (where attention_mask == 1)
+                valid_length = attention_mask[i].sum().item()
+                max_seq_len = max(max_seq_len, valid_length)
+                valid_tokens = input_ids_batch[i, :valid_length]
+                input_ids_list.append(valid_tokens)
+                input_data.append({})
+
+            trie = TokenTrie(input_ids_list, input_data, sorted=False)
+
+            # DTAEngine for batched inference returns list of 1D tensors; pad to [batch_size, max_seq_len]
+            output = self.dta_engine.forward(model=self.model, token_trie=trie)
+            B = len(output)
+            output_padded = torch.zeros(
+                (B, max_seq_len), dtype=output[0].dtype, device=output[0].device
+            )
+            for i, seq in enumerate(output):
+                seq_len = seq.shape[0]
+                output_padded[i, :seq_len] = seq
+            return output_padded
 
         cu_seqlens = pack_tensor_dict(input_)["cu_seqlens"]
         if output_seqlens is None:
@@ -942,6 +1059,13 @@ class ArchonEngine(TrainEngine):
         current_platform.set_device(int(os.environ["LOCAL_RANK"]))
         self.device = torch.device(int(os.environ["LOCAL_RANK"]))
 
+        if self.enable_dta:
+            dta_dtype = getattr(torch, self.config.dtype)
+            self.dta_engine = DTAEngine(
+                self.model_config, self.device, dta_dtype, self.config.dta_depth
+            )
+            self.logger.info(f"DTA Engine created on device {self.device}")
+
         self.tokenizer = load_hf_tokenizer(self.config.path)
 
         tik = time.perf_counter()
@@ -1072,7 +1196,24 @@ class ArchonEngine(TrainEngine):
         else:
             mb_spec = self.config.mb_spec
 
-        mb_list = split_padded_tensor_dict_into_mb_list(input_, mb_spec)
+        if self.enable_dta:
+            # DTA uses one sequence per microbatch for sequence-level loss via TreeTrainingEngine.
+            # PP/CP incompatibility is validated in initialize().
+            n_seqs = input_["input_ids"].shape[0]
+            mb_spec = MicroBatchSpec.new(
+                self.config.mb_spec,
+                n_mbs=n_seqs,
+                granularity=1,
+                max_tokens_per_mb=self.config.dta_depth,
+            )
+            mb_list = split_padded_tensor_dict_into_mb_list(input_, mb_spec)
+            assert len(mb_list.mbs) == n_seqs, (
+                f"DTA requires one microbatch per sequence, "
+                f"expected {n_seqs} microbatches but got {len(mb_list.mbs)}."
+            )
+        else:
+            mb_list = split_padded_tensor_dict_into_mb_list(input_, mb_spec)
+
         mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
 
         # LCM ensures page-aligned memory and exact CP slicing without extra padding.

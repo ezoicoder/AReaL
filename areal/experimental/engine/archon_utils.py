@@ -260,7 +260,7 @@ def force_pad_to_maximum(
     logger: logging.Logger,
 ) -> None:
     """Force ``config.pad_to_maximum = True`` when compile, PP, or tree training
-    requires it. Also validates tree training constraints.
+    requires it. Also validates tree training / DTA constraints.
     """
     # Force pad_to_maximum when compile is enabled to avoid dynamic shape issues
     if enable_compile and not config.pad_to_maximum:
@@ -296,6 +296,14 @@ def force_pad_to_maximum(
                 "block mask alignment. Original pad_to_maximum=False."
             )
             config.pad_to_maximum = True
+
+    # DTA constraints
+    if config.enable_dta:
+        if parallel_dims.pp_enabled or parallel_dims.cp_enabled:
+            raise ValueError(
+                "DTA with pipeline parallelism (pp > 1) or "
+                "context parallelism (cp > 1) is currently not supported."
+            )
 
 
 # =========================================================================

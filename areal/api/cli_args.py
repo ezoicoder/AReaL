@@ -959,6 +959,20 @@ class TrainEngineConfig:
         metadata={"help": "Enable tree training with flex attention module."},
     )
 
+    # Dynamic Tree Attention
+    enable_dta: bool = field(
+        default=False,
+        metadata={"help": "Enable Dynamic Tree Attention."},
+    )
+    dta_depth: int = field(
+        default=16384,
+        metadata={"help": "Depth for Dynamic Tree Attention."},
+    )
+    dta_block_size: int = field(
+        default=2048,
+        metadata={"help": "Block size for Dynamic Tree Attention."},
+    )
+
     # Scheduling
     scheduling_spec: tuple[SchedulingSpec, ...] = field(
         default_factory=lambda: (
