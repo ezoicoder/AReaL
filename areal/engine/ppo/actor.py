@@ -259,6 +259,7 @@ class PPOActor:
             n_seqs=torch.ones_like(reward_score, dtype=torch.bool),
             n_tokens=torch.ones_like(loss_mask, dtype=torch.bool),
             n_valid_tokens=loss_mask.bool(),
+            n_real_tokens=attn_mask.bool(),
             **result_denominators,
         )
         stats_tracker.denominator(**global_denominators)
@@ -319,6 +320,9 @@ class PPOActor:
             # Get current version for proximal approximation metrics
             current_version = self.engine.get_version()
 
+            stack_n_tokens_total = 0
+            stack_n_tree_tokens_total = 0
+
             for mb in mb_inputs.mbs:
                 train_stat = self.engine.train_batch(
                     mb,
@@ -339,7 +343,16 @@ class PPOActor:
                     ),
                     loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
                 )
+                stack_n_tokens_total += train_stat.pop("stack_n_tokens", 0)
+                stack_n_tree_tokens_total += train_stat.pop("stack_n_tree_tokens", 0)
                 stats_tracker.scalar(**train_stat)
+
+            if stack_n_tree_tokens_total > 0:
+                dp_size = self.engine.data_parallel_world_size
+                stats_tracker.scalar(
+                    stack_n_tokens=stack_n_tokens_total * dp_size,
+                    stack_n_tree_tokens=stack_n_tree_tokens_total * dp_size,
+                )
 
 
 class PPOActorController(TrainController):

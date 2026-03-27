@@ -47,7 +47,7 @@ gconfig:
 actor:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  path: /data/tree/models/Qwen2.5-0.5B
+  path: /data/jiarui/dta/models/Qwen2.5-0.5B
   init_from_scratch: false
   disable_dropout: true
   gradient_checkpointing: true
@@ -130,7 +130,7 @@ train_dataset:
   shuffle: true
   pin_memory: true
   num_workers: 4
-  path: /data/tree/datasets/gsm8k
+  path: /data/jiarui/dta/datasets/gsm8k
   type: rl
   max_length: 1024
 
@@ -138,7 +138,7 @@ valid_dataset:
   batch_size: 256
   pin_memory: true
   num_workers: 4
-  path: /data/tree/datasets/gsm8k
+  path: /data/jiarui/dta/datasets/gsm8k
   type: rl
 
 # Utilities

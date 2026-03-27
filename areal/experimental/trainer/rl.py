@@ -182,6 +182,10 @@ class PPOTrainer:
         # Set up statistics logging (wandb, tensoboard, etc.)
         self.stats_logger = StatsLogger(config, ft_spec)
 
+        # Accumulators for cumulative throughput tracking
+        self._cumulative_real_tokens = 0.0
+        self._cumulative_rl_time = 0.0
+
         # Set up checkpointing for recover
         self.recover_info = self.recover_handler.load(
             self.actor,
@@ -688,6 +692,44 @@ class PPOTrainer:
         stats = self.actor.export_stats()
         stats.update(self.rollout.export_stats())
         stats.update(self.eval_rollout.export_stats())
+
+        # Derive throughput metrics from existing timing and token counts.
+        # Include all compute phases; optional phases are only present when
+        # the corresponding component (critic, ref, prox_logp) is enabled.
+        rl_time_keys = [
+            "timeperf/rollout",
+            "timeperf/compute_advantage",
+            "timeperf/train_step",
+        ]
+        for optional_key in [
+            "timeperf/critic_values",
+            "timeperf/recompute_logp",
+            "timeperf/ref_logp",
+            "timeperf/critic_train_step",
+        ]:
+            if optional_key in stats:
+                rl_time_keys.append(optional_key)
+        step_rl_time = sum(stats.get(k, 0.0) for k in rl_time_keys)
+        step_real_tokens = stats.get("ppo_actor/n_real_tokens", 0.0)
+
+        stats["timeperf/rl_step_time"] = step_rl_time
+
+        if step_rl_time > 0:
+            stats["throughput/step_tokens_per_sec"] = step_real_tokens / step_rl_time
+
+        self._cumulative_real_tokens += step_real_tokens
+        self._cumulative_rl_time += step_rl_time
+        if self._cumulative_rl_time > 0:
+            stats["throughput/cumulative_tokens_per_sec"] = (
+                self._cumulative_real_tokens / self._cumulative_rl_time
+            )
+
+        # Tree stack compression ratio (only present when tree stack training is enabled).
+        stack_n_tokens = stats.get("ppo_actor/update/stack_n_tokens", 0.0)
+        stack_n_tree_tokens = stats.get("ppo_actor/update/stack_n_tree_tokens", 0.0)
+        if stack_n_tree_tokens > 0:
+            stats["stack/compression_ratio"] = stack_n_tokens / stack_n_tree_tokens
+
         self.stats_logger.commit(epoch, epoch_step, global_step, stats)
 
         dist.barrier(group=self.actor.cpu_group)

@@ -754,6 +754,9 @@ class FSDPEngine(TrainEngine):
             # Step 5a: Optimizer step
             result = self.optimizer_step()
 
+            result["stack_n_tokens"] = token_trie_info["n_tokens"]
+            result["stack_n_tree_tokens"] = token_trie_info["n_tree_tokens"]
+
             if required_loss:
                 return result, loss
             else:

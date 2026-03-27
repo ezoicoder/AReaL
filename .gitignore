@@ -197,3 +197,5 @@ sympy/
 *.pt
 /output_*.txt
 /*.log
+
+dta_curve_time.py
