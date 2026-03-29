@@ -791,6 +791,17 @@ class TrainEngineConfig:
         metadata={"help": "Enable tree training with flex attention module."},
     )
 
+    use_dfn_mask: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Use DFN (depth-first numbering) order to construct the tree attention mask. "
+                "Reduces attention mask transmission from O(B^2) to O(B) by representing the "
+                "tree mask with a subtree_end array. Only effective when enable_tree_training=True."
+            )
+        },
+    )
+
     enable_tree_stack_training: bool = field(
         default=False,
         metadata={
@@ -806,7 +817,7 @@ class TrainEngineConfig:
         metadata={"help": "Stack depth for tree stack training."},
     )
 
-    stack_block_size:int = field(
+    stack_block_size: int = field(
         default=4096,
         metadata={"help": "Stack block size for tree stack training."},
     )

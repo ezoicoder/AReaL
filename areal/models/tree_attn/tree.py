@@ -293,6 +293,7 @@ def build_packed_tree_batch(
     pad_to_maximum: bool = True,
     pad_to_multiple_of: int = 1,
     dp_group: dist.ProcessGroup | None = None,
+    use_dfn_mask: bool = False,
 ) -> MicroBatchList:
     """Build a MicroBatchList from input data using greedy trie packing.
 
@@ -324,6 +325,11 @@ def build_packed_tree_batch(
         trees across all ranks by finding the maximum tree count and rerunning
         `_greedy_build_tries` with `min_trees=max_num_trees` on ranks with
         fewer trees.
+    use_dfn_mask : bool, default=False
+        When True, build the tree attention mask from a DFN subtree_end array
+        (O(B) storage) instead of a dense O(B^2) mask.  The resulting
+        BlockMask is numerically identical but avoids ever materialising the
+        dense mask, saving significant memory for large trees.
 
     Returns
     -------
@@ -358,8 +364,9 @@ def build_packed_tree_batch(
             )
 
         # Validate padding constraints when using block masks
-        from areal.models.tree_attn.module import BLOCK_SIZE, USE_BLOCK_MASK, create_block_mask_from_dense
-        if USE_BLOCK_MASK:
+        from areal.models.tree_attn.module import BLOCK_SIZE, USE_BLOCK_MASK, create_block_mask_from_dense, create_block_mask_from_dfn
+        use_block = USE_BLOCK_MASK or use_dfn_mask
+        if use_block:
             no_padding = not pad_to_maximum and pad_to_multiple_of <= 1
             if no_padding:
                 raise ValueError(
@@ -460,35 +467,70 @@ def build_packed_tree_batch(
                     padded_size,
                 )
 
-            # Build attention mask
-            with trace_scope("tree_attn.build_attention_mask"):
-                attention_mask = _build_attention_mask(
-                    trie,
-                    padded_size,
-                    mask_template.device,
-                )
-
-            # Create block mask early and release dense mask memory when USE_BLOCK_MASK is True
-            block_mask = None
-            if USE_BLOCK_MASK:
-                with trace_scope("tree_attn.create_block_mask"):
-                    block_mask = create_block_mask_from_dense(
-                        attention_mask, padded_size, mask_template.device
+            if use_dfn_mask:
+                # ---- DFN path: O(B) mask representation ----
+                with trace_scope("tree_attn.build_dfn_subtree_end"):
+                    subtree_end = _build_dfn_subtree_end(
+                        trie, padded_size, mask_template.device,
                     )
 
-            # Amend position_ids (needs dense attention_mask)
-            with trace_scope("tree_attn.get_position_ids"):
-                position_ids = get_packed_tree_position_ids(
-                    input_ids,
-                    attention_mask,
-                )
+                with trace_scope("tree_attn.create_block_mask_dfn"):
+                    block_mask = create_block_mask_from_dfn(
+                        subtree_end, padded_size, mask_template.device,
+                    )
 
-            # Release dense attention mask memory after position_ids are computed
-            # when using block masks
-            if USE_BLOCK_MASK:
-                del attention_mask
+                with trace_scope("tree_attn.get_dfn_position_ids"):
+                    position_ids = _get_dfn_position_ids(
+                        trie, padded_size, mask_template.device,
+                    )
 
-            # Pack extra data
+                mb = {
+                    "input_ids": input_ids,
+                    "block_mask": block_mask,
+                    "position_ids": position_ids,
+                    "trie_node": trie,
+                }
+            else:
+                # ---- Dense path (original) ----
+                with trace_scope("tree_attn.build_attention_mask"):
+                    attention_mask = _build_attention_mask(
+                        trie,
+                        padded_size,
+                        mask_template.device,
+                    )
+
+                block_mask = None
+                if USE_BLOCK_MASK:
+                    with trace_scope("tree_attn.create_block_mask"):
+                        block_mask = create_block_mask_from_dense(
+                            attention_mask, padded_size, mask_template.device
+                        )
+
+                with trace_scope("tree_attn.get_position_ids"):
+                    position_ids = get_packed_tree_position_ids(
+                        input_ids,
+                        attention_mask,
+                    )
+
+                if USE_BLOCK_MASK:
+                    del attention_mask
+
+                if USE_BLOCK_MASK:
+                    mb = {
+                        "input_ids": input_ids,
+                        "block_mask": block_mask,
+                        "position_ids": position_ids,
+                        "trie_node": trie,
+                    }
+                else:
+                    mb = {
+                        "input_ids": input_ids,
+                        "attention_mask": attention_mask,
+                        "position_ids": position_ids,
+                        "trie_node": trie,
+                    }
+
+            # Pack extra data (shared by both paths)
             with trace_scope("tree_attn.pack_extra_data"):
                 extra_data = _pack_extra_data(
                     trie,
@@ -497,25 +539,8 @@ def build_packed_tree_batch(
                     packable_keys,
                     non_packable_keys,
                 )
+            mb.update(extra_data)
 
-            # Build micro-batch dict
-            # Store block_mask instead of attention_mask when USE_BLOCK_MASK is True
-            if USE_BLOCK_MASK:
-                mb = {
-                    "input_ids": input_ids,
-                    "block_mask": block_mask,
-                    "position_ids": position_ids,
-                    "trie_node": trie,
-                    **extra_data,
-                }
-            else:
-                mb = {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                    "position_ids": position_ids,
-                    "trie_node": trie,
-                    **extra_data,
-                }
             mbs.append(mb)
             padding_lengths.append(padded_size - num_tokens)
             padded_to_lengths.append(padded_size)
@@ -866,6 +891,63 @@ def _pack_extra_data(
         extra_data[key] = data[key]
 
     return extra_data
+
+
+def _build_dfn_subtree_end(
+    trie: TrieNode,
+    padded_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the subtree_end array from a trie in DFN (pre-order) layout.
+
+    For each position i in the packed tree, subtree_end[i] is the last
+    position belonging to i's subtree.  The tree attention mask becomes:
+        attend(q, k) = (k <= q) AND (q <= subtree_end[k])
+    which is O(1) per element and only needs O(B) storage.
+
+    Padding positions (>= num_tree_tokens) get subtree_end[i] = i so they
+    attend only to themselves.
+    """
+    subtree_end = torch.arange(padded_size, dtype=torch.long, device=device)
+
+    if not trie.nodes:
+        return subtree_end
+
+    # Compute per-node subtree end in reverse pre-order (children before parents)
+    node_se: dict[int, int] = {}
+    for node in reversed(trie.nodes):
+        if not node.children:
+            node_se[id(node)] = node.end_idx
+        else:
+            node_se[id(node)] = max(
+                node_se[id(child)] for child in node.children.values()
+            )
+        se = node_se[id(node)]
+        subtree_end[node.start_idx : node.end_idx + 1] = se
+
+    return subtree_end
+
+
+def _get_dfn_position_ids(
+    trie: TrieNode,
+    padded_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute position IDs from the trie structure without a dense mask.
+
+    The position (depth) of each token equals the total number of ancestor
+    tokens plus its offset inside the owning compressed trie node.
+    """
+    position_ids = torch.zeros(padded_size, dtype=torch.long, device=device)
+
+    for node in trie.nodes:
+        ancestor_depth = sum(a.num_tokens for a in node.ancestors)
+        n = node.num_tokens
+        position_ids[node.start_idx : node.end_idx + 1] = torch.arange(
+            ancestor_depth, ancestor_depth + n, dtype=torch.long, device=device
+        )
+
+    return position_ids.unsqueeze(0)
 
 
 def get_packed_tree_position_ids(

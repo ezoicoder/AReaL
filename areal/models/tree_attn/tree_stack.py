@@ -49,7 +49,7 @@ def _get_forkpos(lens, lcp_lens, block_size: int) -> list:
     return forkpos_list
 
 
-class TreeStackTrainingEngine:
+class TreeTrainingEngine:
     """
     Engine for backward computation over sequences with shared prefixes.
 
@@ -71,10 +71,6 @@ class TreeStackTrainingEngine:
         self.dtype = dtype
         self.max_seq_len = max_seq_len
 
-        print(f"[Debug][TreeStackTrainingEngine] model_config: {model_config}")
-        print(f"[Debug][TreeStackTrainingEngine] dtype: {dtype}")
-        print(f"[Debug][TreeStackTrainingEngine] max_seq_len: {max_seq_len}")
-
         # ------------------------------------------------------------------------
         # Initialize static stack buffers
         # ------------------------------------------------------------------------
@@ -86,12 +82,12 @@ class TreeStackTrainingEngine:
         # Entropy buffer
         if not forward_only:
             self.entropy       = torch.zeros((max_seq_len), device=self.device, dtype=torch.float32)
-            self.grad_entropy  = torch.zeros((max_seq_len), device=self.device, dtype=torch.float32)
+            self.grad_entropy  = torch.zeros((max_seq_len), device=self.device, dtype=dtype)
 
         # Logprob buffer
         self.logprobs      = torch.zeros((max_seq_len), device=self.device, dtype=torch.float32)
         if not forward_only:
-            self.grad_logprobs = torch.zeros((max_seq_len), device=self.device, dtype=torch.float32)
+            self.grad_logprobs = torch.zeros((max_seq_len), device=self.device, dtype=dtype)
 
         # Fork position logits buffer (store logits only at fork positions, others are None)
         self.forkpos_list  = []                                                             # List of all fork positions
@@ -122,9 +118,6 @@ class TreeStackTrainingEngine:
             ],
         )
 
-        kv_total_bytes = sum(x.numel() * x.element_size() for x in self.kv_cache[0] + self.kv_cache[1])
-        grad_kv_total_bytes = 0
-
         if not forward_only:
             self.grad_kv = (
                 [
@@ -136,14 +129,6 @@ class TreeStackTrainingEngine:
                     for _ in range(self.n_layers)
                 ],
             )
-            grad_kv_total_bytes = sum(x.numel() * x.element_size() for x in self.grad_kv[0] + self.grad_kv[1])
-
-        total_bytes = kv_total_bytes + grad_kv_total_bytes
-        print(
-            f"[Debug][TreeStackTrainingEngine] kv_cache + grad_kv total size: "
-            f"{total_bytes / (1024**2):.2f} MB "
-            f"(kv_cache: {kv_total_bytes / (1024**2):.2f} MB, grad_kv: {grad_kv_total_bytes / (1024**2):.2f} MB)"
-        )
 
         self.ret_logprobs = []
     
@@ -318,7 +303,6 @@ class TreeStackTrainingEngine:
         if start < cache_len:
             self.build_cache(start, cache_len)
 
-        # 修改上一个 token 的 logprob
         if start > 0:
             pre_logits = self.forkpos_logits[start-1].float()
             first_token = new_tokens[0].item()
@@ -366,6 +350,7 @@ class TreeStackTrainingEngine:
         out = self.model(
             tokens_to_pop.unsqueeze(0), past_key_values=prefix_cache, use_cache=True
         )
+        
         logits = out.logits
         block_cache = out.past_key_values
 
@@ -529,7 +514,7 @@ class TreeStackTrainingEngine:
     @torch.no_grad()
     def forward(self, model, token_trie):
         """
-        Perform backward pass over all sequences in a TokenTrie.
+        Perform forward pass over all sequences in a TokenTrie.
         Compute logprobs for each sequence.
         The sequence ID is identified by attachment['_sequence_batch_id'], which TokenTrie automatically adds.
 
@@ -542,7 +527,6 @@ class TreeStackTrainingEngine:
 
         self.model = model
         self.returns = [None] * token_trie.n_sequences
-        self.forkpos_logits = [None] * self.max_seq_len  # Clear forkpos_logits to save memory
 
         inputs, attach_lists, lcp_lens = token_trie.inputs, token_trie.attach_lists, token_trie.lcp_lens
 
@@ -567,7 +551,7 @@ class TreeStackTrainingEngine:
 
         return self.returns
 
-    def backward(self, model, token_trie, block_size: int, loss_fn) -> float:
+    def backward(self, model, token_trie, loss_fn, block_size: int, cut_f1_tail: bool=True) -> float:
         """
         Perform backward pass over all sequences in a TokenTrie.
 
@@ -578,17 +562,12 @@ class TreeStackTrainingEngine:
             token_trie: TokenTrie containing input sequences and attachs.
             block_size: Maximum block size for popping to control GPU memory.
             loss_fn: Callable to compute per-sequence loss.
-
+            cut_f1_tail: Whether to cut the tail of the first forward.
         Returns:
             Total loss accumulated over all sequences.
         """
 
-        print(f"[Debug][TreeBackwardEngine] Backward pass started")
-
         self.model = model
-
-        # Check Flash Attention configuration by unwrapping FSDP/PEFT layers (no new model created)
-        print(f"[Debug][TreeStackTrainingEngine] Initial model type = {type(self.model).__name__}")
 
         total_loss = 0.0
 
@@ -624,6 +603,9 @@ class TreeStackTrainingEngine:
                 cache_len = max(self.cur_len + B - block_size_actual, lcp_next)
             else:
                 cache_len = lcp_next
+
+            if not cut_f1_tail:
+                cache_len = self.cur_len + B
 
             self.push(new_tokens, attach_list, cache_len)
 

@@ -199,3 +199,4 @@ sympy/
 /*.log
 
 dta_curve_time.py
+DynamicTreeAttn/

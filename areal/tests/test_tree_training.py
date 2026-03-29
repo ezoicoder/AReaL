@@ -19,20 +19,13 @@ from areal.api.cli_args import (
 from areal.api.io_struct import FinetuneSpec
 from areal.engine.fsdp_engine import FSDPEngine
 from areal.engine.megatron_engine import MegatronEngine
-from areal.models.tree_attn.tree import build_packed_tree_batch
+from areal.models.tree_attn.tree import build_packed_tree_batch, _greedy_build_tries
 from areal.platforms import current_platform
 from areal.tests.utils import get_model_path
 from areal.utils import logging
 from areal.engine.ppo.actor import grpo_loss_fn
 
 logger = logging.getLogger("MegatronEngine Test")
-
-MODEL_PATH = get_model_path(
-    "/data/tree/models/Qwen3-8B", "Qwen/Qwen3-8B"
-)
-
-# Path to real tree training data
-TREE_DATA_PATH = "/data/tree/tree-data/tau2-16k-small/call2.pt"
 
 
 # =============================================================================
@@ -89,8 +82,10 @@ def setup_engine(
     enable_tree_training: bool = False,
     enable_tree_stack_training: bool = False,
     gradient_checkpointing: bool = False,
-    model_path: str = MODEL_PATH,
+    model_path: str = None,
     disable_optimizer: bool = True,
+    use_dfn_mask: bool = False,
+    local_rank: int = 0,
 ):
     """Context manager to setup and teardown an engine (FSDP or Megatron).
     
@@ -102,17 +97,24 @@ def setup_engine(
         enable_tree_training: Whether to enable tree training mode
         enable_tree_stack_training: Whether to enable tree attention training mode
         gradient_checkpointing: Whether to enable gradient checkpointing
-        model_path: Path to the model
+        model_path: Path to the model (resolved via get_model_path if None)
         disable_optimizer: Whether to disable optimizer (for gradient-only tests)
+        use_dfn_mask: Whether to use DFN O(B) mask instead of dense O(B^2) mask
+        local_rank: CUDA device index for this engine (passed as LOCAL_RANK)
         
     Yields:
         Initialized engine instance
     """
+    if model_path is None:
+        model_path = get_model_path(
+            "/data/jiarui/dta/models/Qwen2.5-0.5B", "Qwen/Qwen2-0.5B"
+        )
+
     os.environ.update(
         {
             "WORLD_SIZE": "1",
             "RANK": "0",
-            "LOCAL_RANK": "0",
+            "LOCAL_RANK": str(local_rank),
             "MASTER_ADDR": "localhost",
             "MASTER_PORT": master_port,
         }
@@ -136,6 +138,7 @@ def setup_engine(
         enable_tree_stack_training=enable_tree_stack_training,
         gradient_checkpointing=gradient_checkpointing,
         disable_optimizer=disable_optimizer,
+        use_dfn_mask=use_dfn_mask,
         **engine_specific_config,
     )
     
@@ -336,30 +339,150 @@ def _assert_logprobs_close(
     )
 
 
-@pytest.fixture(scope="module")
-def real_tree_input(prefix_len):
-    """Load real tree training data from saved file.
+def _build_input_from_token_lists(
+    token_id_sequences: list[torch.Tensor],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Build a full input_data dict from a list of 1-D token-ID tensors.
 
-    Returns the full input_data from saved file (or prefix if prefix_len != -1).
-    Additionally, prints out the sequence lengths for inspection.
-    
+    Generates synthetic ``logprobs``, ``advantages`` and ``loss_mask`` so the
+    data can be used with ``grpo_loss_fn`` for speed benchmarking.
+    Also builds a trie to report prefix-sharing compression statistics.
+    """
+    seq_lens = [t.numel() for t in token_id_sequences]
+    batch_size = len(token_id_sequences)
+    max_len = max(seq_lens)
+
+    input_ids = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
+    attention_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=device)
+    loss_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=device)
+    logprobs = torch.zeros((batch_size, max_len), dtype=torch.float32, device=device)
+    advantages = torch.zeros((batch_size, max_len), dtype=torch.float32, device=device)
+    prox_logp = torch.zeros((batch_size, max_len), dtype=torch.float32, device=device)
+
+    for i, (tokens, length) in enumerate(zip(token_id_sequences, seq_lens)):
+        input_ids[i, :length] = tokens.to(device)
+        attention_mask[i, :length] = True
+        resp_start = length // 2
+        loss_mask[i, resp_start:length] = True
+        logprobs[i, :length] = torch.randn(length, device=device) * 0.1 - 2.0
+        advantages[i, :length] = torch.randn(length, device=device)
+        prox_logp[i, :length] = torch.randn(length, device=device) * 0.1 - 2.0
+
+    result = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "loss_mask": loss_mask,
+        "logprobs": logprobs,
+        "advantages": advantages,
+        "prox_logp": prox_logp,
+    }
+
+    # --- Trie compression analysis ---
+    total_original_tokens = sum(seq_lens)
+    # Build a single trie (unlimited capacity) to measure theoretical compression
+    tries_single, n_tokens_single = _greedy_build_tries(
+        result, max_tokens_per_tree=total_original_tokens + 1
+    )
+    tree_tokens_single = sum(n_tokens_single)
+    compression_ratio = total_original_tokens / tree_tokens_single if tree_tokens_single > 0 else float("inf")
+    saved_tokens = total_original_tokens - tree_tokens_single
+    saved_pct = 100.0 * saved_tokens / total_original_tokens if total_original_tokens > 0 else 0.0
+
+    print(f"\n{'='*60}")
+    print(f"  Trie Compression Analysis  ({batch_size} sequences)")
+    print(f"{'='*60}")
+    print(f"  Seq lengths           : min={min(seq_lens):,}, max={max(seq_lens):,}, mean={sum(seq_lens)/len(seq_lens):,.1f}")
+    print(f"  Total original tokens : {total_original_tokens:,}")
+    print(f"  Tree tokens (1 trie)  : {tree_tokens_single:,}")
+    print(f"  Saved tokens          : {saved_tokens:,} ({saved_pct:.1f}%)")
+    print(f"  Compression ratio     : {compression_ratio:.3f}x")
+    print(f"  #Trees (single trie)  : {len(tries_single)}")
+
+    # Also show per-node depth distribution for the single trie
+    if tries_single:
+        trie = tries_single[0]
+        node_sizes = [n.num_tokens for n in trie.nodes]
+        leaf_count = sum(1 for n in trie.nodes if not n.children)
+        internal_count = len(trie.nodes) - leaf_count
+        print(f"  #Nodes (total)        : {len(trie.nodes)}  (internal: {internal_count}, leaf: {leaf_count})")
+        if node_sizes:
+            print(f"  Node sizes            : min={min(node_sizes)}, max={max(node_sizes)}, "
+                  f"mean={sum(node_sizes)/len(node_sizes):.1f}")
+
+    # Show multi-tree packing at a few representative capacities
+    representative_caps = [4096, 8192, 16384, 32768]
+    print(f"\n  Multi-tree packing at different max_tokens_per_mb:")
+    print(f"  {'capacity':>10s}  {'#trees':>7s}  {'tokens/tree (avg)':>18s}  {'pad overhead':>13s}")
+    for cap in representative_caps:
+        if cap < max(seq_lens):
+            continue
+        try:
+            tries_multi, n_tokens_multi = _greedy_build_tries(result, max_tokens_per_tree=cap)
+            n_trees = len(tries_multi)
+            avg_tokens = sum(n_tokens_multi) / n_trees if n_trees else 0
+            total_padded = n_trees * cap
+            pad_overhead = total_padded - sum(n_tokens_multi)
+            pad_pct = 100.0 * pad_overhead / total_padded if total_padded > 0 else 0.0
+            print(f"  {cap:>10,}  {n_trees:>7}  {avg_tokens:>18,.1f}  {pad_pct:>12.1f}%")
+        except (ValueError, RuntimeError):
+            print(f"  {cap:>10,}  {'(skip)':>7}  {'sequence too long':>18}")
+    print(f"{'='*60}\n")
+
+    return result, compression_ratio
+
+
+@pytest.fixture(scope="module")
+def real_tree_input(data_path, prefix_len):
+    """Load tree training data from saved file.
+
+    Supports two on-disk formats:
+
+    1. ``{"input_data": {<field>: Tensor, ...}}``  — legacy dict format.
+    2. ``list[Tensor]``  — each tensor is a 1-D token-ID sequence.  The
+       remaining fields (``loss_mask``, ``logprobs``, ``advantages``) are
+       synthesised automatically so the data can be used for benchmarking.
+
+    If the file does not exist the test is skipped.
+
     Args:
+        data_path: Path to the .pt data file (from conftest fixture).
         prefix_len: Number of sequences to keep. If -1, keep all sequences.
     """
     import os
-    if not os.path.exists(TREE_DATA_PATH):
-        pytest.skip(f"Tree data file not found: {TREE_DATA_PATH}")
+    if not os.path.exists(data_path):
+        pytest.skip(f"Tree data file not found: {data_path}")
 
-    data = torch.load(TREE_DATA_PATH)
-    if "input_data" not in data:
-        pytest.skip(f"No input_data found in {TREE_DATA_PATH}")
-
-    input_data = data["input_data"]
+    raw = torch.load(data_path, weights_only=False)
 
     device = current_platform.device_type
     device_obj = device if isinstance(device, torch.device) else torch.device(device)
 
-    # Output sequence lengths for debugging
+    # ------------------------------------------------------------------
+    # Detect format
+    # ------------------------------------------------------------------
+    if isinstance(raw, dict) and "input_data" in raw:
+        input_data = raw["input_data"]
+    elif isinstance(raw, (list, tuple)) and len(raw) > 0 and torch.is_tensor(raw[0]):
+        seqs = list(raw)
+        if prefix_len != -1 and len(seqs) > prefix_len:
+            seqs = seqs[:prefix_len]
+        print(f"[real_tree_input] Loaded {len(seqs)} token-ID sequences from list format.")
+        seq_lens = [t.numel() for t in seqs]
+        print(f"[real_tree_input] Sequence lengths: min={min(seq_lens)}, max={max(seq_lens)}, "
+              f"mean={sum(seq_lens)/len(seq_lens):.2f}")
+        print(f"[real_tree_input] First 10 sequence lengths: {seq_lens[:10]}")
+        result, _ = _build_input_from_token_lists(seqs, device_obj)
+        return result
+    else:
+        pytest.skip(
+            f"Unrecognised data format in {data_path}: "
+            f"expected dict with 'input_data' or list[Tensor], got {type(raw)}"
+        )
+
+    # ------------------------------------------------------------------
+    # Legacy dict path
+    # ------------------------------------------------------------------
     if "attention_mask" in input_data:
         attn_mask = input_data["attention_mask"]
         if attn_mask is not None:
@@ -367,24 +490,19 @@ def real_tree_input(prefix_len):
             total_sequences = attn_mask.shape[0]
             print(f"[real_tree_input] Loaded {total_sequences} sequences.")
             print(f"[real_tree_input] Sequence lengths: min={min(seq_lens)}, max={max(seq_lens)}, mean={sum(seq_lens)/len(seq_lens):.2f}")
-            # Optionally, print first few lengths for clarity
             print(f"[real_tree_input] First 10 sequence lengths: {seq_lens[:10]}")
-            
-            # Apply prefix_len filter if specified
             if prefix_len != -1:
                 print(f"[real_tree_input] Applying prefix_len={prefix_len}, keeping first {prefix_len} sequences")
 
-    # Load all fields present in input_data and apply prefix_len filter
     result = {}
-    for field, value in input_data.items():
+    for field_name, value in input_data.items():
         if isinstance(value, torch.Tensor):
-            # Apply prefix_len filter if not -1
             if prefix_len != -1 and value.size(0) >= prefix_len:
-                result[field] = value[:prefix_len].to(device_obj)
+                result[field_name] = value[:prefix_len].to(device_obj)
             else:
-                result[field] = value.to(device_obj)
+                result[field_name] = value.to(device_obj)
         else:
-            result[field] = value
+            result[field_name] = value
 
     return result
 
@@ -1006,7 +1124,7 @@ fsdp_logger = logging.getLogger("FSDPEngine Test")
 
 
 @pytest.fixture
-def fsdp_engine(max_tokens_per_mb):
+def fsdp_engine(max_tokens_per_mb, model_path):
     """Fixture for baseline FSDP engine."""
     fsdp_logger.info(f"torch version={torch.__version__}")
     fsdp_logger.info(f"Using max_tokens_per_mb={max_tokens_per_mb}")
@@ -1016,6 +1134,7 @@ def fsdp_engine(max_tokens_per_mb):
         experiment_name="test_baseline",
         master_port="7780",
         max_tokens_per_mb=max_tokens_per_mb,
+        model_path=model_path,
     ) as engine:
         fsdp_logger.info(f"FSDP Model initialized: {engine.model}")
         yield engine
@@ -1089,7 +1208,7 @@ def _collect_fsdp_parameters(engine: FSDPEngine) -> dict[str, torch.Tensor]:
 
 
 ### Never use gradient checkpointing for tree stack training
-def test_fsdp_flex_forward(fsdp_engine, real_tree_input, max_tokens_per_mb):
+def test_fsdp_flex_forward(fsdp_engine, real_tree_input, max_tokens_per_mb, use_dfn_mask, model_path):
     """Test FSDP tree training forward pass produces correct logprobs."""
     # Run baseline forward pass
     logprob_baseline, baseline_time = run_forward_pass(
@@ -1107,6 +1226,8 @@ def test_fsdp_flex_forward(fsdp_engine, real_tree_input, max_tokens_per_mb):
         master_port="7781",
         max_tokens_per_mb=max_tokens_per_mb,
         enable_tree_training=True,
+        use_dfn_mask=use_dfn_mask,
+        model_path=model_path,
     ) as tree_engine:
         logprob_tree, tree_time = run_forward_pass(tree_engine, real_tree_input)
         fsdp_logger.info(f"Tree training forward_batch time: {tree_time:.4f}s")
@@ -1118,7 +1239,7 @@ def test_fsdp_flex_forward(fsdp_engine, real_tree_input, max_tokens_per_mb):
         # Compare results
         _assert_logprobs_close(logprob_tree, logprob_baseline, fsdp_logger)
 
-def test_fsdp_stack_forward(fsdp_engine, real_tree_input, max_tokens_per_mb):
+def test_fsdp_stack_forward(fsdp_engine, real_tree_input, max_tokens_per_mb, model_path):
     """Test FSDP tree attention training forward pass produces correct logprobs."""
     # Run baseline forward pass
     logprob_baseline, baseline_time = run_forward_pass(
@@ -1136,6 +1257,7 @@ def test_fsdp_stack_forward(fsdp_engine, real_tree_input, max_tokens_per_mb):
         master_port="7781",
         max_tokens_per_mb=max_tokens_per_mb,
         enable_tree_stack_training=True,
+        model_path=model_path,
     ) as tree_engine:
         logprob_tree, tree_time = run_forward_pass(tree_engine, real_tree_input)
         fsdp_logger.info(f"Tree attention forward_batch time: {tree_time:.4f}s")
@@ -1147,7 +1269,7 @@ def test_fsdp_stack_forward(fsdp_engine, real_tree_input, max_tokens_per_mb):
         # Compare results
         _assert_logprobs_close(logprob_tree, logprob_baseline, fsdp_logger)
 
-def test_fsdp_flex_backward(real_tree_input, max_tokens_per_mb, is_gradient_checkpointing):
+def test_fsdp_flex_backward(real_tree_input, max_tokens_per_mb, is_gradient_checkpointing, use_dfn_mask, model_path):
     """Test FSDP tree training forward-backward pass produces correct gradients."""
     # Run baseline training FIRST
     reset_peak_memory()
@@ -1157,6 +1279,7 @@ def test_fsdp_flex_backward(real_tree_input, max_tokens_per_mb, is_gradient_chec
         master_port="7782",
         max_tokens_per_mb=max_tokens_per_mb,
         gradient_checkpointing=is_gradient_checkpointing,
+        model_path=model_path,
     ) as baseline_engine:
         _, baseline_time = run_train_batch(baseline_engine, real_tree_input, loss_fn, loss_weight_fn)
         fsdp_logger.info(f"Baseline train_batch time: {baseline_time:.4f}s")
@@ -1199,6 +1322,8 @@ def test_fsdp_flex_backward(real_tree_input, max_tokens_per_mb, is_gradient_chec
         max_tokens_per_mb=max_tokens_per_mb,
         gradient_checkpointing=is_gradient_checkpointing,
         enable_tree_training=True,
+        use_dfn_mask=use_dfn_mask,
+        model_path=model_path,
     ) as tree_engine:
         _, tree_time = run_train_batch(tree_engine, real_tree_input, loss_fn, loss_weight_fn)
         fsdp_logger.info(f"Tree training train_batch time: {tree_time:.4f}s")
@@ -1207,7 +1332,7 @@ def test_fsdp_flex_backward(real_tree_input, max_tokens_per_mb, is_gradient_chec
         fsdp_logger.info(f"Speedup (baseline/tree): {speedup:.2f}x")
         
         # Get and log memory stats for tree training
-        tree_mem_stats = get_memory_stats("Flex Tree Training")
+        tree_mem_stats = get_memory_stats("Flex Tree Training (dfn={})".format(use_dfn_mask))
         log_memory_stats(tree_mem_stats, fsdp_logger)
 
         # Collect gradients and params, automatically offloaded to CPU
@@ -1241,7 +1366,7 @@ def test_fsdp_flex_backward(real_tree_input, max_tokens_per_mb, is_gradient_chec
         logger_instance=fsdp_logger,
     )
 
-def test_fsdp_stack_backward(real_tree_input, max_tokens_per_mb, is_gradient_checkpointing):
+def test_fsdp_stack_backward(real_tree_input, max_tokens_per_mb, is_gradient_checkpointing, model_path):
     """Test FSDP tree attention training forward-backward pass produces correct gradients."""
     # Run baseline training FIRST
     reset_peak_memory()
@@ -1251,6 +1376,7 @@ def test_fsdp_stack_backward(real_tree_input, max_tokens_per_mb, is_gradient_che
         master_port="7782",
         gradient_checkpointing=is_gradient_checkpointing,
         max_tokens_per_mb=max_tokens_per_mb,
+        model_path=model_path,
     ) as baseline_engine:
         _, baseline_time = run_train_batch(baseline_engine, real_tree_input, loss_fn, loss_weight_fn)
         fsdp_logger.info(f"Baseline train_batch time: {baseline_time:.4f}s")
@@ -1292,6 +1418,7 @@ def test_fsdp_stack_backward(real_tree_input, max_tokens_per_mb, is_gradient_che
         master_port="7783",
         max_tokens_per_mb=max_tokens_per_mb,
         enable_tree_stack_training=True,
+        model_path=model_path,
     ) as tree_engine:
         _, tree_time = run_train_batch(tree_engine, real_tree_input, loss_fn, loss_weight_fn)
         fsdp_logger.info(f"Tree stack train_batch time: {tree_time:.4f}s")
@@ -1333,7 +1460,7 @@ def test_fsdp_stack_backward(real_tree_input, max_tokens_per_mb, is_gradient_che
         logger_instance=fsdp_logger,
     )
 
-def test_flex(real_tree_input, max_tokens_per_mb, is_gradient_checkpointing):
+def test_flex(real_tree_input, max_tokens_per_mb, is_gradient_checkpointing, use_dfn_mask, model_path):
     """Test flex (flatten tree) training and record execution time.
     
     This test runs flex tree training mode and records the training time.
@@ -1346,6 +1473,8 @@ def test_flex(real_tree_input, max_tokens_per_mb, is_gradient_checkpointing):
         max_tokens_per_mb=max_tokens_per_mb,
         gradient_checkpointing=is_gradient_checkpointing,
         enable_tree_training=True,
+        use_dfn_mask=use_dfn_mask,
+        model_path=model_path,
     ) as flex_engine:
         _, flex_time = run_train_batch(flex_engine, real_tree_input, loss_fn, loss_weight_fn)
         
@@ -1360,7 +1489,7 @@ def test_flex(real_tree_input, max_tokens_per_mb, is_gradient_checkpointing):
         log_memory_stats(flex_mem_stats, fsdp_logger)
 
 
-def test_stack(real_tree_input, max_tokens_per_mb):
+def test_stack(real_tree_input, max_tokens_per_mb, model_path):
     """Test stack (tree attention) training and record execution time.
     
     This test runs stack tree training mode and records the training time.
@@ -1373,6 +1502,7 @@ def test_stack(real_tree_input, max_tokens_per_mb):
         master_port="7785",
         max_tokens_per_mb=max_tokens_per_mb,
         enable_tree_stack_training=True,
+        model_path=model_path,
     ) as stack_engine:
         _, stack_time = run_train_batch(stack_engine, real_tree_input, loss_fn, loss_weight_fn)
         
@@ -1387,7 +1517,7 @@ def test_stack(real_tree_input, max_tokens_per_mb):
         log_memory_stats(stack_mem_stats, fsdp_logger)
 
 
-def test_baseline(real_tree_input, max_tokens_per_mb, is_gradient_checkpointing):
+def test_baseline(real_tree_input, max_tokens_per_mb, is_gradient_checkpointing, model_path):
     """Test baseline (standard) training and record execution time.
     
     This test runs baseline training mode without any tree optimizations
@@ -1402,6 +1532,7 @@ def test_baseline(real_tree_input, max_tokens_per_mb, is_gradient_checkpointing)
         gradient_checkpointing=is_gradient_checkpointing,
         enable_tree_training=False,
         enable_tree_stack_training=False,
+        model_path=model_path,
     ) as baseline_engine:
         _, baseline_time = run_train_batch(baseline_engine, real_tree_input, loss_fn, loss_weight_fn)
         
@@ -1416,22 +1547,32 @@ def test_baseline(real_tree_input, max_tokens_per_mb, is_gradient_checkpointing)
         log_memory_stats(baseline_mem_stats, fsdp_logger)
 
 """
-A100(80G):
-AREAL_FLEX_ATTENTION_BLOCK_SIZE=64 python -m pytest areal/tests/test_tree_training.py::test_fsdp_flex_backward -v -s --max-tokens-per-mb 16384
+Usage examples (A100 80G):
 
-python -m pytest areal/tests/test_tree_training.py::test_fsdp_stack_backward -v -s --max-tokens-per-mb 16384
+# DFN mask is ON by default; add --disable-dfn-mask to fall back to O(B^2) dense mask.
+# --model-path and --data-path can be set to override defaults.
 
-AREAL_FLEX_ATTENTION_BLOCK_SIZE=64 python -m pytest areal/tests/test_tree_training.py::test_fsdp_flex_forward -v -s --max-tokens-per-mb 16384
-
-python -m pytest areal/tests/test_tree_training.py::test_fsdp_stack_forward -v -s --max-tokens-per-mb 16384
-
+# Standalone benchmarks
 AREAL_FLEX_ATTENTION_BLOCK_SIZE=64 python -m pytest areal/tests/test_tree_training.py::test_flex -v -s --max-tokens-per-mb 16384
-
 python -m pytest areal/tests/test_tree_training.py::test_stack -v -s --max-tokens-per-mb 16384
-
 python -m pytest areal/tests/test_tree_training.py::test_baseline -v -s --max-tokens-per-mb 16384 --prefix-len 10
 
-AREAL_FLEX_ATTENTION_BLOCK_SIZE=64 python -m pytest areal/tests/test_tree_training.py::test_fsdp_flex_backward -v -s --max-tokens-per-mb 39936 --prefix-len 10
+# Correctness tests (forward)
+AREAL_FLEX_ATTENTION_BLOCK_SIZE=64 python -m pytest areal/tests/test_tree_training.py::test_fsdp_flex_forward -v -s --max-tokens-per-mb 16384
+python -m pytest areal/tests/test_tree_training.py::test_fsdp_stack_forward -v -s --max-tokens-per-mb 16384
 
+# Correctness tests (backward)
 AREAL_FLEX_ATTENTION_BLOCK_SIZE=64 python -m pytest areal/tests/test_tree_training.py::test_fsdp_flex_backward -v -s --max-tokens-per-mb 16384 --prefix-len 10
+python -m pytest areal/tests/test_tree_training.py::test_fsdp_stack_backward -v -s --prefix-len 10
+
+# Disable DFN mask (use dense O(B^2) mask instead):
+AREAL_FLEX_ATTENTION_BLOCK_SIZE=64 python -m pytest areal/tests/test_tree_training.py::test_flex -v -s --max-tokens-per-mb 16384 --disable-dfn-mask
+
+# Custom model / data paths:
+python -m pytest areal/tests/test_tree_training.py::test_flex -v -s --model-path /path/to/model --data-path /path/to/data.pt
+
+# Batch benchmark across a directory of .pt files (multi-GPU):
+python areal/tests/bench_tree_training.py --data-dir /path/to/pt_dir --method flex --output results.jsonl
+python areal/tests/bench_tree_training.py --data-dir /path/to/pt_dir --method stack --output results.jsonl --max-tokens-per-mb 16384
+python areal/tests/bench_tree_training.py --data-dir /path/to/pt_dir --method baseline --output results.jsonl --num-gpus 4
 """

@@ -114,7 +114,7 @@ from areal.utils.ulysses import (
 )
 
 from areal.models.tree_attn.token_trie import TokenTrie
-from areal.models.tree_attn.tree_stack import TreeStackTrainingEngine
+from areal.models.tree_attn.tree_stack import TreeTrainingEngine
 
 
 if TYPE_CHECKING:
@@ -196,14 +196,14 @@ class FSDPEngine(TrainEngine):
         self.is_tree_distribution: bool = self.config.is_tree_distribution
         self.dump_dir: str | None = self.config.dump_dir
         self.enable_tree_training: bool = self.config.enable_tree_training
+        self.use_dfn_mask: bool = self.config.use_dfn_mask
         self.stack_depth: int = self.config.stack_depth
         self.stack_block_size: int = self.config.stack_block_size
-        
-        print(f"Stack depth: {self.stack_depth}, Stack block size: {self.stack_block_size}")
 
         self.enable_tree_stack_training: bool = self.config.enable_tree_stack_training
-        assert not (self.enable_tree_training and self.enable_tree_stack_training), "Tree training and tree attention training cannot be enabled at the same time."
-        
+        assert not (self.enable_tree_training and self.enable_tree_stack_training), (
+            "Tree training and tree attention training cannot be enabled at the same time."
+        )
 
         # NOTE: Tree stack training uses a custom ZeRO-1 variant:
         # - Model parameters: replicated across ranks (no wrapper)
@@ -212,7 +212,7 @@ class FSDPEngine(TrainEngine):
         # This saves ~1x model size VRAM compared to DDP (no gradient buckets).
 
         if self.enable_tree_stack_training:
-            self.tree_stack_training_engine: TreeStackTrainingEngine
+            self.tree_stack_training_engine: TreeTrainingEngine
 
 
         if hasattr(self.model_config, 'torch_dtype') and self.model_config.torch_dtype is not None:
@@ -630,10 +630,7 @@ class FSDPEngine(TrainEngine):
 
             # ctx_dict = dataclasses.asdict(ctx)
             if self.enable_tree_training:
-                if ctx.trie_node is not None:
-                    print(f"[Debug] ctx with enable_tree_training is not None")
-                else:
-                    print(f"[Debug] ctx with enable_tree_training is None")
+                pass
             ctx_dict = {
                 "model_inputs": ctx.model_inputs,
                 "mb_input": ctx.mb_input,
@@ -648,8 +645,8 @@ class FSDPEngine(TrainEngine):
             if not forward_only and loss is not None:
                 with trace_scope("fsdp_engine.backward"):
                     loss.backward()
-        if isinstance(loss_sum, torch.Tensor):loss_sum = loss_sum.item()
-        print(f"[Debug] Final loss_sum in train_batch = {loss_sum}")
+        if isinstance(loss_sum, torch.Tensor):
+            loss_sum = loss_sum.item()
         return loss_sum
 
     def train_batch(
@@ -679,7 +676,6 @@ class FSDPEngine(TrainEngine):
 
         # Step 1: Prepare micro-batches
         mb_list = self._prepare_mb_list(input_).to(self.device)
-        print(f"[Debug] length of mb_list: {len(mb_list)}")
 
         # Step 2: Compute total loss weight
         total_loss_weight = compute_total_loss_weight(
@@ -688,8 +684,6 @@ class FSDPEngine(TrainEngine):
 
         if self.enable_tree_stack_training:
             # ========== Tree Stack Training Path ==========
-            print(f"[Debug] enable_tree_stack_training in train_batch is True")
-            print(f"[Debug] total_loss_weight: {total_loss_weight}")
 
             # Step 3a: Prepare input data for tree training
             input_data = []
@@ -698,58 +692,47 @@ class FSDPEngine(TrainEngine):
                 loss_scale = loss_weight_fn(ctx.mb_input) / total_loss_weight * self.parallel_helper.dp_size
                 if isinstance(loss_scale, torch.Tensor):
                     loss_scale = loss_scale.item()
-                inputs, ctx = self._prepare_mb_inputs(mb_item)
                 input_data.append({"original": ctx.mb_input, "scale": loss_scale})
 
             # Step 3b: Define loss function
             def new_loss_fn(logprobs: torch.Tensor, entropy: torch.Tensor, input_data: dict):
-                # Append zero for padding compatibility (TreeBackwardEngine expects extra position)
                 logprobs = torch.cat([logprobs, logprobs.new_zeros(1)], dim=0)
-                res = loss_fn(logprobs, entropy, input_data["original"]) * input_data["scale"]
-                return res
-                # return logprobs.sum()
+                return loss_fn(logprobs, entropy, input_data["original"]) * input_data["scale"]
 
             # Step 3c: Extract valid sequences
-            input_ids_batch = input_["input_ids"]  # [batch_size, seq_len]
-            attention_mask = input_["attention_mask"]  # [batch_size, seq_len]
-            total_length = attention_mask.sum().item()
-            print(f"[Debug] total_length: {total_length}")
+            input_ids_batch = input_["input_ids"]
+            attention_mask = input_["attention_mask"]
             input_ids_list = []
             for i in range(input_ids_batch.shape[0]):
-                # Extract valid tokens (where attention_mask == 1)
-                valid_length = attention_mask[i].sum().item()
-                valid_tokens = input_ids_batch[i, :valid_length]
-                input_ids_list.append(valid_tokens)
+                valid_length = int(attention_mask[i].sum().item())
+                input_ids_list.append(input_ids_batch[i, :valid_length])
 
-            # Step 3d: Build trie
+            # Step 3d: Build trie and apply DFS ordering
             trie = TokenTrie(input_ids_list, input_data, sorted=False)
+            trie.backward_permute()
 
             token_trie_info = trie.count_tokens_information()
-            
+
             loss = self.tree_stack_training_engine.backward(
                 model=self.model,
                 token_trie=trie,
                 block_size=self.config.stack_block_size,
-                loss_fn=new_loss_fn
+                loss_fn=new_loss_fn,
             )
 
-            if required_token_trie_info:return token_trie_info,loss # when requiring token_trie_info ,we don't sync gradients
+            if required_token_trie_info:
+                return token_trie_info, loss
 
             # Step 4b: Manual gradient synchronization across DP ranks
-            import time
             torch.cuda.synchronize()
-            sync_start_time = time.time()
             for param in self.model.parameters():
                 if param.grad is not None:
                     dist.all_reduce(param.grad, group=self.dp_group)
                     param.grad.div_(self.parallel_helper.dp_size)
             torch.cuda.synchronize()
-            sync_end_time = time.time()
-            print(f"[Debug][TreeStack] Gradient sync (all_reduce) time: {sync_end_time - sync_start_time:.4f}s")
 
             if isinstance(loss, torch.Tensor):
                 loss = loss.item()
-            print(f"[Debug] Final loss_sum in train_batch = {loss}")
 
             # Step 5a: Optimizer step
             result = self.optimizer_step()
@@ -838,26 +821,21 @@ class FSDPEngine(TrainEngine):
         self._ensure_ready()
 
         if self.enable_tree_stack_training:
-            print(f"[Debug] enable_tree_stack_training in forward_batch is True")
-            # Tree attention forward: use TreeForwardEngine for batched inference
-            # Extract valid sequences and build TokenTrie for shared prefix optimization
-            input_ids_batch = input_["input_ids"]  # [batch_size, seq_len]
-            attention_mask = input_["attention_mask"]  # [batch_size, seq_len]
-            
+            input_ids_batch = input_["input_ids"]
+            attention_mask = input_["attention_mask"]
+
             max_seq_len = 0
             input_ids_list = []
-            input_data = []
+            input_data: list[dict] = []
             for i in range(input_ids_batch.shape[0]):
-                # Extract valid tokens (where attention_mask == 1)
-                valid_length = attention_mask[i].sum().item()
+                valid_length = int(attention_mask[i].sum().item())
                 max_seq_len = max(max_seq_len, valid_length)
-                valid_tokens = input_ids_batch[i, :valid_length]
-                input_ids_list.append(valid_tokens)
+                input_ids_list.append(input_ids_batch[i, :valid_length])
                 input_data.append({})
 
             trie = TokenTrie(input_ids_list, input_data, sorted=False)
+            trie.forward_permute()
 
-            # TreeForwardEngine returns list of 1D tensors; pad to [batch_size, max_seq_len]
             output = self.tree_stack_training_engine.forward(model=self.model, token_trie=trie)
             B = len(output)
             output_padded = torch.zeros((B, max_seq_len), dtype=output[0].dtype, device=output[0].device)
@@ -985,7 +963,7 @@ class FSDPEngine(TrainEngine):
         self.device = torch.device(int(os.environ["LOCAL_RANK"]))
 
         if self.enable_tree_stack_training:
-            self.tree_stack_training_engine = TreeStackTrainingEngine(self.model_config, self.device, self.model_dtype, self.stack_depth)
+            self.tree_stack_training_engine = TreeTrainingEngine(self.model_config, self.device, self.model_dtype, self.stack_depth)
 
         dtype = getattr(torch, self.config.dtype)
 
@@ -1594,6 +1572,7 @@ class FSDPEngine(TrainEngine):
                 # pad_to_maximum=self.config.pad_to_maximum,
                 pad_to_multiple_of=BLOCK_SIZE,
                 dp_group=self.data_parallel_group,
+                use_dfn_mask=self.use_dfn_mask,
             )
             self.logger.info(
                 f"Packed tree #microbatch: {len(mb_list)}, microbatch #tokens: {mb_list.group_lens}, "
@@ -1632,7 +1611,6 @@ class FSDPEngine(TrainEngine):
             input_ = amend_position_ids(input_)
 
         if self.enable_tree_stack_training:
-            print(f"[Debug] one_seq_per_mb in _prepare_mb_list is True")
             # TreeBackwardEngine supports sequence-level loss calculation based on logprobs and entropy.
             # To enable this, we use one sequence per microbatch (sequence-level decoupling)
             mb_spec = self.config.mb_spec

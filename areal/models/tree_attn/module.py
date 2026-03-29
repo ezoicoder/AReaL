@@ -99,6 +99,49 @@ def create_block_mask_from_dense(
     return block_mask
 
 
+def create_block_mask_from_dfn(
+    subtree_end: torch.Tensor,
+    seq_len: int,
+    device: torch.device,
+) -> BlockMask:
+    """Create a flex attention BlockMask from a DFN subtree_end array.
+
+    The mask predicate is O(1) per element:
+        attend(q, k) = (k <= q) AND (q <= subtree_end[k])
+
+    This avoids materialising the O(seq_len^2) dense mask entirely.
+
+    Parameters
+    ----------
+    subtree_end : torch.Tensor
+        1-D tensor of length >= seq_len.  subtree_end[k] gives the last
+        position in the subtree rooted at k (in DFN / pre-order layout).
+    seq_len : int
+        Sequence length (may include padding).
+    device : torch.device
+        Target device.
+    """
+
+    def dfn_tree_mask(
+        batch: torch.Tensor,
+        head: torch.Tensor,
+        q_idx: torch.Tensor,
+        k_idx: torch.Tensor,
+    ):
+        return (k_idx <= q_idx) & (q_idx <= subtree_end[k_idx])
+
+    return create_block_mask(
+        dfn_tree_mask,
+        B=1,
+        H=1,
+        Q_LEN=seq_len,
+        KV_LEN=seq_len,
+        BLOCK_SIZE=BLOCK_SIZE,
+        device=device,
+        _compile=False,
+    )
+
+
 def make_block_mask_or_score_mod(
     attention_mask: torch.Tensor | None,
     q_len: int,
