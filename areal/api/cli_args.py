@@ -802,6 +802,18 @@ class TrainEngineConfig:
         },
     )
 
+    use_trie_partition: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Use TokenTrie-based partitioning for tree training microbatch composition. "
+                "Builds a global trie, applies backward_permute for optimal DFN ordering, "
+                "then divides along contiguous DFN ranges to maximise prefix sharing within "
+                "each microbatch. Only effective when enable_tree_training=True."
+            )
+        },
+    )
+
     enable_tree_stack_training: bool = field(
         default=False,
         metadata={

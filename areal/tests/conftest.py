@@ -8,7 +8,7 @@ def pytest_addoption(parser):
     parser.addoption(
         "--max-tokens-per-mb",
         action="store",
-        default=16384,
+        default=24576,
         type=int,
         help="Maximum tokens per microbatch for tree packing tests",
     )

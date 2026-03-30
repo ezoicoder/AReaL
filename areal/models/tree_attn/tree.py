@@ -294,6 +294,7 @@ def build_packed_tree_batch(
     pad_to_multiple_of: int = 1,
     dp_group: dist.ProcessGroup | None = None,
     use_dfn_mask: bool = False,
+    use_trie_partition: bool = False,
 ) -> MicroBatchList:
     """Build a MicroBatchList from input data using greedy trie packing.
 
@@ -330,6 +331,12 @@ def build_packed_tree_batch(
         (O(B) storage) instead of a dense O(B^2) mask.  The resulting
         BlockMask is numerically identical but avoids ever materialising the
         dense mask, saving significant memory for large trees.
+    use_trie_partition : bool, default=False
+        When True, partition sequences using ``TokenTrie.backward_permute``
+        + ``divide`` instead of greedy first-fit.  This builds a global trie,
+        optimises the DFN leaf ordering for backward-pass efficiency, then
+        splits along contiguous DFN ranges to maximise prefix sharing within
+        each microbatch.
 
     Returns
     -------
@@ -389,13 +396,21 @@ def build_packed_tree_batch(
         min_trees = mb_spec.n_mbs if mb_spec.n_mbs is not None else 1
         n_trees_divisor = mb_spec.n_mbs_divisor if mb_spec.n_mbs_divisor is not None else 1
 
-        # Build tries using greedy packing
-        tries, num_tokens_list = _greedy_build_tries(
-            data,
-            max_tokens_per_tree,
-            min_trees=min_trees,
-            n_trees_divisor=n_trees_divisor,
-        )
+        # Build tries: trie-partition (global optimal) or greedy first-fit
+        if use_trie_partition:
+            tries, num_tokens_list = _build_tries_from_trie_partition(
+                data,
+                max_tokens_per_tree,
+                min_trees=min_trees,
+                n_trees_divisor=n_trees_divisor,
+            )
+        else:
+            tries, num_tokens_list = _greedy_build_tries(
+                data,
+                max_tokens_per_tree,
+                min_trees=min_trees,
+                n_trees_divisor=n_trees_divisor,
+            )
 
         # Synchronize number of trees across dp_group if provided
         if dp_group is not None:
@@ -791,6 +806,100 @@ def _extract_sequences(data: dict[str, Any]) -> list[list[int]]:
         seq = ids[mask.bool()].tolist()
         sequences.append(seq)
     return sequences
+
+
+@trace_perf("tree_attn._build_tries_from_trie_partition")
+def _build_tries_from_trie_partition(
+    data: dict[str, Any],
+    max_tokens_per_tree: int,
+    min_trees: int = 1,
+    n_trees_divisor: int = 1,
+) -> tuple[list[TrieNode], list[int]]:
+    """Build tries by partitioning a global TokenTrie along optimal DFN order.
+
+    Unlike ``_greedy_build_tries`` (first-fit greedy), this function:
+    1. Builds a global ``TokenTrie`` from all sequences.
+    2. Applies ``backward_permute`` for a DFN ordering that keeps subtrees
+       contiguous, improving block-mask density for flex attention.
+    3. Calls ``try_devide`` / ``divide`` to split along contiguous DFN ranges,
+       maximising prefix sharing within each microbatch while balancing load.
+
+    Parameters
+    ----------
+    data : dict[str, Any]
+        Dictionary with ``input_ids`` and ``attention_mask`` tensors
+        of shape ``[batch_size, seq_len]``.
+    max_tokens_per_tree : int
+        Maximum tree-token budget per microbatch.
+    min_trees : int
+        Minimum number of partitions (may exceed to satisfy ``n_trees_divisor``).
+    n_trees_divisor : int
+        Final partition count must be divisible by this value.
+
+    Returns
+    -------
+    tuple[list[TrieNode], list[int]]
+        Compressed TrieNodes and their token counts, one per partition.
+    """
+    from areal.models.tree_attn.token_trie import TokenTrie
+
+    sequences = _extract_sequences(data)
+    input_ids_tensors = [
+        data["input_ids"][i][data["attention_mask"][i].bool()]
+        for i in range(data["input_ids"].shape[0])
+    ]
+
+    token_trie = TokenTrie(input_ids_tensors, sorted=False)
+    token_trie.backward_permute()
+
+    logger.info(
+        "Trie partition: %d sequences, %d tree tokens (%.2fx compression), "
+        "max_seq_len=%d",
+        token_trie.n_sequences,
+        token_trie.n_tree_tokens,
+        token_trie.n_tokens / token_trie.n_tree_tokens
+        if token_trie.n_tree_tokens > 0
+        else float("inf"),
+        token_trie.max_seq_len,
+    )
+
+    # --- Determine groups via try_devide / divide ---
+    groups = token_trie.try_devide(max_tokens_per_tree)
+    if groups is None:
+        raise ValueError(
+            f"A single sequence exceeds max_tokens_per_tree "
+            f"({token_trie.max_seq_len} > {max_tokens_per_tree}); "
+            f"increase max_tokens_per_mb."
+        )
+
+    if min_trees < n_trees_divisor:
+        min_trees = n_trees_divisor
+
+    # Split further if we don't meet min_trees / divisor constraints
+    if len(groups) < min_trees or len(groups) % n_trees_divisor != 0:
+        target = max(min_trees, len(groups))
+        if target % n_trees_divisor != 0:
+            target = ((target // n_trees_divisor) + 1) * n_trees_divisor
+        groups = token_trie.divide(target)
+
+    # --- Build a TrieNode per group, preserving original seq_ids ---
+    tries: list[TrieNode] = []
+    num_tokens_list: list[int] = []
+
+    for tree_id, group_seq_ids in enumerate(groups):
+        root = _BuildNode(tree_id, -1, -1)
+        all_nodes: list[_BuildNode] = []
+        for seq_id in group_seq_ids:
+            _insert_sequence(root, all_nodes, sequences[seq_id], tree_id, seq_id)
+        tries.append(_compress_trie(root))
+        num_tokens_list.append(len(all_nodes))
+
+    logger.info(
+        "Trie partition produced %d trees, tokens per tree: %s",
+        len(tries),
+        num_tokens_list,
+    )
+    return tries, num_tokens_list
 
 
 def _pack_input_ids(

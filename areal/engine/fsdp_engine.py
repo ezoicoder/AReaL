@@ -197,6 +197,7 @@ class FSDPEngine(TrainEngine):
         self.dump_dir: str | None = self.config.dump_dir
         self.enable_tree_training: bool = self.config.enable_tree_training
         self.use_dfn_mask: bool = self.config.use_dfn_mask
+        self.use_trie_partition: bool = self.config.use_trie_partition
         self.stack_depth: int = self.config.stack_depth
         self.stack_block_size: int = self.config.stack_block_size
 
@@ -1573,6 +1574,7 @@ class FSDPEngine(TrainEngine):
                 pad_to_multiple_of=BLOCK_SIZE,
                 dp_group=self.data_parallel_group,
                 use_dfn_mask=self.use_dfn_mask,
+                use_trie_partition=self.use_trie_partition,
             )
             self.logger.info(
                 f"Packed tree #microbatch: {len(mb_list)}, microbatch #tokens: {mb_list.group_lens}, "

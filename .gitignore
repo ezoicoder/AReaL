@@ -200,3 +200,4 @@ sympy/
 
 dta_curve_time.py
 DynamicTreeAttn/
+result*.jsonl

@@ -20,7 +20,7 @@ Usage:
         --method stack \\
         --output results.jsonl \\
         --model-path /path/to/model \\
-        --max-tokens-per-mb 16384 \\
+        --max-tokens-per-mb 24576 \\
         --prefix-len 10 \\
         --disable-dfn-mask \\
         --num-gpus 4
@@ -136,6 +136,7 @@ def run_single_benchmark(
     gradient_checkpointing: bool,
     prefix_len: int,
     use_dfn_mask: bool,
+    use_trie_partition: bool,
     master_port: str,
     gpu_id: int = 0,
 ) -> dict:
@@ -147,11 +148,13 @@ def run_single_benchmark(
     enable_stack = method == "stack"
     gc_flag = gradient_checkpointing if method != "stack" else False
     dfn = use_dfn_mask if method == "flex" else False
+    trie_part = use_trie_partition if method == "flex" else False
 
     gc.collect()
     torch.cuda.empty_cache()
     reset_peak_memory()
 
+    assert "input_ids" in input_data, "input_ids not found in input_data"
     with setup_engine(
         FSDPEngine,
         experiment_name=f"bench_{method}",
@@ -162,6 +165,7 @@ def run_single_benchmark(
         enable_tree_stack_training=enable_stack,
         model_path=model_path,
         use_dfn_mask=dfn,
+        use_trie_partition=trie_part,
         local_rank=gpu_id,
     ) as engine:
         _, elapsed = run_train_batch(engine, input_data, loss_fn, loss_weight_fn)
@@ -212,6 +216,7 @@ def _worker(gpu_id: int, pt_files: list[str], args, result_queue):
                 gradient_checkpointing=not args.disable_gradient_checkpointing,
                 prefix_len=args.prefix_len,
                 use_dfn_mask=not args.disable_dfn_mask,
+                use_trie_partition=args.use_trie_partition,
                 master_port=str(base_port + 99),
                 gpu_id=gpu_id,
             )
@@ -234,6 +239,7 @@ def _worker(gpu_id: int, pt_files: list[str], args, result_queue):
                 gradient_checkpointing=not args.disable_gradient_checkpointing,
                 prefix_len=args.prefix_len,
                 use_dfn_mask=not args.disable_dfn_mask,
+                use_trie_partition=args.use_trie_partition,
                 master_port=port,
                 gpu_id=gpu_id,
             )
@@ -283,12 +289,19 @@ def main():
     parser.add_argument(
         "--model-path", default=None, help="Model checkpoint path (default: Qwen2.5-0.5B)"
     )
-    parser.add_argument("--max-tokens-per-mb", type=int, default=16384)
+    parser.add_argument("--max-tokens-per-mb", type=int, default=24576)
     parser.add_argument(
         "--disable-gradient-checkpointing", action="store_true", default=False
     )
     parser.add_argument("--prefix-len", type=int, default=-1)
     parser.add_argument("--disable-dfn-mask", action="store_true", default=False)
+    parser.add_argument(
+        "--use-trie-partition",
+        action="store_true",
+        default=False,
+        help="Use TokenTrie-based partitioning (backward_permute + divide) "
+        "instead of greedy first-fit for microbatch composition",
+    )
     parser.add_argument(
         "--num-gpus",
         type=int,
@@ -313,6 +326,7 @@ def main():
     print(f"Method: {args.method}, GPUs: {num_gpus}")
     print(f"max_tokens_per_mb={args.max_tokens_per_mb}, "
           f"dfn_mask={'OFF' if args.disable_dfn_mask else 'ON'}, "
+          f"trie_partition={'ON' if args.use_trie_partition else 'OFF'}, "
           f"gradient_ckpt={'OFF' if args.disable_gradient_checkpointing else 'ON'}, "
           f"prefix_len={args.prefix_len}")
 

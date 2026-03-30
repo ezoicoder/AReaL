@@ -85,6 +85,7 @@ def setup_engine(
     model_path: str = None,
     disable_optimizer: bool = True,
     use_dfn_mask: bool = False,
+    use_trie_partition: bool = False,
     local_rank: int = 0,
 ):
     """Context manager to setup and teardown an engine (FSDP or Megatron).
@@ -100,6 +101,7 @@ def setup_engine(
         model_path: Path to the model (resolved via get_model_path if None)
         disable_optimizer: Whether to disable optimizer (for gradient-only tests)
         use_dfn_mask: Whether to use DFN O(B) mask instead of dense O(B^2) mask
+        use_trie_partition: Whether to use TokenTrie-based microbatch partitioning
         local_rank: CUDA device index for this engine (passed as LOCAL_RANK)
         
     Yields:
@@ -139,6 +141,7 @@ def setup_engine(
         gradient_checkpointing=gradient_checkpointing,
         disable_optimizer=disable_optimizer,
         use_dfn_mask=use_dfn_mask,
+        use_trie_partition=use_trie_partition,
         **engine_specific_config,
     )
     
