@@ -38,7 +38,10 @@ import torch
 import torch.multiprocessing as mp
 
 from areal.engine.fsdp_engine import FSDPEngine
-from areal.models.tree_attn.tree import _greedy_build_tries
+from areal.models.tree_attn.tree import (
+    _build_tries_from_trie_partition,
+    _greedy_build_tries,
+)
 from areal.platforms import current_platform
 from areal.tests.test_tree_training import (
     _build_input_from_token_lists,
@@ -82,6 +85,43 @@ def _compute_compression_ratio(input_data: dict) -> float:
     if tree_tokens_single == 0:
         return float("inf")
     return total_original_tokens / tree_tokens_single
+
+
+def _compute_mb_tree_stats(
+    input_data: dict,
+    max_tokens_per_mb: int,
+    use_trie_partition: bool,
+) -> dict:
+    """Compute tree token stats after microbatch partitioning.
+
+    Splitting into microbatches duplicates shared prefixes at partition
+    boundaries, so the sum of per-microbatch tree tokens is typically
+    larger than a single-tree count.  This function replicates the
+    partitioning logic to report the actual numbers.
+
+    Returns dict with keys: mb_tree_tokens, mb_n_trees, mb_compressed_ratio.
+    """
+    attn_mask = input_data["attention_mask"]
+    total_original = int(attn_mask.sum().item())
+    if total_original == 0:
+        return {"mb_tree_tokens": 0, "mb_n_trees": 0, "mb_compressed_ratio": float("inf")}
+
+    if use_trie_partition:
+        tries, n_tokens = _build_tries_from_trie_partition(
+            input_data, max_tokens_per_tree=max_tokens_per_mb
+        )
+    else:
+        tries, n_tokens = _greedy_build_tries(
+            input_data, max_tokens_per_tree=max_tokens_per_mb
+        )
+
+    mb_tree_tokens = sum(n_tokens)
+    mb_ratio = total_original / mb_tree_tokens if mb_tree_tokens > 0 else float("inf")
+    return {
+        "mb_tree_tokens": mb_tree_tokens,
+        "mb_n_trees": len(tries),
+        "mb_compressed_ratio": round(mb_ratio, 4),
+    }
 
 
 def _load_tree_data(
@@ -150,6 +190,11 @@ def run_single_benchmark(
     dfn = use_dfn_mask if method == "flex" else False
     trie_part = use_trie_partition if method == "flex" else False
 
+    # Compute microbatch-level tree stats for flex (prefix duplication from splitting)
+    mb_stats: dict = {}
+    if enable_tree:
+        mb_stats = _compute_mb_tree_stats(input_data, max_tokens_per_mb, trie_part)
+
     gc.collect()
     torch.cuda.empty_cache()
     reset_peak_memory()
@@ -173,7 +218,7 @@ def run_single_benchmark(
 
     throughput = total_tokens / elapsed if elapsed > 0 else 0.0
 
-    return {
+    result = {
         "pt_path": str(data_path),
         "method": method,
         "throughput": round(throughput, 2),
@@ -183,6 +228,8 @@ def run_single_benchmark(
         "n_seqs": n_seqs,
         "total_tokens": total_tokens,
     }
+    result.update(mb_stats)
+    return result
 
 
 def _worker(gpu_id: int, pt_files: list[str], args, result_queue):
@@ -245,12 +292,19 @@ def _worker(gpu_id: int, pt_files: list[str], args, result_queue):
             )
             results.append(result)
             _append_jsonl(args.output, result)
+            mb_info = ""
+            if "mb_compressed_ratio" in result:
+                mb_info = (
+                    f", mb_CR={result['mb_compressed_ratio']:.3f}x"
+                    f" ({result['mb_n_trees']} trees, {result['mb_tree_tokens']} tok)"
+                )
             print(
                 f"[GPU {gpu_id}] {i + 1}/{len(pt_files)} done: "
                 f"{Path(pt_path).name} — "
                 f"{result['throughput']:.0f} tok/s, "
                 f"{result['peak_memory_gb']:.2f} GB, "
-                f"CR={result['compressed_ratio']:.3f}x "
+                f"CR={result['compressed_ratio']:.3f}x"
+                f"{mb_info} "
                 f"({time.time() - t0:.1f}s)"
             )
         except Exception as e:
@@ -287,7 +341,7 @@ def main():
     )
     parser.add_argument("--output", required=True, help="Output JSONL file path")
     parser.add_argument(
-        "--model-path", default=None, help="Model checkpoint path (default: Qwen2.5-0.5B)"
+        "--model-path", default=None, help="Model cgheckpoint path (default: Qwen2.5-0.5B)"
     )
     parser.add_argument("--max-tokens-per-mb", type=int, default=24576)
     parser.add_argument(
@@ -378,6 +432,13 @@ def main():
         print(f"  Avg throughput:     {avg_tp:,.0f} tok/s")
         print(f"  Avg peak memory:    {avg_mem:.2f} GB")
         print(f"  Avg compression:    {avg_cr:.3f}x")
+        with_mb = [r for r in successful if "mb_compressed_ratio" in r]
+        if with_mb:
+            avg_mb_cr = sum(r["mb_compressed_ratio"] for r in with_mb) / len(with_mb)
+            avg_mb_trees = sum(r["mb_n_trees"] for r in with_mb) / len(with_mb)
+            avg_mb_tok = sum(r["mb_tree_tokens"] for r in with_mb) / len(with_mb)
+            print(f"  Avg mb compression: {avg_mb_cr:.3f}x "
+                  f"(avg {avg_mb_trees:.1f} trees, {avg_mb_tok:,.0f} tree tok)")
     if failed:
         print(f"\nFailed files ({len(failed)}):")
         for r in failed:
