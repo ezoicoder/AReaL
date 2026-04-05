@@ -177,6 +177,7 @@ def run_single_benchmark(
     prefix_len: int,
     use_dfn_mask: bool,
     use_trie_partition: bool,
+    cut_f1_tail: bool,
     master_port: str,
     gpu_id: int = 0,
 ) -> dict:
@@ -211,6 +212,7 @@ def run_single_benchmark(
         model_path=model_path,
         use_dfn_mask=dfn,
         use_trie_partition=trie_part,
+        cut_f1_tail=cut_f1_tail,
         local_rank=gpu_id,
     ) as engine:
         _, elapsed = run_train_batch(engine, input_data, loss_fn, loss_weight_fn)
@@ -264,6 +266,7 @@ def _worker(gpu_id: int, pt_files: list[str], args, result_queue):
                 prefix_len=args.prefix_len,
                 use_dfn_mask=not args.disable_dfn_mask,
                 use_trie_partition=args.use_trie_partition,
+                cut_f1_tail=not args.no_cut_f1_tail,
                 master_port=str(base_port + 99),
                 gpu_id=gpu_id,
             )
@@ -287,6 +290,7 @@ def _worker(gpu_id: int, pt_files: list[str], args, result_queue):
                 prefix_len=args.prefix_len,
                 use_dfn_mask=not args.disable_dfn_mask,
                 use_trie_partition=args.use_trie_partition,
+                cut_f1_tail=not args.no_cut_f1_tail,
                 master_port=port,
                 gpu_id=gpu_id,
             )
@@ -357,6 +361,14 @@ def main():
         "instead of greedy first-fit for microbatch composition",
     )
     parser.add_argument(
+        "--no-cut-f1-tail",
+        action="store_true",
+        default=False,
+        help="Disable cut_f1_tail optimisation in tree stack training. "
+        "When set, the entire pushed segment is cached instead of only "
+        "the prefix needed for the next pop (useful for ablation)",
+    )
+    parser.add_argument(
         "--num-gpus",
         type=int,
         default=None,
@@ -382,6 +394,7 @@ def main():
           f"dfn_mask={'OFF' if args.disable_dfn_mask else 'ON'}, "
           f"trie_partition={'ON' if args.use_trie_partition else 'OFF'}, "
           f"gradient_ckpt={'OFF' if args.disable_gradient_checkpointing else 'ON'}, "
+          f"cut_f1_tail={'OFF' if args.no_cut_f1_tail else 'ON'}, "
           f"prefix_len={args.prefix_len}")
 
     chunks: list[list[str]] = [[] for _ in range(num_gpus)]

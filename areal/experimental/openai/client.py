@@ -315,7 +315,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 prompt_text, add_special_tokens=False
             )
         elif self.chat_template_type == "concat":
-            if tools is not None:
+            if tools_list:
                 logger.warning(
                     "'concat' mode is not compatible with tool call scenarios. Unexpected behavior may occur"
                 )

@@ -124,6 +124,8 @@ class ArchonEngine(TrainEngine):
             pretrained_model_name_or_path=self.config.path,
             trust_remote_code=True,
         )
+        self.dump_dir: str | None = self.config.dump_dir
+        self.dump_style: str = self.config.dump_style
 
         self._validate_model_type()
 
@@ -502,6 +504,8 @@ class ArchonEngine(TrainEngine):
             should_accept_fn=should_accept_fn,
             group_size=group_size,
             dynamic_bs=dynamic_bs,
+            dump_dir=self.dump_dir,
+            dump_style=self.dump_style,
         )
 
     def clear_batches(self, *args):

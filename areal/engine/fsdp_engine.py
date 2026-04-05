@@ -195,11 +195,13 @@ class FSDPEngine(TrainEngine):
         self.is_offload: bool = False
         self.is_tree_distribution: bool = self.config.is_tree_distribution
         self.dump_dir: str | None = self.config.dump_dir
+        self.dump_style: str = self.config.dump_style
         self.enable_tree_training: bool = self.config.enable_tree_training
         self.use_dfn_mask: bool = self.config.use_dfn_mask
         self.use_trie_partition: bool = self.config.use_trie_partition
         self.stack_depth: int = self.config.stack_depth
         self.stack_block_size: int = self.config.stack_block_size
+        self.cut_f1_tail: bool = self.config.cut_f1_tail
 
         self.enable_tree_stack_training: bool = self.config.enable_tree_stack_training
         assert not (self.enable_tree_training and self.enable_tree_stack_training), (
@@ -448,6 +450,7 @@ class FSDPEngine(TrainEngine):
             dynamic_bs=dynamic_bs,
             is_tree_distribution=self.is_tree_distribution,
             dump_dir=self.dump_dir,
+            dump_style=self.dump_style,
         )
 
     def update_weights(self, meta: WeightUpdateMeta):
@@ -719,6 +722,7 @@ class FSDPEngine(TrainEngine):
                 token_trie=trie,
                 block_size=self.config.stack_block_size,
                 loss_fn=new_loss_fn,
+                cut_f1_tail=self.cut_f1_tail,
             )
 
             if required_token_trie_info:

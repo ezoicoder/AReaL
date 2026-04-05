@@ -73,6 +73,7 @@ def process_file(src: Path, dst: Path | None, *, dry_run: bool = False) -> dict:
     leaf_tokens = sum(t.numel() for t in leaves)
 
     leaf_total, leaf_tree, leaf_ratio = _compression_ratio(leaves)
+    avg_leaf_len = leaf_tokens / n_leaves if n_leaves > 0 else 0.0
 
     if not dry_run and dst is not None:
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -90,6 +91,7 @@ def process_file(src: Path, dst: Path | None, *, dry_run: bool = False) -> dict:
         "orig_ratio": orig_ratio,
         "leaf_tree_tokens": leaf_tree,
         "leaf_ratio": leaf_ratio,
+        "avg_leaf_len": avg_leaf_len,
     }
 
 
@@ -141,12 +143,12 @@ def main() -> None:
     header = (
         f"{'File':<20s} {'Orig':>5s} {'Leaf':>5s} {'Rm':>5s}"
         f" {'OrigTok':>10s} {'TreeTok':>10s} {'Ratio':>6s}"
-        f" {'LeafTok':>10s} {'TreeTok':>10s} {'Ratio':>6s}"
+        f" {'LeafTok':>10s} {'TreeTok':>10s} {'Ratio':>6s} {'AvgLeafLen':>10s}"
     )
     sub_header = (
         f"{'':<20s} {'':>5s} {'':>5s} {'':>5s}"
         f" {'--- original ---':^28s}"
-        f" {'--- leaves only ---':^28s}"
+        f" {'--- leaves only ---':^39s}"
     )
     print(sub_header)
     print(header)
@@ -171,7 +173,7 @@ def main() -> None:
         print(
             f"{name:<20s} {stats['n_original']:>5d} {stats['n_leaves']:>5d} {stats['n_removed']:>5d}"
             f" {stats['original_tokens']:>10,d} {stats['orig_tree_tokens']:>10,d} {stats['orig_ratio']:>6.2f}x"
-            f" {stats['leaf_tokens']:>10,d} {stats['leaf_tree_tokens']:>10,d} {stats['leaf_ratio']:>6.2f}x"
+            f" {stats['leaf_tokens']:>10,d} {stats['leaf_tree_tokens']:>10,d} {stats['leaf_ratio']:>6.2f}x {stats['avg_leaf_len']:>10.2f}"
         )
 
     print("-" * len(header))
@@ -179,10 +181,11 @@ def main() -> None:
     removed_tokens = total_original_tokens - total_leaf_tokens
     total_orig_ratio = total_original_tokens / total_orig_tree_tokens if total_orig_tree_tokens else 0
     total_leaf_ratio = total_leaf_tokens / total_leaf_tree_tokens if total_leaf_tree_tokens else 0
+    total_avg_leaf_len = total_leaf_tokens / total_leaves if total_leaves > 0 else 0.0
     print(
         f"{'TOTAL':<20s} {total_original:>5d} {total_leaves:>5d} {removed_seqs:>5d}"
         f" {total_original_tokens:>10,d} {total_orig_tree_tokens:>10,d} {total_orig_ratio:>6.2f}x"
-        f" {total_leaf_tokens:>10,d} {total_leaf_tree_tokens:>10,d} {total_leaf_ratio:>6.2f}x"
+        f" {total_leaf_tokens:>10,d} {total_leaf_tree_tokens:>10,d} {total_leaf_ratio:>6.2f}x {total_avg_leaf_len:>10.2f}"
     )
 
     if total_original > 0:

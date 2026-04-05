@@ -158,6 +158,8 @@ class MegatronEngine(TrainEngine):
         self.enable_fp8: bool = self.config.megatron.fp8_config is not None
         self.quantization_config: dict[str, int | str | list[str]] | None = None
         self.enable_tree_training: bool = self.config.enable_tree_training
+        self.dump_dir: str | None = self.config.dump_dir
+        self.dump_style: str = self.config.dump_style
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
         if parallel_strategy is None:
@@ -471,6 +473,8 @@ class MegatronEngine(TrainEngine):
             should_accept_fn=should_accept_fn,
             group_size=group_size,
             dynamic_bs=dynamic_bs,
+            dump_dir=self.dump_dir,
+            dump_style=self.dump_style,
         )
 
     def update_weights(self, meta: WeightUpdateMeta):

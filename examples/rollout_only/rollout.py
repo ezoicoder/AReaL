@@ -202,8 +202,9 @@ def main(args):
         tokenizer=tokenizer,
     )
     batch_size = config.train_dataset.batch_size // world_size
-    max_num_prompts = config.max_batches * batch_size
-    train_dataset = train_dataset.select(range(max_num_prompts))
+    if config.max_batches > 0:
+        max_num_prompts = min(config.max_batches * batch_size, len(train_dataset))
+        train_dataset = train_dataset.select(range(max_num_prompts))
 
     train_dataloader = create_dataloader(
         train_dataset,
@@ -223,12 +224,13 @@ def main(args):
         train_engine=mock_train_engine,
     )
 
+    max_turns = config.agent_run_args.get("max_turns", 8)
     workflow_kwargs = dict(
         reward_fn="examples.multi_turn_math.gsm8k_rl_mt.gsm8k_reward_fn",
         gconfig=config.gconfig,
         tokenizer=config.tokenizer_path,
-        export_style="individual",
-        max_turns=8,
+        export_style=config.export_style,
+        max_turns=max_turns,
     )
     # Run rollout through entire dataset
     batch_count = 0
@@ -236,7 +238,8 @@ def main(args):
 
     print(f"[Rank {rank}] Starting rollout...")
 
-    for step, data in enumerate(train_dataloader):
+    step = 0
+    while True:
         if config.max_batches > 0 and batch_count >= config.max_batches:
             break
 
@@ -245,6 +248,9 @@ def main(args):
             workflow="examples.multi_turn_math.gsm8k_rl_mt.MultiturnRLVRWorkflow",
             workflow_kwargs=workflow_kwargs,
             group_size=config.gconfig.n_samples,
+            is_tree_distribution=config.actor.is_tree_distribution,
+            dump_dir=config.actor.dump_dir,
+            dump_style=config.actor.dump_style,
         )
 
         batch_shape = batch.get("input_ids", batch.get("packed_input_ids")).shape
@@ -258,6 +264,7 @@ def main(args):
 
         if batch_count % 10 == 0:
             print(f"[Rank {rank}] Processed {batch_count} batches, {total_samples} samples")
+        step += 1
 
     # Export and print statistics
     rollout_stats = stats_tracker.export_all(reduce_group=group)

@@ -57,6 +57,7 @@ def redistribute_trajectories(
     group=None,
     is_tree_distribution: bool = False,
     dump_dir: str | None = None,
+    dump_style: str = "merged",
 ) -> RedistributedData:
     """Redistribute a list of trajectory dicts across a process group.
 
@@ -76,7 +77,11 @@ def redistribute_trajectories(
         using a specialized tree-based allocation algorithm. Default is False.
     dump_dir : str | None, optional
         If provided, dumps sequences (list of input_ids tensors) to this directory
-        as call_0.pt, call_1.pt, ... on rank 0. Default is None (no dumping).
+        on rank 0. Default is None (no dumping).
+    dump_style : str, optional
+        Dump style for sequence files. "merged" dumps one file per call:
+        call_<idx>.pt. "separate" dumps one file per trajectory:
+        call_<idx>_<traj_id>.pt. Default is "merged".
 
     Returns
     -------
@@ -98,9 +103,15 @@ def redistribute_trajectories(
 
     # Dump trajectories if requested (only on rank 0, before processing)
     if dump_dir is not None and dist.get_rank(group=group) == 0:
+        if dump_style not in {"merged", "separate"}:
+            raise ValueError(
+                f"Invalid dump_style: {dump_style}. Expected 'merged' or 'separate'."
+            )
         _redistribute_call_counter += 1
         if _redistribute_call_counter <= 50:
             os.makedirs(dump_dir, exist_ok=True)
+            trajectories_sequences: list[list[torch.Tensor]] = []
+            merged_sequences: list[torch.Tensor] = []
             for traj_id, traj in enumerate(all_data):
                 # Extract all valid sequences from this trajectory
                 valid_sequences = []
@@ -113,16 +124,30 @@ def redistribute_trajectories(
                         valid_len = int(mask.sum().item())
                         seq_input_ids = seq_input_ids[:valid_len]
                     valid_sequences.append(seq_input_ids)
-                
-                # Save this trajectory's sequences
+                trajectories_sequences.append(valid_sequences)
+                merged_sequences.extend(valid_sequences)
+
+                if dump_style == "separate":
+                    dump_filename = os.path.join(
+                        dump_dir,
+                        f"call_{_redistribute_call_counter}_{traj_id}.pt",
+                    )
+                    torch.save(valid_sequences, dump_filename)
+
+            if dump_style == "merged":
                 dump_filename = os.path.join(
-                    dump_dir, 
-                    f"call_{_redistribute_call_counter}_{traj_id}.pt"
+                    dump_dir,
+                    f"call_{_redistribute_call_counter}.pt",
                 )
-                torch.save(valid_sequences, dump_filename)
-            
-            print(f"[Rank 0] Dumped {len(all_data)} trajectories to {dump_dir}/ "
-                  f"(call_{_redistribute_call_counter}_*.pt)")
+                torch.save(merged_sequences, dump_filename)
+                print(
+                    f"[Rank 0] Dumped {len(merged_sequences)} sequences to {dump_filename}"
+                )
+            else:
+                print(
+                    f"[Rank 0] Dumped {len(all_data)} trajectories to {dump_dir}/ "
+                    f"(call_{_redistribute_call_counter}_*.pt)"
+                )
     
     if is_tree_distribution:
         # Split trajectories into individual sequences for finer granularity
@@ -183,6 +208,7 @@ class DistRolloutCoordinator:
         trajectories: list[dict[str, Any]] | None,
         is_tree_distribution: bool = False,
         dump_dir: str | None = None,
+        dump_style: str = "merged",
     ) -> dict[str, Any]:
         """Broadcast and redistribute trajectories across distributed workers.
 
@@ -211,6 +237,7 @@ class DistRolloutCoordinator:
                 group=self.train_engine.data_parallel_group,
                 is_tree_distribution=is_tree_distribution,
                 dump_dir=dump_dir,
+                dump_style=dump_style,
             )
             batch = redist.data
         else:
@@ -294,6 +321,7 @@ class DistRolloutCoordinator:
         dynamic_bs: bool = False,
         is_tree_distribution: bool = False,
         dump_dir: str | None = None,
+        dump_style: str = "merged",
     ) -> dict[str, Any]:
         """Prepare async rollout batch with distributed coordination.
 
@@ -321,6 +349,9 @@ class DistRolloutCoordinator:
             Whether to use tree-based sequence-level redistribution.
         dump_dir : str | None, optional
             Directory path to dump sequences to disk on rank 0. If None, no dumping.
+        dump_style : str, optional
+            Dump style for sequence files ("merged" or "separate"). Default is
+            "merged".
 
         Returns
         -------
@@ -348,5 +379,8 @@ class DistRolloutCoordinator:
             )
 
         return self._broadcast_and_redistribute_trajectories(
-            trajectories, is_tree_distribution=is_tree_distribution, dump_dir=dump_dir
+            trajectories,
+            is_tree_distribution=is_tree_distribution,
+            dump_dir=dump_dir,
+            dump_style=dump_style,
         )

@@ -784,6 +784,17 @@ class TrainEngineConfig:
         default=None,
         metadata={"help": "Directory path to dump sequences (call_0.pt, call_1.pt, ...). Only on rank 0. If None, no dumping."},
     )
+    dump_style: str = field(
+        default="merged",
+        metadata={
+            "help": (
+                "Sequence dump style when dump_dir is enabled. "
+                "'merged' dumps all sequences from one call into call_<idx>.pt; "
+                "'separate' dumps each trajectory into call_<idx>_<traj_id>.pt."
+            ),
+            "choices": ["merged", "separate"],
+        },
+    )
 
     # Tree training
     enable_tree_training: bool = field(
@@ -832,6 +843,18 @@ class TrainEngineConfig:
     stack_block_size: int = field(
         default=4096,
         metadata={"help": "Stack block size for tree stack training."},
+    )
+
+    cut_f1_tail: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Whether to cut the tail of the first forward pass in tree stack "
+                "training. When True (default), only the prefix needed for the next "
+                "pop is cached, reducing peak memory. When False, the entire pushed "
+                "segment is cached, which may be useful for debugging or ablation."
+            )
+        },
     )
 
     ### Disable optimizer
