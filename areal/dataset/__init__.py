@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 VALID_DATASETS = [
     "gsm8k",
     "aime",
+    "amo_bench",
     "clevr_count_70k",
     "geometry3k",
     "hh-rlhf",
@@ -49,7 +50,7 @@ def _get_custom_dataset(
             max_length=max_length,
             **kwargs,
         )
-    elif "aime" in path.lower() and type == "rl":
+    elif ("aime" in path.lower() or "amo_bench" in path.lower()) and type == "rl":
         from .aime import get_aime_rl_dataset
 
         return get_aime_rl_dataset(
