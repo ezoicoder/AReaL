@@ -33,13 +33,20 @@ def get_gsm8k_rl_dataset(
     max_length: int | None = None,
 ):
     dataset = load_dataset(path=path, name="main", split=split)
+    one_shot_suffix = (
+        "\n\nAfter solving the above problem, please output your final answer in the following format:\n"
+        "### The final answer is: $\\boxed{<your answer>}$\n"
+        "Example:\n"
+        "### The final answer is: $\\boxed{123}$\n"
+        "The final answer should be given as precisely as possible (using LaTeX symbols such as \\sqrt, \\frac, \\pi, etc.). "
+        "If the final answer involves a decimal approximation, it must be accurate to at least four decimal places."
+    )
 
     def process(sample):
         messages = [
             {
                 "role": "user",
-                "content": sample["question"]
-                + "\nPlease put your final answer within \\boxed{}.",
+                "content": sample["question"] + one_shot_suffix,
             }
         ]
         return {"messages": messages}
