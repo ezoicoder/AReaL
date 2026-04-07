@@ -79,6 +79,22 @@ def _compression_ratio(sequences: list[torch.Tensor]) -> tuple[int, int, float]:
     return trie.n_tokens, trie.n_tree_tokens, ratio
 
 
+def _attention_compression_ratio(sequences: list[torch.Tensor]) -> tuple[int, int, float]:
+    """Return (dense_attn_ops, tree_attn_ops, dense/tree ratio) for sequences."""
+    if not sequences:
+        return 0, 0, 0.0
+
+    dense_attn_ops = sum((L * (L + 1)) // 2 for L in (int(seq.numel()) for seq in sequences))
+    trie = TokenTrie(sequences)
+    tree_attn_ops = int(trie.get_stats("forward")["sum_depth"])
+    ratio = (
+        dense_attn_ops / tree_attn_ops
+        if tree_attn_ops > 0
+        else (float("inf") if dense_attn_ops > 0 else 0.0)
+    )
+    return dense_attn_ops, tree_attn_ops, ratio
+
+
 def process_file(
     src: Path,
     dst: Path | None,
@@ -112,6 +128,9 @@ def process_file(
     # If --strip-common-prefix is enabled, this is strip后的最大长度.
     leaf_max_len = max((int(t.numel()) for t in output_sequences), default=0)
     output_total, output_tree, output_ratio = _compression_ratio(output_sequences)
+    output_attn_dense, output_attn_tree, output_attn_ratio = _attention_compression_ratio(
+        output_sequences
+    )
     avg_output_len = output_tokens / n_leaves if n_leaves > 0 else 0.0
 
     if not dry_run and dst is not None:
@@ -132,6 +151,9 @@ def process_file(
         "orig_ratio": orig_ratio,
         "output_tree_tokens": output_tree,
         "output_ratio": output_ratio,
+        "output_attn_dense": output_attn_dense,
+        "output_attn_tree": output_attn_tree,
+        "output_attn_ratio": output_attn_ratio,
         "avg_output_len": avg_output_len,
         "common_prefix_len": common_prefix_len,
     }
@@ -186,6 +208,8 @@ def main() -> None:
     total_output_tokens = 0
     total_orig_tree_tokens = 0
     total_output_tree_tokens = 0
+    total_output_attn_dense = 0
+    total_output_attn_tree = 0
     total_common_prefix_len = 0
     total_orig_max_len = 0
     total_leaf_max_len = 0
@@ -200,11 +224,12 @@ def main() -> None:
         f"{'File':<20s} {'Orig':>5s} {'Leaf':>5s} {'Rm':>5s}"
         f" {'OrigTok':>10s} {'TreeTok':>10s} {'Ratio':>6s} {'OrigMax':>8s}"
         f" {output_label + 'Tok':>10s} {'TreeTok':>10s} {'Ratio':>6s} {'LeafMax':>8s} {'AvgOutLen':>10s}"
+        f" {'AttnDense':>12s} {'AttnTree':>12s} {'AttnCR':>8s}"
     ) + (f"{' PrefixLen':>10s}" if args.strip_common_prefix else "")
     sub_header = (
         f"{'':<20s} {'':>5s} {'':>5s} {'':>5s}"
         f" {'--- original ---':^28s}"
-        f" {f'--- {output_stage_label} ---':^39s}"
+        f" {f'--- {output_stage_label} ---':^75s}"
     )
     print(sub_header)
     print(header)
@@ -230,6 +255,8 @@ def main() -> None:
         total_output_tokens += stats["output_tokens"]
         total_orig_tree_tokens += stats["orig_tree_tokens"]
         total_output_tree_tokens += stats["output_tree_tokens"]
+        total_output_attn_dense += stats["output_attn_dense"]
+        total_output_attn_tree += stats["output_attn_tree"]
         total_common_prefix_len += stats["common_prefix_len"]
         total_orig_max_len = max(total_orig_max_len, int(stats["orig_max_len"]))
         total_leaf_max_len = max(total_leaf_max_len, int(stats["leaf_max_len"]))
@@ -239,6 +266,7 @@ def main() -> None:
             f" {stats['original_tokens']:>10,d} {stats['orig_tree_tokens']:>10,d} {stats['orig_ratio']:>6.2f}x {stats['orig_max_len']:>8d}"
             f" {stats['output_tokens']:>10,d} {stats['output_tree_tokens']:>10,d} {stats['output_ratio']:>6.2f}x"
             f" {stats['leaf_max_len']:>8d} {stats['avg_output_len']:>10.2f}"
+            f" {stats['output_attn_dense']:>12,d} {stats['output_attn_tree']:>12,d} {stats['output_attn_ratio']:>8.2f}x"
         ) + (f"{stats['common_prefix_len']:>10d}" if args.strip_common_prefix else "")
         print(row)
 
@@ -251,12 +279,18 @@ def main() -> None:
     total_output_ratio = (
         total_output_tokens / total_output_tree_tokens if total_output_tree_tokens else 0
     )
+    total_output_attn_ratio = (
+        total_output_attn_dense / total_output_attn_tree
+        if total_output_attn_tree
+        else (float("inf") if total_output_attn_dense > 0 else 0.0)
+    )
     total_avg_output_len = total_output_tokens / total_leaves if total_leaves > 0 else 0.0
     total_row = (
         f"{'TOTAL':<20s} {total_original:>5d} {total_leaves:>5d} {removed_seqs:>5d}"
         f" {total_original_tokens:>10,d} {total_orig_tree_tokens:>10,d} {total_orig_ratio:>6.2f}x {total_orig_max_len:>8d}"
         f" {total_output_tokens:>10,d} {total_output_tree_tokens:>10,d} {total_output_ratio:>6.2f}x"
         f" {total_leaf_max_len:>8d} {total_avg_output_len:>10.2f}"
+        f" {total_output_attn_dense:>12,d} {total_output_attn_tree:>12,d} {total_output_attn_ratio:>8.2f}x"
     ) + (f"{total_common_prefix_len:>10d}" if args.strip_common_prefix else "")
     print(total_row)
 
@@ -280,6 +314,10 @@ def main() -> None:
             )
         print(
             f"Trie compression: original {total_orig_ratio:.2f}x -> output {total_output_ratio:.2f}x"
+        )
+        print(
+            "Filtered attention compression (dense/tree depth-sum): "
+            f"{total_output_attn_ratio:.2f}x"
         )
 
     if not args.dry_run:
