@@ -95,6 +95,7 @@ def process_file(
     sequences: list[torch.Tensor] = list(raw)
     n_original = len(sequences)
     original_tokens = sum(t.numel() for t in sequences)
+    orig_max_len = max((int(t.numel()) for t in sequences), default=0)
 
     orig_total, orig_tree, orig_ratio = _compression_ratio(sequences)
 
@@ -107,6 +108,9 @@ def process_file(
         output_sequences, common_prefix_len = strip_common_prefix(leaves)
 
     output_tokens = sum(t.numel() for t in output_sequences)
+    # `leaf_max_len` is defined on the final output stage.
+    # If --strip-common-prefix is enabled, this is strip后的最大长度.
+    leaf_max_len = max((int(t.numel()) for t in output_sequences), default=0)
     output_total, output_tree, output_ratio = _compression_ratio(output_sequences)
     avg_output_len = output_tokens / n_leaves if n_leaves > 0 else 0.0
 
@@ -120,7 +124,9 @@ def process_file(
         "n_leaves": n_leaves,
         "n_removed": n_original - n_leaves,
         "original_tokens": original_tokens,
+        "orig_max_len": orig_max_len,
         "output_tokens": output_tokens,
+        "leaf_max_len": leaf_max_len,
         "removed_tokens": original_tokens - output_tokens,
         "orig_tree_tokens": orig_tree,
         "orig_ratio": orig_ratio,
@@ -181,6 +187,8 @@ def main() -> None:
     total_orig_tree_tokens = 0
     total_output_tree_tokens = 0
     total_common_prefix_len = 0
+    total_orig_max_len = 0
+    total_leaf_max_len = 0
     output_label = "Leaf+Strip" if args.strip_common_prefix else "Leaf"
     output_stage_label = (
         "leaves + common-prefix stripped"
@@ -190,10 +198,9 @@ def main() -> None:
 
     header = (
         f"{'File':<20s} {'Orig':>5s} {'Leaf':>5s} {'Rm':>5s}"
-        f" {'OrigTok':>10s} {'TreeTok':>10s} {'Ratio':>6s}"
-        f" {output_label + 'Tok':>10s} {'TreeTok':>10s} {'Ratio':>6s} {'AvgOutLen':>10s}"
-        f"{' PrefixLen':>10s}" if args.strip_common_prefix else ""
-    )
+        f" {'OrigTok':>10s} {'TreeTok':>10s} {'Ratio':>6s} {'OrigMax':>8s}"
+        f" {output_label + 'Tok':>10s} {'TreeTok':>10s} {'Ratio':>6s} {'LeafMax':>8s} {'AvgOutLen':>10s}"
+    ) + (f"{' PrefixLen':>10s}" if args.strip_common_prefix else "")
     sub_header = (
         f"{'':<20s} {'':>5s} {'':>5s} {'':>5s}"
         f" {'--- original ---':^28s}"
@@ -224,30 +231,40 @@ def main() -> None:
         total_orig_tree_tokens += stats["orig_tree_tokens"]
         total_output_tree_tokens += stats["output_tree_tokens"]
         total_common_prefix_len += stats["common_prefix_len"]
+        total_orig_max_len = max(total_orig_max_len, int(stats["orig_max_len"]))
+        total_leaf_max_len = max(total_leaf_max_len, int(stats["leaf_max_len"]))
 
-        print(
+        row = (
             f"{name:<20s} {stats['n_original']:>5d} {stats['n_leaves']:>5d} {stats['n_removed']:>5d}"
-            f" {stats['original_tokens']:>10,d} {stats['orig_tree_tokens']:>10,d} {stats['orig_ratio']:>6.2f}x"
-            f" {stats['output_tokens']:>10,d} {stats['output_tree_tokens']:>10,d} {stats['output_ratio']:>6.2f}x {stats['avg_output_len']:>10.2f}"
-            f"{stats['common_prefix_len']:>10d}" if args.strip_common_prefix else ""
-        )
+            f" {stats['original_tokens']:>10,d} {stats['orig_tree_tokens']:>10,d} {stats['orig_ratio']:>6.2f}x {stats['orig_max_len']:>8d}"
+            f" {stats['output_tokens']:>10,d} {stats['output_tree_tokens']:>10,d} {stats['output_ratio']:>6.2f}x"
+            f" {stats['leaf_max_len']:>8d} {stats['avg_output_len']:>10.2f}"
+        ) + (f"{stats['common_prefix_len']:>10d}" if args.strip_common_prefix else "")
+        print(row)
 
     print("-" * len(header))
     removed_seqs = total_original - total_leaves
     removed_tokens = total_original_tokens - total_output_tokens
-    total_orig_ratio = total_original_tokens / total_orig_tree_tokens if total_orig_tree_tokens else 0
-    total_output_ratio = total_output_tokens / total_output_tree_tokens if total_output_tree_tokens else 0
-    total_avg_output_len = total_output_tokens / total_leaves if total_leaves > 0 else 0.0
-    print(
-        f"{'TOTAL':<20s} {total_original:>5d} {total_leaves:>5d} {removed_seqs:>5d}"
-        f" {total_original_tokens:>10,d} {total_orig_tree_tokens:>10,d} {total_orig_ratio:>6.2f}x"
-        f" {total_output_tokens:>10,d} {total_output_tree_tokens:>10,d} {total_output_ratio:>6.2f}x {total_avg_output_len:>10.2f}"
-        f"{total_common_prefix_len:>10d}" if args.strip_common_prefix else ""
+    total_orig_ratio = (
+        total_original_tokens / total_orig_tree_tokens if total_orig_tree_tokens else 0
     )
+    total_output_ratio = (
+        total_output_tokens / total_output_tree_tokens if total_output_tree_tokens else 0
+    )
+    total_avg_output_len = total_output_tokens / total_leaves if total_leaves > 0 else 0.0
+    total_row = (
+        f"{'TOTAL':<20s} {total_original:>5d} {total_leaves:>5d} {removed_seqs:>5d}"
+        f" {total_original_tokens:>10,d} {total_orig_tree_tokens:>10,d} {total_orig_ratio:>6.2f}x {total_orig_max_len:>8d}"
+        f" {total_output_tokens:>10,d} {total_output_tree_tokens:>10,d} {total_output_ratio:>6.2f}x"
+        f" {total_leaf_max_len:>8d} {total_avg_output_len:>10.2f}"
+    ) + (f"{total_common_prefix_len:>10d}" if args.strip_common_prefix else "")
+    print(total_row)
 
     if total_original > 0:
         pct_seqs = 100.0 * removed_seqs / total_original
-        pct_toks = 100.0 * removed_tokens / total_original_tokens if total_original_tokens else 0
+        pct_toks = (
+            100.0 * removed_tokens / total_original_tokens if total_original_tokens else 0
+        )
         if args.strip_common_prefix:
             print(
                 f"\nRemoved {pct_seqs:.1f}% sequences, {pct_toks:.1f}% tokens "
