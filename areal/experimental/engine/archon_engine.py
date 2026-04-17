@@ -526,6 +526,7 @@ class ArchonEngine(TrainEngine):
 
             # Step 3d: Build trie
             trie = TokenTrie(input_ids_list, input_data, sorted=False)
+            trie.backward_permute()
 
             # token_trie_info = trie.count_tokens_information()
 
@@ -645,6 +646,7 @@ class ArchonEngine(TrainEngine):
                 input_data.append({})
 
             trie = TokenTrie(input_ids_list, input_data, sorted=False)
+            trie.forward_permute()
 
             # DTAEngine for batched inference returns list of 1D tensors; pad to [batch_size, max_seq_len]
             output = self.dta_engine.forward(model=self.model, token_trie=trie)
