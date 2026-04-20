@@ -203,3 +203,8 @@ wandb/
 outputs/
 sympy/
 !/docs/figures/*
+
+/.cursor/
+/notes/
+/DynamicTreeAttn/
+/enter_areal.sh
