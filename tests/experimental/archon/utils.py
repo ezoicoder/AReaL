@@ -662,12 +662,13 @@ def create_archon_engine(
     max_tokens_per_mb = int(test_config.max_tokens_per_mb)
 
     config = create_engine_config(
-        model_path, "archon_dta" if test_config.enable_dta else "archon"
+        model_path,
+        "archon_dta" if test_config.tree_training_mode == "dta" else "archon",
     )
     config.mb_spec = MicroBatchSpec.new(
         config.mb_spec, max_tokens_per_mb=max_tokens_per_mb
     )
-    config.enable_dta = test_config.enable_dta
+    config.tree_training_mode = test_config.tree_training_mode
     if os.environ.get("AREAL_DISABLE_TORCH_COMPILE", "").lower() in (
         "1",
         "true",
@@ -681,10 +682,23 @@ def create_archon_engine(
     engine.initialize(addr=None, ft_spec=ft_spec)
 
     if test_config.use_hf:
-        ### NOTE:hack
-        from transformers import AutoModelForCausalLM
+        # Clean up original engine.model to avoid memory leaks (显存残留)
+        if hasattr(engine, "model") and engine.model is not None:
+            try:
+                # Call .cpu() + del + torch.cuda.empty_cache for safety
+                engine.model.cpu()
+            except Exception:
+                pass
+            del engine.model
+            import gc
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # Use the traditional HuggingFace transformer model for DTA smoke tests
+        from transformers import AutoModelForCausalLM
+
         engine.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,

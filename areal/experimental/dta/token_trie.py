@@ -1,3 +1,7 @@
+# The following code is adapted with minor modifications from
+# https://github.com/Whisper-6/DynamicTreeAttn/blob/main/token_trie.py.
+# Special thanks to Yuchen Yang for outstanding contributions to the optimized DFS order.
+
 import torch
 
 from areal.experimental.dta.trie import CompressedTrie, _get_stats
@@ -12,14 +16,14 @@ def _lcp_torch(a: torch.Tensor, b: torch.Tensor) -> int:
 
 def _leafization(input_ids: list[torch.LongTensor], attachs: list[dict]):
     """
-    参数：
-        input_ids: List of Token Tensor（按字典序排序）
-        attachs: List of dict，表示每个 Token Tensor 的 loss 配置
+    Args:
+        input_ids: List of token tensors, sorted in lexicographic order.
+        attachs: List of dicts, each storing loss-related config for one token tensor.
 
-    将完全重叠的前缀合并，并计算 lcp_lens 列表。
+    Merge fully overlapping prefixes and compute the `lcp_lens` list.
     """
 
-    # 计算相邻序列的 LCP 长度，同时检查字典序
+    # Compute adjacent LCP lengths and validate lexicographic ordering.
     lcp_lens = []
     for i in range(len(input_ids) - 1):
         seq_L, seq_R = input_ids[i], input_ids[i + 1]
@@ -29,7 +33,7 @@ def _leafization(input_ids: list[torch.LongTensor], attachs: list[dict]):
             raise ValueError("Input_ids not sorted in lexicographic order.")
         lcp_lens.append(lcp)
 
-    # 合并完全重叠的前缀，计算时只保留最长序列
+    # Merge fully overlapping prefixes by keeping only the longest sequence.
     input_ids_leafed = []
     attach_lists = []
     lcp_lens_leafed = []
@@ -65,7 +69,7 @@ class TokenTrie:
         else:
             attachs = [{} for _ in range(len(inputs))]
 
-        # 向 attachs 中添加序列编号
+        # Attach the original sequence index to each attachment dict.
         for seq_id in range(len(inputs)):
             attachs[seq_id]["_sequence_batch_id"] = seq_id
 

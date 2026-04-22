@@ -160,7 +160,12 @@ class MegatronEngine(TrainEngine):
         self.seed: int = 0
         self.own_global_group: bool = False
         self.is_offload: bool = False
-        self.enable_tree_training: bool = self.config.enable_tree_training
+        self.tree_training_mode: str = self.config.tree_training_mode
+        if self.tree_training_mode == "dta":
+            raise ValueError(
+                "tree_training_mode='dta' is only supported by ArchonEngine. "
+                "Please use Archon backend or set tree_training_mode to 'disabled'/'sparse'."
+            )
         # FP8 configuration
         self.fp8_config = self.mcore_config.fp8_config
         self.enable_fp8: bool = self.fp8_config is not None
@@ -239,7 +244,7 @@ class MegatronEngine(TrainEngine):
 
         self.tokenizer = load_hf_tokenizer(self.config.path)
 
-        with patch_bridge_for_tree_training(self.enable_tree_training):
+        with patch_bridge_for_tree_training(self.tree_training_mode == "sparse"):
             self.bridge = mbridge.AutoBridge.from_pretrained(self.config.path)
             self.bridge.dtype = self.dtype
             # Set gradient checkpointing options
@@ -578,7 +583,7 @@ class MegatronEngine(TrainEngine):
             # save_for_backward() which can only save torch.Tensor objects;
             # BlockMask is recreated inside PytorchFlexAttention.forward().
             tree_attn_keys: list[str] = []
-            if self.enable_tree_training:
+            if self.tree_training_mode == "sparse":
                 trie_node = mb_input.padded_mb.get("trie_node", None)
                 # Ensure trie_node is also in orig_mb for _compute_logprobs_and_loss
                 if trie_node is not None and "trie_node" not in mb_input.orig_mb:
@@ -742,7 +747,7 @@ class MegatronEngine(TrainEngine):
         # Step 4: Aggregate, reorder, and broadcast outputs
         res = None
         if mpu.is_pipeline_last_stage():
-            if self.enable_tree_training:
+            if self.tree_training_mode == "sparse":
                 res = merge_packed_tree_results(outputs, batch_size)
             else:
                 res = reorder_and_pad_outputs(
@@ -1393,7 +1398,7 @@ class MegatronEngine(TrainEngine):
         pp_size = self.parallel_strategy.pipeline_parallel_size
         cp_size = self.parallel_strategy.context_parallel_size
         tp_size = self.parallel_strategy.tensor_parallel_size
-        if self.enable_tree_training:
+        if self.tree_training_mode == "sparse":
             assert cp_size == 1, (
                 "Context parallelism is not supported in tree training."
             )
@@ -1482,12 +1487,12 @@ class MegatronEngine(TrainEngine):
         total_loss_weight: torch.Tensor,
         loss_multiplier: float = 1.0,
     ) -> torch.Tensor:
-        if self.config.is_critic and self.enable_tree_training:
+        if self.config.is_critic and self.tree_training_mode == "sparse":
             raise NotImplementedError(
                 "Tree training with critic model is not supported yet."
             )
         if not self.config.is_critic:
-            if self.enable_tree_training:
+            if self.tree_training_mode == "sparse":
                 # Handle dummy trie (empty tree for DP synchronization)
                 # When trie has no sequences, return zero loss with grad connection
                 trie_node = inputs.get("trie_node")
@@ -1543,12 +1548,12 @@ class MegatronEngine(TrainEngine):
         output: torch.Tensor,
         inputs: dict[str, Any],
     ) -> torch.Tensor | dict[int, torch.Tensor]:
-        if self.config.is_critic and self.enable_tree_training:
+        if self.config.is_critic and self.tree_training_mode == "sparse":
             raise NotImplementedError(
                 "Tree training with critic model is not supported yet."
             )
         if not self.config.is_critic:
-            if self.enable_tree_training:
+            if self.tree_training_mode == "sparse":
                 logprobs = _gather_packed_tree_logprobs(
                     output,
                     inputs["trie_node"],

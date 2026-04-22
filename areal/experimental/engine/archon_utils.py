@@ -256,7 +256,7 @@ def force_pad_to_maximum(
     config: TrainEngineConfig,
     parallel_dims: ArchonParallelDims,
     enable_compile: bool,
-    enable_tree_training: bool,
+    tree_training_mode: str,
     logger: logging.Logger,
 ) -> None:
     """Force ``config.pad_to_maximum = True`` when compile, PP, or tree training
@@ -278,8 +278,8 @@ def force_pad_to_maximum(
         )
         config.pad_to_maximum = True
 
-    # Tree training constraints
-    if enable_tree_training:
+    # Sparse tree training constraints
+    if tree_training_mode == "sparse":
         if config.is_critic:
             raise NotImplementedError(
                 "Tree training with critic model is not supported yet."
@@ -298,11 +298,20 @@ def force_pad_to_maximum(
             config.pad_to_maximum = True
 
     # DTA constraints
-    if config.enable_dta:
-        if parallel_dims.pp_enabled or parallel_dims.cp_enabled:
+    if tree_training_mode == "dta":
+        if (
+            parallel_dims.pp_enabled
+            or parallel_dims.cp_enabled
+            or parallel_dims.tp_enabled
+            or parallel_dims.ep_enabled
+            or parallel_dims.etp_enabled
+        ):
             raise ValueError(
-                "DTA with pipeline parallelism (pp > 1) or "
-                "context parallelism (cp > 1) is currently not supported."
+                "DTA currently supports only data parallelism. "
+                "Found unsupported parallel dimensions enabled among "
+                "{pp, cp, tp, ep, etp}. "
+                f"Current sizes: pp={parallel_dims.pp}, cp={parallel_dims.cp}, "
+                f"tp={parallel_dims.tp}, ep={parallel_dims.ep}, etp={parallel_dims.etp}."
             )
 
 
@@ -315,7 +324,7 @@ def prepare_training_config(
     config: TrainEngineConfig,
     parallel_dims: ArchonParallelDims,
     model_config: PretrainedConfig,
-    enable_tree_training: bool,
+    tree_training_mode: str,
     logger: logging.Logger,
 ) -> tuple[ActivationCheckpointConfig | None, bool]:
     """Build and validate all training configs before parallelism setup.
@@ -339,7 +348,7 @@ def prepare_training_config(
         config=config,
         parallel_dims=parallel_dims,
         enable_compile=enable_compile,
-        enable_tree_training=enable_tree_training,
+        tree_training_mode=tree_training_mode,
         logger=logger,
     )
 

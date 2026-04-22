@@ -60,14 +60,13 @@ def archon_test_config(request) -> SimpleNamespace:
     """Expose archon runtime config to tests/fixtures."""
     Ans = SimpleNamespace(
         max_tokens_per_mb=int(request.config.getoption("--max-tokens-per-mb")),
-        enable_dta=not request.config.getoption("--no-dta"),
+        tree_training_mode=(
+            "disabled" if request.config.getoption("--no-dta") else "dta"
+        ),
         dta_data=request.config.getoption("--dta-data"),
         dta_limit=int(request.config.getoption("--dta-limit")),
         use_hf=request.config.getoption("--use-hf"),
         model_path=request.config.getoption("--model-path"),
-    )
-    assert not Ans.use_hf or Ans.enable_dta, (
-        "Use HuggingFace model for Archon DTA tests must enable DTA."
     )
     return Ans
 

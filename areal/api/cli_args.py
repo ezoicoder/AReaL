@@ -1,11 +1,12 @@
 import argparse
 import json
 import os
+import warnings
 from dataclasses import MISSING as dataclass_missing
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import uvloop
 import yaml
@@ -954,23 +955,55 @@ class TrainEngineConfig:
     )
 
     # Tree training
+    tree_training_mode: Literal["disabled", "sparse", "dta"] = field(
+        default="disabled",
+        metadata={
+            "help": (
+                "Tree training mode. "
+                "'sparse' enables tree training with Flex Attention module (flex attention), "
+                "'dta' enables Dynamic Tree Attention (dynamic tree training), "
+                "'disabled' disables tree training."
+            ),
+            "choices": ["disabled", "sparse", "dta"],
+        },
+    )
     enable_tree_training: bool = field(
         default=False,
-        metadata={"help": "Enable tree training with flex attention module."},
+        metadata={
+            "help": (
+                "[DEPRECATED] Use tree_training_mode instead. "
+                "enable_tree_training=True maps to tree_training_mode='sparse'. "
+                "If both are set, tree_training_mode takes precedence."
+            )
+        },
     )
 
-    # Dynamic Tree Attention
-    enable_dta: bool = field(
-        default=False,
-        metadata={"help": "Enable Dynamic Tree Attention."},
-    )
     dta_depth: int = field(
         default=16384,
-        metadata={"help": "Depth for Dynamic Tree Attention."},
+        metadata={
+            "help": "Depth for Dynamic Tree Attention. Only effective when tree_training_mode='dta'."
+        },
     )
     dta_block_size: int = field(
         default=2048,
-        metadata={"help": "Block size for Dynamic Tree Attention."},
+        metadata={
+            "help": (
+                "Block size for Dynamic Tree Attention. "
+                "Set to -1 to disable block-size limit. "
+                "Only effective when tree_training_mode='dta'."
+            )
+        },
+    )
+    partition_mode: Literal["seqlen", "dta"] = field(
+        default="seqlen",
+        metadata={
+            "help": (
+                "Data-parallel trajectory partition strategy in distributed rollout. "
+                "'seqlen' balances by total sequence length; "
+                "'dta' balances by DTA DFS-order n_tree_tokens estimate."
+            ),
+            "choices": ["seqlen", "dta"],
+        },
     )
 
     # Scheduling
@@ -1006,6 +1039,45 @@ class TrainEngineConfig:
                 "memory_efficient_load is for loading pretrained weights on CPU, "
                 "but init_from_scratch creates a model without loading any weights."
             )
+        valid_tree_modes = {"disabled", "sparse", "dta"}
+        if self.tree_training_mode not in valid_tree_modes:
+            raise ValueError(
+                f"tree_training_mode must be one of {valid_tree_modes}, got '{self.tree_training_mode}'"
+            )
+        valid_partition_modes = {"seqlen", "dta"}
+        if self.partition_mode not in valid_partition_modes:
+            raise ValueError(
+                f"partition_mode must be one of {valid_partition_modes}, got '{self.partition_mode}'"
+            )
+        if self.tree_training_mode == "dta" and (
+            self.dta_block_size == 0 or self.dta_block_size < -1
+        ):
+            raise ValueError(
+                f"dta_block_size must be -1 or a positive integer when tree_training_mode='dta', got {self.dta_block_size}."
+            )
+
+        if self.enable_tree_training:
+            warnings.warn(
+                "`enable_tree_training` is deprecated and will be removed in a future version. "
+                "Use `tree_training_mode='sparse'` instead.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            if self.tree_training_mode != "disabled":
+                warnings.warn(
+                    f"`tree_training_mode` is already set to '{self.tree_training_mode}', "
+                    "`enable_tree_training=True` is ignored.",
+                    FutureWarning,
+                    stacklevel=2,
+                )
+            else:
+                self.tree_training_mode = "sparse"
+                warnings.warn(
+                    "`tree_training_mode` is overridden to 'sparse' from deprecated "
+                    "`enable_tree_training=True`.",
+                    FutureWarning,
+                    stacklevel=2,
+                )
 
 
 @dataclass

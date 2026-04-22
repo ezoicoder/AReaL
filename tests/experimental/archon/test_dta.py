@@ -261,8 +261,10 @@ def test_engine_is_initialized(archon_test_config):
     engine = create_archon_engine(test_config=archon_test_config)
     try:
         assert engine.initialized
-        assert engine.enable_dta == archon_test_config.enable_dta
-        assert hasattr(engine, "dta_engine")
+        assert engine.tree_training_mode == archon_test_config.tree_training_mode
+        assert hasattr(engine, "dta_wrapper") == (
+            archon_test_config.tree_training_mode == "dta"
+        )
     finally:
         destroy_test_engine(engine)
 

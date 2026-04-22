@@ -1,3 +1,5 @@
+# The following code is adapted with minor modifications from
+# https://github.com/Whisper-6/DynamicTreeAttn/blob/main/trie.py.
 import random
 from dataclasses import dataclass, field
 from math import ceil
@@ -59,29 +61,30 @@ def _get_stats(
 
 @dataclass(slots=True)
 class CTNode:
-    """压缩Trie树节点"""
+    """Node in the compressed trie."""
 
-    depth: int = 0  # 节点深度
-    seq_id: int = -1  # 字符串编号，-1 表示内部节点
-    chain_tail_depth: int = 0  # 主链末端的深度
-    child_ids: list[int] = field(default_factory=list)  # 子节点ID列表
+    depth: int = 0  # Depth of this node.
+    seq_id: int = -1  # Sequence index; -1 indicates an internal node.
+    chain_tail_depth: int = 0  # Tail depth of the prioritized chain.
+    child_ids: list[int] = field(default_factory=list)  # IDs of child nodes.
 
 
 class CompressedTrie:
-    """压缩Trie树类，用于规划遍历顺序"""
+    """Compressed trie used to plan traversal order."""
 
     def __init__(self, lens: list[int], lcp_lens: list[int]):
         """
-        初始化压缩Trie树
+        Initialize the compressed trie.
 
         Args:
-            lens: 每个字符串的长度，保证按字典序排序
-            lcp_lens: 相邻字符串的LCP长度，len(lcp_lens) = len(lens) - 1
+            lens: Length of each sequence, sorted in lexicographic order.
+            lcp_lens: LCP length between adjacent sequences, where
+                len(lcp_lens) == len(lens) - 1.
         """
         if len(lcp_lens) != len(lens) - 1:
-            raise ValueError("lcp_lens的长度必须为len(lens)-1")
+            raise ValueError("len(lcp_lens) must be len(lens) - 1")
 
-        self.nodes: list[CTNode] = []  # 存储所有节点
+        self.nodes: list[CTNode] = []  # Stores all trie nodes.
         self._build(lens, lcp_lens)
 
         self.lca_depth = None
@@ -90,17 +93,17 @@ class CompressedTrie:
         self.lcp_lens = None
 
     def _new_node(self, depth: int, seq_id: int = -1) -> int:
-        """创建新节点，返回节点ID"""
+        """Create a new node and return its ID."""
         self.nodes.append(CTNode(depth=depth, seq_id=seq_id))
         return len(self.nodes) - 1
 
     def _build(self, lens: list[int], lcp_lens: list[int]):
-        """构建压缩Trie树"""
+        """Build the compressed trie."""
 
         n_seqs = len(lens)
-        # 创建根节点
+        # Create the root node.
         root_id = self._new_node(depth=0, seq_id=-1)
-        stack = [(root_id, 0)]  # 栈结构：(node_id, depth)
+        stack = [(root_id, 0)]  # Stack entries are (node_id, depth).
         nodes = self.nodes
 
         for seq_id in range(n_seqs):
@@ -109,7 +112,7 @@ class CompressedTrie:
 
             if len(stack) >= 2:
                 while stack[-2][1] > lcp:
-                    # 弹出子节点，并将子节点连接到父节点
+                    # Pop a child node and connect it to its parent.
                     child_id = stack.pop()[0]
                     parent_id = stack[-1][0]
                     nodes[parent_id].child_ids.append(child_id)
@@ -125,7 +128,7 @@ class CompressedTrie:
                     lcp_node_id = self._new_node(depth=lcp, seq_id=-1)
                     stack.append((lcp_node_id, lcp))
 
-            # 创建新的叶节点
+            # Create a new leaf node.
             parent_id = stack[-1][0]
             cur_node_id = self._new_node(depth=len_i, seq_id=seq_id)
             stack.append((cur_node_id, len_i))
@@ -136,10 +139,10 @@ class CompressedTrie:
             nodes[parent_id].child_ids.append(child_id)
 
     def dfs_chain(self, node_id: int, child_order_func) -> int:
-        """计算每个节点的 chain_tail_depth"""
+        """Compute `chain_tail_depth` for each node."""
         node = self.nodes[node_id]
 
-        # 如果是叶节点
+        # Leaf node.
         if node.seq_id != -1:
             node.chain_tail_depth = node.depth
             return
@@ -174,7 +177,7 @@ class CompressedTrie:
     def dfs_get_order(self, node_id: int, child_order_func):
         node = self.nodes[node_id]
 
-        # 如果是叶节点，记录字符串编号
+        # Leaf node: record the sequence index.
         if node.seq_id != -1:
             self.order.append(node.seq_id)
             self.lens.append(node.depth)
@@ -182,10 +185,10 @@ class CompressedTrie:
             self.lca_depth = node.depth
             return
 
-        # 根据指定的顺序函数获取子节点遍历顺序
+        # Get child traversal order from the given strategy.
         child_ids = child_order_func(node_id)
 
-        # 递归遍历子节点
+        # Recursively traverse children.
         for child_id in child_ids:
             self.lca_depth = min(self.lca_depth, node.depth)
             self.dfs_get_order(child_id, child_order_func)
@@ -221,7 +224,7 @@ class CompressedTrie:
         return child_ids
 
     def get_order(self, child_order_func):
-        """获取按指定顺序函数DFS遍历得到的字符串顺序"""
+        """Get sequence order from DFS with a custom child-order strategy."""
         self.dfs_chain(0, child_order_func)
         self.order = []
         self.lens = []
@@ -230,17 +233,17 @@ class CompressedTrie:
         self.dfs_get_order(0, child_order_func)
 
     def get_order_forward(self):
-        """获取按main_Ld优先DFS遍历得到的字符串顺序"""
+        """Get sequence order from DFS using main-Ld-priority traversal."""
         self.get_order(self._get_child_order_forward)
         return self.order, self.lens, self.lcp_lens[1:]
 
     def get_order_backward(self):
-        """获取按main_Ld优先DFS遍历得到的字符串顺序"""
+        """Get sequence order from DFS for backward-style pop traversal."""
         self.get_order(self._get_child_order_backward)
         return self.order[::-1], self.lens[::-1], self.lcp_lens[1:][::-1]
 
     def get_order_random(self, seed: int | None = None):
-        """获取随机打乱边表后的DFS遍历顺序"""
+        """Get sequence order from DFS after randomizing child edges."""
         self.get_order(lambda node_id: self._get_child_order_random(node_id, seed))
         return self.order
 

@@ -268,6 +268,9 @@ class PPOTrainer:
         )
 
         self._config_perf_tracer()
+        self._cumulative_training_tokens = 0.0
+        self._cumulative_train_step_time = 0.0
+        self._cumulative_step_time = 0.0
 
     def train(
         self,
@@ -846,10 +849,52 @@ class PPOTrainer:
         stats.update(self.rollout.export_stats())
         if self.eval_rollout is not None:
             stats.update(self.eval_rollout.export_stats())
+        self._add_throughput_metrics(stats)
         self.stats_logger.commit(epoch, epoch_step, global_step, stats)
 
         dist.barrier(group=self.actor.cpu_group)
         current_platform.synchronize()
+
+    def _add_throughput_metrics(self, stats: dict[str, float]) -> None:
+        if "ppo_actor/update/n_tokens" not in stats:
+            raise ValueError(
+                "Missing required metric `ppo_actor/update/n_tokens` for throughput computation."
+            )
+        if "timeperf/train_step" not in stats:
+            raise ValueError(
+                "Missing required metric `timeperf/train_step` for throughput computation."
+            )
+
+        n_tokens = float(stats["ppo_actor/update/n_tokens"])
+        train_step_time = float(stats["timeperf/train_step"])
+        step_total_time = sum(
+            float(value)
+            for key, value in stats.items()
+            if key.startswith("timeperf/") and not key.endswith("__count")
+        )
+        stats["timeperf/step_total"] = step_total_time
+
+        self._cumulative_training_tokens += n_tokens
+        self._cumulative_train_step_time += max(train_step_time, 0.0)
+        self._cumulative_step_time += max(step_total_time, 0.0)
+        stats["timeperf/cumulative_step_total"] = self._cumulative_step_time
+
+        if n_tokens > 0.0 and train_step_time > 0.0:
+            stats["training_throughput"] = n_tokens / train_step_time
+        if (
+            self._cumulative_training_tokens > 0.0
+            and self._cumulative_train_step_time > 0.0
+        ):
+            stats["cumulative_training_throughput"] = (
+                self._cumulative_training_tokens / self._cumulative_train_step_time
+            )
+
+        if n_tokens > 0.0 and step_total_time > 0.0:
+            stats["throughput"] = n_tokens / step_total_time
+        if self._cumulative_training_tokens > 0.0 and self._cumulative_step_time > 0.0:
+            stats["cumulative_throughput"] = (
+                self._cumulative_training_tokens / self._cumulative_step_time
+            )
 
     def _validate_cfg(self):
         """validate config for incompatible settings before weight initialization, to avoid wasted resources on spawning workers and loading models."""

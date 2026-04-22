@@ -1,3 +1,8 @@
+# The following code is adapted with minor modifications from
+# https://github.com/Whisper-6/DynamicTreeAttn/blob/main/tree_training_engine.py.
+# Special thanks to Yuchen Yang for outstanding contributions to core DTA algorithms
+# and optimizations, including chunked backpropagation and cut tail features.
+
 from bisect import bisect_left, bisect_right
 from math import ceil
 
@@ -7,10 +12,12 @@ from transformers.cache_utils import DynamicCache
 
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
 
+NO_BLOCK_SIZE_LIMIT = int(1e9)
 
-def _get_forkpos(lens, lcp_lens, block_size: int) -> list:
+
+def _get_forkpos(lens, lcp_lens, block_size: int | None) -> list:
     """
-    Compute all fork positions that TreeTrainingEngine's stack must track.
+    Compute all fork positions that DTAEngine's stack must track.
 
     Fork positions are token indices where:
     1) Sequences diverge (longest common prefix boundaries)
@@ -33,7 +40,6 @@ def _get_forkpos(lens, lcp_lens, block_size: int) -> list:
             end = lens[i]
 
             pop_len = end - start
-
             n_blocks = ceil(pop_len / block_size)
             block_size_actual = ceil(pop_len / n_blocks)
 
@@ -48,11 +54,11 @@ def _get_forkpos(lens, lcp_lens, block_size: int) -> list:
     return forkpos_list
 
 
-class TreeTrainingEngine:
+class DTAEngine:
     """
     Engine for backward computation over sequences with shared prefixes.
 
-    TreeTrainingEngine stores only necessary KV caches, logits at fork
+    DTAEngine stores only necessary KV caches, logits at fork
     positions, log-probs, and entropy to efficiently compute gradients
     for multiple sequences while saving memory.
 
@@ -68,7 +74,7 @@ class TreeTrainingEngine:
         forward_only: bool = False,
     ):
         """
-        Initialize the engine with model_config, device, dtype, and maximum sequence length.
+        Initialize DTAEngine with model config, device and buffer sizes.
 
         Buffers for tokens, logprobs, entropy and KV caches are preallocated
         to max_seq_len.
@@ -333,7 +339,7 @@ class TreeTrainingEngine:
         if start < cache_len:
             self.build_cache(start, cache_len)
 
-        # 修改上一个 token 的 logprob
+        # Update the previous token's logprob.
         if start > 0:
             pre_logits = self.forkpos_logits[start - 1].float()
             first_token = new_tokens[0].item()
@@ -619,6 +625,7 @@ class TreeTrainingEngine:
         Args:
             token_trie: TokenTrie containing input sequences and attachs.
             block_size: Maximum block size for popping to control GPU memory.
+                Use -1 for no block-size limit.
             loss_fn: Callable to compute per-sequence loss.
             cut_f1_tail: Whether to cut the tail of the first forward.
         Returns:
@@ -626,6 +633,8 @@ class TreeTrainingEngine:
         """
 
         self.model = model
+        if block_size == -1:
+            block_size = NO_BLOCK_SIZE_LIMIT
 
         total_loss = 0.0
 
