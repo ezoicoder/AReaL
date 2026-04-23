@@ -23,6 +23,7 @@ from tests.experimental.archon.utils import (
     dta_loss_weight_fn,
     load_pt_batch,
     snapshot_module_parameters,
+    strip_wrapper_prefixes,
 )
 
 _CUDA_AVAILABLE = torch.cuda.is_available()
@@ -30,11 +31,6 @@ _CUDA_AVAILABLE = torch.cuda.is_available()
 pytestmark = [
     pytest.mark.skipif(not _CUDA_AVAILABLE, reason="CUDA not available"),
 ]
-
-
-def _strip_wrapper_prefixes(name: str) -> str:
-    """Drop wrapper-generated path segments from parameter names."""
-    return name.replace("._checkpoint_wrapped_module", "").replace("._orig_mod", "")
 
 
 def _canonicalize_param_dict(
@@ -52,11 +48,11 @@ def _canonicalize_param_dict(
             )
             mapped = archon_adapter.convert_single_to_hf(raw_name, value)
             if not mapped:
-                key = _strip_wrapper_prefixes(raw_name)
+                key = strip_wrapper_prefixes(raw_name)
             else:
                 key, _ = mapped[0]
         else:
-            key = _strip_wrapper_prefixes(raw_name)
+            key = strip_wrapper_prefixes(raw_name)
         canonical[key] = value
     return canonical
 

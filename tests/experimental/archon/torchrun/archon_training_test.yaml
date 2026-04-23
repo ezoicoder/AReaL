@@ -1,0 +1,52 @@
+# Example config for tests/experimental/archon/torchrun/run_archon_training_test.py.
+#
+# Launch (2 GPUs, dp=2, DTA enabled):
+#   torchrun --nproc_per_node=2 \
+#     tests/experimental/archon/torchrun/run_archon_training_test.py \
+#     --config tests/experimental/archon/torchrun/archon_training_test.yaml \
+#     test_config.step=4 \
+#     test_config.data_dir=/path/to/data_dir
+#
+# CLI overrides use OmegaConf dotlist syntax; eg ``engine.mb_spec.max_tokens_per_mb=8192``.
+
+engine:
+  experiment_name: archon_train_test
+  path: /storage/openpsi/models/Qwen__Qwen2.5-0.5B-Instruct/
+  dtype: bfloat16
+  init_from_scratch: false
+  gradient_checkpointing: false
+
+  mb_spec:
+    max_tokens_per_mb: 5596
+
+  optimizer:
+    type: adam
+    lr: 1.0e-5
+    weight_decay: 0.01
+    warmup_steps_proportion: 0.0
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+
+  # Dynamic Tree Attention toggles.
+  tree_training_mode: dta        # {disabled, sparse, dta}
+  dta_depth: 16384
+  dta_block_size: 2048
+  partition_mode: seqlen         # {seqlen, dta}
+
+parallel: archon:d2
+
+test_config:
+  # step is required; set via CLI or here.
+  step: 4
+  # data_dir is required; must be set via CLI override, eg
+  #   test_config.data_dir=/path/to/data_dir
+  data_dir: ""
+  # Root directory for auto-derived dump path. Can be overridden via CLI:
+  #   test_config.fileroot=/storage/openpsi/experiments
+  fileroot: /storage/openpsi/experiments
+  disable_optimizer: false
+  prompt_ratio: 0.3
+  save_diff: true
+  save_params: false
+  save_initial_params: false
+  seed: 42

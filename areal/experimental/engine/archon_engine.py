@@ -489,6 +489,7 @@ class ArchonEngine(TrainEngine):
         input_: dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        return_loss: bool = False,
     ) -> dict[str, float]:
         """Train on a batch of data."""
         assert self._initialized
@@ -520,13 +521,18 @@ class ArchonEngine(TrainEngine):
                 dp_group=self.data_parallel_group,
             )
             result = self.optimizer_step()
+            if return_loss:
+                dta_loss = float(dta_stats.get("dta_loss", float("nan")))
+                result["loss"] = dta_loss
             return result
+
+        losses: list[torch.Tensor] = []
 
         def process_output(
             logits: torch.Tensor, ctx_dict: dict[str, Any]
         ) -> torch.Tensor:
             ctx = ArchonTrainContext(**ctx_dict)
-            return self._compute_logprobs_and_loss(
+            loss = self._compute_logprobs_and_loss(
                 logits,
                 ctx,
                 loss_fn,
@@ -534,10 +540,27 @@ class ArchonEngine(TrainEngine):
                 total_loss_weight,
                 loss_multiplier=self.data_parallel_world_size,
             )
+            if return_loss:
+                losses.append(loss.detach())
+            return loss
 
         self.forward_backward_batch(mb_list, process_output, forward_only=False)
 
-        return self.optimizer_step()
+        result = self.optimizer_step()
+        if return_loss:
+            if losses:
+                # Non-DTA path stores per-microbatch scaled loss:
+                #   loss_i * (w_i / W_total) * dp_world_size
+                # Summing over microbatches then dividing by dp_world_size aligns
+                # with DTA's returned objective:
+                #   sum_i loss_i * (w_i / W_total)
+                local_loss = float(torch.stack(losses).sum().item()) / float(
+                    self.data_parallel_world_size
+                )
+            else:
+                local_loss = float("nan")
+            result["loss"] = local_loss
+        return result
 
     @torch.no_grad()
     def eval_batch(

@@ -66,6 +66,7 @@ __all__ = [
     "dta_dummy_loss_fn",
     "dta_loss_weight_fn",
     "snapshot_module_parameters",
+    "strip_wrapper_prefixes",
 ]
 
 
@@ -82,6 +83,11 @@ def get_model_path_for_type(model_type: str) -> str | None:
 
 
 DATASET_PATH = get_dataset_path("/storage/openpsi/data/gsm8k", "openai/gsm8k")
+
+
+def strip_wrapper_prefixes(name: str) -> str:
+    """Drop wrapper-generated path segments from parameter names."""
+    return name.replace("._checkpoint_wrapped_module", "").replace("._orig_mod", "")
 
 
 @dataclass
