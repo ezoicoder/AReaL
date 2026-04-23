@@ -40,9 +40,30 @@ cost-effective** for a broad community of developers and researchers.
 
 ## 📰 News
 
+**\[2026/04/23\]** 🚀 We’re excited to release our integration with
+[Scaffoldings](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding)
+for agentic RL training - now live in our
+[examples](https://github.com/inclusionAI/AReaL/tree/main/examples/scaffolding)! Huge
+shoutout to @narutolhy and @WeiHaocheng for making this happen 🙌. The modular design of
+the Scaffoldings enables it to achieve a thorough decoupling of agent execution, reward
+calculation, and trajectory acquisition. This enables developers to reuse existing
+modules when implementing an agentic RL method, allowing them to focus on their own
+innovative modules.
+
+**\[2026/04/18\]** We are thrilled to announce that **AReaL's first Community Biweekly
+Meeting** was successfully held! Thank you to everyone who joined us. Meeting materials
+are now available
+[here](https://github.com/inclusionAI/AReaL/tree/main/assets/community). Our next
+meeting is scheduled for **2026/05/01** and will also be conducted in Chinese;
+English-language meetings will be scheduled in the future. We warmly welcome everyone to
+participate! See [Community](./assets/community/README.md) for more details.
+
 **\[2026/03/02\]** We provide [a complete example](./examples/openclaw/) to train your
 own 🦞 OpenClaw agent by simply replacing the `base_url` and `api_key` with AReaL's RL
 service - no complicated dependencies, no code changes, works with any agentic runtime!
+
+<details>
+<summary><b>📋 Previous Releases</b></summary>
 
 **\[2026/02/06\]** We are delighted to introduce **AReaL-SEA**, a self-evolving data
 synthesis engine. Combined with RL training on AReaL, the 235B MoE model surpasses GPT 5
@@ -57,9 +78,6 @@ open-sourcing [SETA](https://github.com/camel-ai/seta), their terminal agent RL 
 trained with AReaL! Check out
 [their training workflow](https://github.com/camel-ai/seta/tree/main/training/tbench_areal_workflow)
 and the [announcement on X](https://x.com/guohao_li/status/2009678513574408636).
-
-<details>
-<summary><b>📋 Previous Releases</b></summary>
 
 **\[2026/01/01\]** Happy New Year! Thanks to the outstanding contribution from
 @HwVanICI, we are excited to officially announce stable support for AReaL training on

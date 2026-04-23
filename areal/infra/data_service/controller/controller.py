@@ -123,7 +123,7 @@ class DataController:
         guard_addr_0 = guard_addrs[0]
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(trust_env=False) as session:
                 # Wave 1: Fork all DataWorkers + Router in parallel
                 worker_tasks = [
                     self._async_fork_on_guard(
@@ -141,6 +141,8 @@ class DataController:
                             str(num_dataset_workers),
                             "--dataloader-num-workers",
                             str(cfg.dataloader_num_workers),
+                            "--seed",
+                            str(cfg.seed),
                         ],
                     )
                     for rank in range(num_dataset_workers)
@@ -211,6 +213,7 @@ class DataController:
                 "DataController initialization failed, rolling back",
                 exc_info=True,
             )
+            # Kill forked services concurrently
             if self._forked_services:
                 await self._async_kill_forked_services(
                     list(reversed(self._forked_services))
@@ -240,7 +243,6 @@ class DataController:
         dataset_kwargs: dict[str, Any] | None = None,
         tokenizer_or_processor_path: str = "",
         split: str = "train",
-        seed: int = 42,
         shuffle: bool = True,
         drop_last: bool = True,
         max_length: int | None = None,
@@ -256,7 +258,6 @@ class DataController:
             "dataset_type": dataset_type,
             "split": split,
             "tokenizer_or_processor_path": tokenizer_or_processor_path,
-            "seed": seed,
             "max_length": max_length,
             "shuffle": shuffle,
             "drop_last": drop_last,
@@ -340,7 +341,7 @@ class DataController:
             except Exception:
                 logger.debug("Failed to clear batches on %s", addr)
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(trust_env=False) as session:
             await asyncio.gather(
                 *(_clear_one(session, addr) for addr in self._worker_addrs),
                 return_exceptions=True,
@@ -367,7 +368,6 @@ class DataController:
                     exc,
                 )
 
-        # Kill forked services concurrently
         if self._forked_services:
             run_async_task(
                 self._async_kill_forked_services,
@@ -488,7 +488,7 @@ class DataController:
                     exc,
                 )
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(trust_env=False) as session:
             await asyncio.gather(
                 *(_kill_one(session, *svc) for svc in services),
                 return_exceptions=True,
@@ -514,7 +514,7 @@ class DataController:
         url = f"{self._gateway_addr}{endpoint}"
         try:
             async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=timeout)
+                timeout=aiohttp.ClientTimeout(total=timeout), trust_env=False
             ) as session:
                 async with session.post(
                     url,
