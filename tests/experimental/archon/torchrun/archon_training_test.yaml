@@ -7,10 +7,16 @@
 #     test_config.step=4 \
 #     test_config.data_dir=/path/to/data_dir
 #
-# CLI overrides use OmegaConf dotlist syntax; eg ``engine.mb_spec.max_tokens_per_mb=8192``.
+# CLI overrides use OmegaConf dotlist syntax; eg ``actor.mb_spec.max_tokens_per_mb=8192``.
 
-engine:
-  experiment_name: archon_train_test
+experiment_name: archon_train_test
+trial_name: trial0
+
+cluster:
+  fileroot: /storage/openpsi/experiments
+
+actor:
+  backend: archon:d2
   path: /storage/openpsi/models/Qwen__Qwen2.5-0.5B-Instruct/
   dtype: bfloat16
   init_from_scratch: false
@@ -31,9 +37,7 @@ engine:
   tree_training_mode: dta        # {disabled, sparse, dta}
   dta_depth: 16384
   dta_block_size: 2048
-  partition_mode: seqlen         # {seqlen, dta}
-
-parallel: archon:d2
+  packing_algorithm: dta         # rollout: {ffd, kk, dta} (not mb_spec)
 
 test_config:
   # step is required; set via CLI or here.
@@ -41,11 +45,7 @@ test_config:
   # data_dir is required; must be set via CLI override, eg
   #   test_config.data_dir=/path/to/data_dir
   data_dir: ""
-  # Root directory for auto-derived dump path. Can be overridden via CLI:
-  #   test_config.fileroot=/storage/openpsi/experiments
-  fileroot: /storage/openpsi/experiments
   disable_optimizer: false
-  prompt_ratio: 0.3
   save_diff: true
   save_params: false
   save_initial_params: false

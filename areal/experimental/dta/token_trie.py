@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # The following code is adapted with minor modifications from
 # https://github.com/Whisper-6/DynamicTreeAttn/blob/main/token_trie.py.
 # Special thanks to Yuchen Yang for outstanding contributions to the optimized DFS order.

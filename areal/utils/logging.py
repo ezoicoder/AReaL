@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import logging.config
 import os
 import threading
@@ -59,6 +61,7 @@ LOGGER_COLORS_EXACT = {
     "SyncRPCServer": "white",
     "RayRPCServer": "white",
     "RPCSerialization": "white",
+    "HttpRTensor": "white",
     # Inference wrappers - white
     "SGLangWrapper": "white",
     "VLLMWrapper": "white",
@@ -101,6 +104,20 @@ LOGGER_COLORS_EXACT = {
     "ToolCallParser": "light_purple",
     "TokenLogpReward": "light_purple",
     "ProxyUtils": "light_purple",
+    # Agent Service - purple
+    "AgentGateway": "light_purple",
+    "AgentBridge": "light_purple",
+    "AgentRouter": "light_purple",
+    "AgentWorker": "light_purple",
+    "AgentDataProxy": "light_purple",
+    "AgentServiceController": "light_purple",
+    # Inference service - white (orchestration)
+    "GatewayInferenceController": "white",
+    "InferenceDataProxy": "white",
+    "InferenceInfBridge": "white",
+    "InferenceRouter": "white",
+    "InferenceGateway": "white",
+    "RPCGuard": "white",
 }
 
 # Prefix patterns checked in order (first match wins)
@@ -399,7 +416,7 @@ _LATEST_LOG_STEP = 0
 
 
 def log_swanlab_wandb_tensorboard(data, step=None, summary_writer=None):
-    # Logs data to SwanLab、 wandb、 TensorBoard.
+    # Logs data to SwanLab, wandb, TensorBoard, and Trackio.
 
     global _LATEST_LOG_STEP
     if step is None:
@@ -419,6 +436,14 @@ def log_swanlab_wandb_tensorboard(data, step=None, summary_writer=None):
     import wandb
 
     wandb.log(data, step=step)
+
+    # trackio
+    try:
+        import trackio
+
+        trackio.log(data, step=step)
+    except (ModuleNotFoundError, ImportError):
+        pass
 
     # tensorboard
     if summary_writer is not None:

@@ -9,9 +9,9 @@ Before applying fixes, understand which parameters affect memory usage:
 
 ### Core Parameters
 
-- **`allocation_mode`**: How inference and training are distributed across GPUs. For
-  large models, tensor parallelism typically uses less memory per GPU than data
-  parallelism.
+- **Per-engine `backend` fields (`actor.backend`, `rollout.backend`)**: How inference
+  and training are distributed across GPUs. For large models, tensor parallelism
+  typically uses less memory per GPU than data parallelism.
 
 - **`train_dataset.max_length`**: Maximum prompt length. Longer prompts require more
   memory.
@@ -58,9 +58,12 @@ effective solution.
 Increase tensor parallelism to distribute model weights across more GPUs:
 
 ```yaml
-# Before: sglang:d4+fsdp:d4 (4 data parallel processes)
-# After: sglang:d2t2+fsdp:d4 (2 data parallel, 2 tensor parallel)
-allocation_mode: sglang:d2t2+fsdp:d4
+# Before: 4 data parallel processes for rollout
+# After: 2 data parallel, 2 tensor parallel for rollout
+rollout:
+  backend: "sglang:d2t2"
+actor:
+  backend: "fsdp:d4"
 ```
 
 Note that higher tensor parallelism reduces generation throughput.
@@ -112,9 +115,12 @@ For long contexts where `max_tokens_per_mb` cannot be reduced further, use Ulyss
 sequence parallelism to distribute sequences across multiple GPUs:
 
 ```yaml
-# Before: sglang:d4+fsdp:d4 (4 data parallel processes)
-# After: sglang:d4+fsdp:d2c2 (2 data parallel, 2 ulysses context parallel)
-allocation_mode: sglang:d4+fsdp:d2c2
+# Before: 4 data parallel processes for training
+# After: 2 data parallel, 2 ulysses context parallel for training
+rollout:
+  backend: "sglang:d4"
+actor:
+  backend: "fsdp:d2c2"
 ```
 
 > The Ulysses context parallel size must evenly divide the model's attention head count.
@@ -127,18 +133,24 @@ allocation_mode: sglang:d4+fsdp:d2c2
 You can also enable tensor parallelism with FSDP:
 
 ```yaml
-# Before: sglang:d4+fsdp:d4 (4 data parallel processes)
-# After: sglang:d4+fsdp:d2t2 (2 data parallel, 2 tensor parallel)
-allocation_mode: sglang:d4+fsdp:d2t2
+# Before: 4 data parallel processes for training
+# After: 2 data parallel, 2 tensor parallel for training
+rollout:
+  backend: "sglang:d4"
+actor:
+  backend: "fsdp:d2t2"
 ```
 
 For the Megatron and Archon backends, you can also enable pipeline and expert
 parallelism:
 
 ```yaml
-# Before: sglang:d4+fsdp:d4 (4 data parallel processes)
-# After: sglang:d4+archon:d2p2e2 (2 data parallel with 2 overlaid expert parallel, 2 pipeline parallel, still 4 GPUs)
-allocation_mode: sglang:d4+archon:d2p2e2
+# Before: 4 data parallel processes for training
+# After: 2 data parallel with 2 overlaid expert parallel, 2 pipeline parallel, still 4 GPUs
+rollout:
+  backend: "sglang:d4"
+actor:
+  backend: "archon:d2p2e2"
 ```
 
 We recommend pipeline and expert parallelism over tensor/context parallelism. Check
@@ -147,12 +159,34 @@ We recommend pipeline and expert parallelism over tensor/context parallelism. Ch
 ```{seealso}
 Pipeline parallelism introduces unique memory challenges (microbatch warmup accumulation,
 zero-bubble `retain_graph` overhead, FSDP resharding trade-offs, gradient accumulation
-costs, and per-rank memory budgeting). See the
-[Archon PP Memory Guide](../tutorial/archon.md#appendix-pipeline-parallelism-memory-guide)
-for a comprehensive walkthrough.
+costs, and per-rank memory budgeting). See
+{ref}`Archon PP Memory Guide <appendix-pipeline-parallelism-memory-guide>` for a
+comprehensive walkthrough.
 ```
 
-### 4. Switch to a Lightweight Optimizer
+### 4. Enable Per-Layer Optim Step
+
+When using FSDP CPU offloading (`offload_params: true`), the default CPU Adam step can
+be very slow. Enable per-layer optim step to stream optimizer states per-layer to device
+for a significant speedup:
+
+```yaml
+actor:
+  fsdp:
+    per_layer_optim_step: true
+    optim_step_prefetch_layers: 1  # Number of layers to prefetch (default: 1)
+```
+
+This streams one layer at a time to device instead of running Adam on CPU, keeping
+device memory usage low while achieving much faster optimizer updates.
+
+**Requirements:**
+
+- Compatible with both `offload_params: true` and `false` (optimizer states are
+  automatically managed on CPU by the per-layer wrapper; when `offload_params` is also
+  enabled, params/grads are streamed per-layer to device as well)
+
+### 5. Switch to a Lightweight Optimizer
 
 AReaL supports different optimizers depending on the training engine.
 
@@ -166,7 +200,7 @@ AReaL supports different optimizers depending on the training engine.
 `actor.optimizer.type: <name>` in your YAML configuration file (e.g.,
 `actor.optimizer.type: sgd`).
 
-### 5. Use Memory-Efficient Model Loading
+### 6. Use Memory-Efficient Model Loading
 
 If OOM occurs during model initialization (before training starts), enable
 memory-efficient loading:

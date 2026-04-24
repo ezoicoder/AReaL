@@ -26,6 +26,7 @@ typical ``grpo_loss_fn`` setup.
 
 from __future__ import annotations
 
+import functools
 import glob
 import json
 import math
@@ -45,19 +46,23 @@ _REPO_ROOT = _THIS_FILE.parents[4]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from tests.experimental.archon.torchrun.training_test_config import (  # noqa: E402
+from areal.api.io_struct import FinetuneSpec  # noqa: E402
+from areal.experimental.archon.torchrun.training_test_config import (  # noqa: E402
     ArchonTrainingTestConfig,
     ensure_dump_dir,
     load_training_test_config,
 )
-from tests.experimental.archon.utils import strip_wrapper_prefixes  # noqa: E402
-
-from areal.api.io_struct import FinetuneSpec  # noqa: E402
+from areal.experimental.archon.utils import strip_wrapper_prefixes  # noqa: E402
 from areal.experimental.engine.archon_engine import ArchonLMEngine  # noqa: E402
 from areal.infra.dist_rollout import redistribute_trajectories  # noqa: E402
 from areal.infra.platforms import current_platform  # noqa: E402
 from areal.trainer.ppo.actor import grpo_loss_fn  # noqa: E402
+from areal.utils.data import concat_batch  # noqa: E402
+from areal.utils.logging import getLogger  # noqa: E402
 from areal.utils.network import find_free_ports  # noqa: E402
+
+# Fixed prompt ratio for synthetic loss mask construction.
+_PROMPT_RATIO = 0.3
 
 # -----------------------------------------------------------------------------
 # Distributed setup
@@ -121,7 +126,6 @@ def _load_sequences(pt_path: str) -> list[torch.Tensor]:
 def _build_trajectory(
     input_ids: torch.Tensor,
     global_idx: int,
-    prompt_ratio: float,
     base_seed: int,
     max_tokens: int,
     device: torch.device,
@@ -139,7 +143,7 @@ def _build_trajectory(
     ids = input_ids[:seq_len].long().unsqueeze(0).contiguous()
     attention_mask = torch.ones(1, seq_len, dtype=torch.long)
     loss_mask = torch.zeros(1, seq_len)
-    prompt_len = max(1, int(seq_len * prompt_ratio))
+    prompt_len = max(1, int(seq_len * _PROMPT_RATIO))
     loss_mask[:, prompt_len:] = 1.0
 
     gen = torch.Generator(device="cpu").manual_seed(int(base_seed) + int(global_idx))
@@ -169,7 +173,6 @@ def _build_local_trajectories(
     seqs: list[torch.Tensor],
     dp_rank: int,
     dp_world_size: int,
-    prompt_ratio: float,
     base_seed: int,
     max_tokens: int,
     device: torch.device,
@@ -196,7 +199,6 @@ def _build_local_trajectories(
             _build_trajectory(
                 input_ids=seqs[global_i],
                 global_idx=global_i,
-                prompt_ratio=prompt_ratio,
                 base_seed=base_seed,
                 max_tokens=max_tokens,
                 device=device,
@@ -215,7 +217,6 @@ _GRPO_KW: dict[str, Any] = dict(
     eps_clip=0.2,
     eps_clip_higher=None,
     c_clip=None,
-    behave_imp_weight_cap=None,
     importance_sampling_level="token",
     current_version=1,
     prox_logp_method="recompute",
@@ -227,20 +228,6 @@ _GRPO_KW: dict[str, Any] = dict(
 def _loss_weight_fn(input_data: dict[str, Any]) -> torch.Tensor:
     mask = input_data["loss_mask"]
     return mask.count_nonzero()
-
-
-def _make_loss_fn():
-    """Build the GRPO loss function used by ``train_batch``."""
-
-    def _loss_fn(logprobs: torch.Tensor, entropy: torch.Tensor, input_: dict):
-        return grpo_loss_fn(
-            logprobs=logprobs,
-            entropy=entropy,
-            input_data=input_,
-            **_GRPO_KW,
-        )
-
-    return _loss_fn
 
 
 def _patch_engine_for_test(
@@ -356,7 +343,7 @@ def _snapshot_initial_full_params(
                         f"Duplicate dump key '{dump_name}' from raw param '{raw_name}'."
                     )
                 out[dump_name] = (
-                    dump_tensor.detach().to(torch.float32, device="cpu").clone()
+                    dump_tensor.detach().to(device="cpu", dtype=torch.float32).clone()
                 )
         del full
     if dist.is_initialized():
@@ -407,7 +394,7 @@ def _save_diff_snapshot(
                         f"(raw='{raw_name}')."
                     )
                 initial = initial_params[dump_name]
-                current = dump_tensor.detach().to(torch.float32, device="cpu")
+                current = dump_tensor.detach().to(device="cpu", dtype=torch.float32)
                 if current.shape != initial.shape:
                     raise ValueError(
                         f"Shape mismatch for '{dump_name}': current={tuple(current.shape)} "
@@ -491,7 +478,6 @@ def _run_single_step(
         seqs=seqs,
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
-        prompt_ratio=cfg.test_config.prompt_ratio,
         base_seed=cfg.test_config.seed + step_idx * 100003,
         max_tokens=max_tokens,
         device=device,
@@ -500,13 +486,16 @@ def _run_single_step(
     redist = redistribute_trajectories(
         trajectories=trajectories,
         group=dp_group,
-        partition_mode=engine.config.partition_mode,
+        packing_algorithm=engine.config.packing_algorithm,
     )
-    batch = redist.data
-    if not batch or "input_ids" not in batch:
+    local_trajectories = redist.data
+    if not local_trajectories:
         raise RuntimeError(
-            f"Step {step_idx}: redistribute_trajectories returned empty batch."
+            f"Step {step_idx}: redistribute_trajectories returned no local trajectories. "
+            f"all_data={len(redist.all_data)}, group_indices={redist.group_indices}, "
+            f"rank={redist.rank}"
         )
+    batch, _ = concat_batch(local_trajectories)
     batch = {
         k: (v.to(device) if isinstance(v, torch.Tensor) else v)
         for k, v in batch.items()
@@ -620,6 +609,7 @@ def main(argv: list[str] | None = None) -> None:
 
     rank, world_size = _setup_distributed_environment()
     device = torch.device(current_platform.device_type)
+    logger = getLogger(f"[ArchonTrainingTest Rank {rank}]")
 
     dump_dir = ensure_dump_dir(cfg, rank=rank)
     stats_path = os.path.join(dump_dir, "stats.jsonl")
@@ -628,18 +618,19 @@ def main(argv: list[str] | None = None) -> None:
         open(stats_path, "w").close()
 
     if rank == 0:
-        print(
-            f"[run_archon_training_test] config={config_path} "
-            f"dump_dir={dump_dir} world_size={world_size}",
-            flush=True,
+        logger.info(
+            "config=%s dump_dir=%s world_size=%s",
+            config_path,
+            dump_dir,
+            world_size,
         )
 
     step_files = _list_step_files(cfg.test_config.data_dir)
     if rank == 0:
-        print(
-            f"[run_archon_training_test] found {len(step_files)} .pt files in "
-            f"{cfg.test_config.data_dir}",
-            flush=True,
+        logger.info(
+            "Found %d .pt files in %s",
+            len(step_files),
+            cfg.test_config.data_dir,
         )
 
     engine: ArchonLMEngine | None = None
@@ -651,27 +642,33 @@ def main(argv: list[str] | None = None) -> None:
             disable_optimizer=cfg.test_config.disable_optimizer,
         )
         if rank == 0 and cfg.test_config.save_params:
-            print(
-                "[run_archon_training_test][warn] test_config.save_params is "
-                "deprecated in low-memory mode and ignored. Use diff.pt.",
-                flush=True,
+            logger.warning(
+                "test_config.save_params is deprecated in low-memory mode and "
+                "ignored. Use diff.pt.",
             )
         if rank == 0 and cfg.test_config.save_initial_params:
-            print(
-                "[run_archon_training_test][warn] test_config.save_initial_params "
-                "is ignored in low-memory mode.",
-                flush=True,
+            logger.warning(
+                "test_config.save_initial_params is ignored in low-memory mode.",
             )
 
         initial_params: dict[str, torch.Tensor] | None = None
         if cfg.test_config.save_diff:
             initial_params = _snapshot_initial_full_params(engine)
 
-        loss_fn = _make_loss_fn()
+        loss_fn = functools.partial(grpo_loss_fn, **_GRPO_KW)
 
-        for step_idx in range(int(cfg.test_config.step)):
+        num_steps = int(cfg.test_config.step)
+        for step_idx in range(num_steps):
             file_idx = step_idx % len(step_files)
             step_file = step_files[file_idx]
+            if rank == 0:
+                logger.info(
+                    "Starting training step %d/%d (0-based index %d), data file=%s",
+                    step_idx + 1,
+                    num_steps,
+                    step_idx,
+                    os.path.abspath(step_file),
+                )
 
             record = _run_single_step(
                 engine=engine,
@@ -685,13 +682,15 @@ def main(argv: list[str] | None = None) -> None:
             if rank == 0:
                 with open(stats_path, "a") as fp:
                     fp.write(json.dumps(record) + "\n")
-                print(
-                    f"[step {step_idx:03d}] file={os.path.basename(step_file)} "
-                    f"loss={record['loss']:.6f} "
-                    f"grad_norm(max)={record['grad_norm_max']:.4f} "
-                    f"elapsed(max)={record['elapsed_s_max']:.2f}s "
-                    f"peak_mem(max)={record['peak_mem_mib_max']:.1f}MiB",
-                    flush=True,
+                logger.info(
+                    "Step %03d done: file=%s loss=%.6f grad_norm(max)=%.4f "
+                    "elapsed(max)=%.2fs peak_mem(max)=%.1fMiB",
+                    step_idx,
+                    os.path.basename(step_file),
+                    record["loss"],
+                    record["grad_norm_max"],
+                    record["elapsed_s_max"],
+                    record["peak_mem_mib_max"],
                 )
 
         if cfg.test_config.save_diff:

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # The following code is adapted with minor modifications from
 # https://github.com/Whisper-6/DynamicTreeAttn/blob/main/trie.py.
 import random
@@ -35,7 +37,7 @@ def _get_stats(
             f1_start = lcp_lens[i - 1] if i > 0 else 0
 
             if block_size is None or pop_len <= block_size:
-                f1_end = lcp_lens[i]
+                f1_end = start
                 sum_prefix_len += start
             else:
                 n_blocks = ceil(pop_len / block_size)
@@ -79,10 +81,14 @@ class CompressedTrie:
         Args:
             lens: Length of each sequence, sorted in lexicographic order.
             lcp_lens: LCP length between adjacent sequences, where
-                len(lcp_lens) == len(lens) - 1.
+                len(lcp_lens) == max(len(lens) - 1, 0). An empty `lens`
+                produces a degenerate trie that contains only the root node.
         """
-        if len(lcp_lens) != len(lens) - 1:
-            raise ValueError("len(lcp_lens) must be len(lens) - 1")
+        expected_lcp = max(len(lens) - 1, 0)
+        if len(lcp_lens) != expected_lcp:
+            raise ValueError(
+                f"len(lcp_lens) must be {expected_lcp}, got {len(lcp_lens)}"
+            )
 
         self.nodes: list[CTNode] = []  # Stores all trie nodes.
         self._build(lens, lcp_lens)
@@ -151,6 +157,11 @@ class CompressedTrie:
             self.dfs_chain(child_id, child_order_func)
 
         child_ids = child_order_func(node_id)
+        if not child_ids:
+            # Only reachable for the root of an empty trie. The value never
+            # propagates anywhere since the subtree carries no leaves.
+            node.chain_tail_depth = node.depth
+            return
         node.chain_tail_depth = self.nodes[child_ids[0]].chain_tail_depth
 
     def dfs_get_lens(self, node_id: int, seq_set: set[int]):

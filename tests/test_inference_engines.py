@@ -7,14 +7,13 @@ import torch.distributed as dist
 
 from tests.utils import get_model_path
 
+from areal.api import RolloutWorkflow, WeightUpdateMeta
 from areal.api.cli_args import (
     GenerationHyperparameters,
     InferenceEngineConfig,
     SGLangConfig,
     vLLMConfig,
 )
-from areal.api.io_struct import WeightUpdateMeta
-from areal.api.workflow_api import RolloutWorkflow
 from areal.utils import network
 from areal.utils.data import concat_padded_tensors, get_batch_size
 from areal.utils.hf_utils import load_hf_tokenizer
@@ -25,6 +24,7 @@ MODEL_PATH = get_model_path(
 )
 
 IS_VLLM_INSTALLED = is_available("vllm")
+IS_SGLANG_INSTALLED = is_available("sglang")
 
 
 def _dummy_reward_fn(*args, **kwargs):
@@ -32,7 +32,13 @@ def _dummy_reward_fn(*args, **kwargs):
     return 1.0
 
 
-@pytest.fixture(params=["vllm", "sglang"], scope="module")
+@pytest.fixture(
+    params=[
+        pytest.param("vllm", marks=pytest.mark.vllm),
+        pytest.param("sglang", marks=pytest.mark.sglang),
+    ],
+    scope="module",
+)
 def inference_engine(request):
     """Fixture for remote inference engines only (vLLM and SGLang)."""
     backend = request.param
@@ -51,19 +57,21 @@ def inference_engine(request):
     dist_port = network.find_free_ports(1)[0]
     host = network.gethostip()
 
-    # Configure SGLang
-    sglang_config = SGLangConfig(
-        skip_tokenizer_init=True,
-        model_path=MODEL_PATH,
-        mem_fraction_static=0.2,
-        context_length=128,
-    )
-    sglang_args = SGLangConfig.build_args(
-        sglang_config=sglang_config,
-        tp_size=1,
-        base_gpu_id=0,
-        dist_init_addr=f"{host}:{dist_port}",
-    )
+    # Configure SGLang (only when sglang is installed)
+    sglang_args = None
+    if IS_SGLANG_INSTALLED:
+        sglang_config = SGLangConfig(
+            skip_tokenizer_init=True,
+            model_path=MODEL_PATH,
+            mem_fraction_static=0.2,
+            context_length=128,
+        )
+        sglang_args = SGLangConfig.build_args(
+            sglang_config=sglang_config,
+            tp_size=1,
+            base_gpu_id=0,
+            dist_init_addr=f"{host}:{dist_port}",
+        )
 
     # Configure vLLM
     vllm_config = vLLMConfig(
@@ -81,11 +89,13 @@ def inference_engine(request):
 
     # Launch remote server and initialize engine
     if backend == "vllm":
-        from areal.engine.vllm_remote import RemotevLLMEngine
+        from areal.engine import RemotevLLMEngine
 
         engine_class = RemotevLLMEngine
         server_args = vllm_args
     else:  # sglang
+        if not IS_SGLANG_INSTALLED:
+            pytest.skip("SGLang is not installed")
         from areal.engine.sglang_remote import RemoteSGLangEngine
 
         engine_class = RemoteSGLangEngine
@@ -93,6 +103,7 @@ def inference_engine(request):
 
     # Create engine instance for server management
     temp_config = InferenceEngineConfig(
+        backend="sglang:d1",
         experiment_name=expr_name,
         trial_name=trial_name,
         setup_timeout=360,
@@ -128,9 +139,10 @@ def inference_engine(request):
 @pytest.mark.ci
 def test_rollout(inference_engine, n_samples):
     """Test engine rollout with different sample sizes."""
-    from areal.workflow.rlvr import RLVRWorkflow
+    from areal.workflow import RLVRWorkflow
 
     config = InferenceEngineConfig(
+        backend="sglang:d1",
         experiment_name=inference_engine["expr_name"],
         trial_name=inference_engine["trial_name"],
         max_concurrent_rollouts=2,
@@ -184,9 +196,10 @@ def test_rollout(inference_engine, n_samples):
 @pytest.mark.ci
 def test_staleness_control(inference_engine, bs, ofp, n_samples):
     """Test engine staleness control mechanism."""
-    from areal.workflow.rlvr import RLVRWorkflow
+    from areal.workflow import RLVRWorkflow
 
     config = InferenceEngineConfig(
+        backend="sglang:d1",
         experiment_name=inference_engine["expr_name"],
         trial_name=inference_engine["trial_name"],
         consumer_batch_size=bs,
@@ -248,9 +261,10 @@ def test_staleness_control(inference_engine, bs, ofp, n_samples):
 @pytest.mark.ci
 def test_wait_for_task(inference_engine):
     """Test wait_for_task functionality with real inference engines."""
-    from areal.workflow.rlvr import RLVRWorkflow
+    from areal.workflow import RLVRWorkflow
 
     config = InferenceEngineConfig(
+        backend="sglang:d1",
         experiment_name=inference_engine["expr_name"],
         trial_name=inference_engine["trial_name"],
         max_concurrent_rollouts=8,
@@ -326,9 +340,9 @@ def test_disk_update_weights_from_fsdp_engine(tmp_path_factory, inference_engine
     """Test disk-based weight updates from FSDP engine to inference engine."""
 
     # setup FSDP engine
+    from areal.api import FinetuneSpec
     from areal.api.cli_args import OptimizerConfig, TrainEngineConfig
-    from areal.api.io_struct import FinetuneSpec
-    from areal.engine.fsdp_engine import FSDPEngine
+    from areal.engine import FSDPEngine
 
     os.environ["WORLD_SIZE"] = "1"
     os.environ["RANK"] = "0"
@@ -337,6 +351,7 @@ def test_disk_update_weights_from_fsdp_engine(tmp_path_factory, inference_engine
     os.environ["MASTER_PORT"] = "7777"
 
     engine_config = TrainEngineConfig(
+        backend="fsdp:d1",
         experiment_name=inference_engine["expr_name"],
         trial_name=inference_engine["trial_name"],
         path=MODEL_PATH,
@@ -363,6 +378,7 @@ def test_disk_update_weights_from_fsdp_engine(tmp_path_factory, inference_engine
         name_resolve.reconfigure(name_resolve_config)
 
         config = InferenceEngineConfig(
+            backend="sglang:d1",
             experiment_name=inference_engine["expr_name"],
             trial_name=inference_engine["trial_name"],
         )

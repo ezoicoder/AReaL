@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import time
 from collections import defaultdict
@@ -13,12 +15,12 @@ from ray.util.placement_group import (
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from areal.api import Job, Scheduler, Worker
 from areal.api.cli_args import (
     BaseExperimentConfig,
     SchedulingSpec,
     SchedulingStrategyType,
 )
-from areal.api.scheduler_api import Job, Scheduler, Worker
 from areal.infra.rpc.ray_rpc_server import RayRPCServer
 from areal.infra.scheduler.exceptions import (
     EngineCallError,
@@ -37,6 +39,7 @@ from areal.infra.utils.ray_placement_group import (
     ray_resource_type,
 )
 from areal.utils import logging
+from areal.utils.offload import get_tms_env_vars
 
 logger = logging.getLogger("RayScheduler")
 
@@ -61,6 +64,9 @@ class RayScheduler(Scheduler):
     ):
         self.exp_config = exp_config
         self.startup_timeout = startup_timeout
+        self.enable_tms_offload = False
+        if exp_config is not None:
+            self.enable_tms_offload = exp_config.enable_offload
 
         self._workers: dict[str, list[RayWorkerInfo]] = defaultdict(list)
         self._worker_info_by_id: dict[str, RayWorkerInfo] = {}
@@ -120,6 +126,8 @@ class RayScheduler(Scheduler):
         if spec.env_vars:
             additional_envs_str = ",".join(f"{k}={v}" for k, v in spec.env_vars.items())
         env = get_env_vars(additional_envs_str)
+        if self.enable_tms_offload:
+            env.update(get_tms_env_vars())
         thread_env = get_thread_env_vars(
             cpus_per_task=spec.cpu,
             existing_env_vars=spec.env_vars,
@@ -543,24 +551,7 @@ class RayScheduler(Scheduler):
         """Fork new worker processes from existing workers.
 
         Creates new Ray actors colocated with existing workers of the target role.
-        The forked workers share the same placement groups as their target workers.
-
-        Note: The `command` parameter is ignored for RayScheduler since Ray actors
-        always run the RayRPCServer. For custom module behavior, use LocalScheduler.
-
-        Parameters
-        ----------
-        role : str
-            Role name for the new forked workers (e.g., "proxy")
-        target_role : str
-            Role of existing workers to fork from (e.g., "rollout")
-        command : str, optional
-            Custom module path (ignored for Ray - Ray actors always run RayRPCServer)
-
-        Returns
-        -------
-        list[str]
-            List of worker IDs created (e.g., ["proxy/0", "proxy/1"])
+        The ``command`` parameter is ignored — Ray actors always run RayRPCServer.
         """
         if command is not None:
             logger.warning(
@@ -649,6 +640,7 @@ class RayScheduler(Scheduler):
         method: str,
         engine_name: str | None = None,
         *args,
+        rpc_meta: dict[str, Any] | None = None,
         http_timeout: float = 7200.0,
         max_retries: int = 3,
         retry_delay: float = 1.0,
@@ -664,7 +656,11 @@ class RayScheduler(Scheduler):
             try:
                 # Pass engine_name to support multiple engines per worker (colocation)
                 ref = wi.actor.call.remote(
-                    method, *args, engine_name=engine_name, **kwargs
+                    method,
+                    *args,
+                    engine_name=engine_name,
+                    rpc_meta=rpc_meta,
+                    **kwargs,
                 )
                 result = ray.get(ref, timeout=http_timeout)
                 if attempt > 1:
@@ -704,6 +700,7 @@ class RayScheduler(Scheduler):
         method: str,
         engine_name: str | None = None,
         *args,
+        rpc_meta: dict[str, Any] | None = None,
         http_timeout: float = 7200.0,
         max_retries: int = 3,
         retry_delay: float = 1.0,
@@ -719,7 +716,11 @@ class RayScheduler(Scheduler):
             try:
                 # Pass engine_name to support multiple engines per worker (colocation)
                 ref = wi.actor.call.remote(
-                    method, *args, engine_name=engine_name, **kwargs
+                    method,
+                    *args,
+                    engine_name=engine_name,
+                    rpc_meta=rpc_meta,
+                    **kwargs,
                 )
                 result = await ref
                 if attempt > 1:

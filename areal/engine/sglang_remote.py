@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import subprocess
 import sys
@@ -10,25 +12,28 @@ import numpy as np
 import pybase64
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from areal.api.cli_args import InferenceEngineConfig, PerfTracerConfig, SGLangConfig
-from areal.api.engine_api import InferenceEngine
-from areal.api.io_struct import (
-    HttpGenerationResult,
-    HttpRequest,
+from areal.api import (
+    InferenceEngine,
     LocalInfServerInfo,
     ModelRequest,
     ModelResponse,
     ParamSpec,
+    Scheduler,
     WeightUpdateMeta,
+    WorkflowLike,
+)
+from areal.api.cli_args import InferenceEngineConfig, PerfTracerConfig, SGLangConfig
+from areal.api.io_struct import (
+    HttpGenerationResult,
+    HttpRequest,
     WeightUpdateRequests,
     get_versioned_lora_name,
 )
-from areal.api.scheduler_api import Scheduler
-from areal.api.workflow_api import WorkflowLike
 from areal.infra import RemoteInfEngine, RolloutController, WorkflowExecutor
 from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
 from areal.utils import perf_tracer, stats_tracker
+from areal.utils.network import format_host_for_url
 
 
 class SGLangBackend:
@@ -184,17 +189,18 @@ class SGLangBackend:
         self, addr: str, server_idx: int, meta: WeightUpdateMeta
     ) -> HttpRequest:
         """Build SGLang init weights group request."""
-        assert meta.alloc_mode is not None
-        if meta.alloc_mode.gen.pp_size != 1:
+        assert meta.gen_allocation is not None
+        gen_parallel = meta.gen_allocation.parallel
+        if gen_parallel.pp_size != 1:
             raise NotImplementedError(
                 "NCCL weight update with PP size > 1 is not implemented yet."
             )
-        rank_offset = 1 + server_idx * meta.alloc_mode.gen.tp_size
+        rank_offset = 1 + server_idx * gen_parallel.tp_size
         payload = {
-            "master_address": meta.nccl_master_address,
+            "master_address": format_host_for_url(meta.nccl_master_address),
             "master_port": str(meta.nccl_master_port),
             "rank_offset": rank_offset,
-            "world_size": meta.alloc_mode.gen.world_size + 1,
+            "world_size": gen_parallel.world_size + 1,
             "backend": current_platform.communication_backend,
             "group_name": meta.nccl_group_name,
         }

@@ -16,12 +16,11 @@ import torch.distributed as dist
 
 from tests.utils import get_model_path
 
-from areal.api.alloc_mode import ParallelStrategy
+from areal.api import FinetuneSpec, ParallelStrategy
 from areal.api.cli_args import (
     MicroBatchSpec,
     TrainEngineConfig,
 )
-from areal.api.io_struct import FinetuneSpec
 from areal.experimental.engine.archon_engine import ArchonEngine
 from areal.infra.platforms import current_platform
 from areal.utils.data import tensor_container_to
@@ -82,6 +81,7 @@ def mock_input(
 def make_engine_with_cp(model_type: str, mb_spec: MicroBatchSpec, cp_size: int):
     """Create and initialize an ArchonEngine with Context Parallelism."""
     config = TrainEngineConfig(
+        backend=f"archon:c{cp_size}",
         experiment_name="test_archon_cp_forward",
         trial_name="test",
         path=MODEL_PATHS[model_type],
@@ -110,6 +110,7 @@ def make_engine_with_cp(model_type: str, mb_spec: MicroBatchSpec, cp_size: int):
 def make_engine_no_cp(model_type: str, mb_spec: MicroBatchSpec):
     """Create and initialize an ArchonEngine without CP (for golden comparison)."""
     config = TrainEngineConfig(
+        backend="archon:d1",
         experiment_name="test_archon_cp_forward_golden",
         trial_name="test",
         path=MODEL_PATHS[model_type],

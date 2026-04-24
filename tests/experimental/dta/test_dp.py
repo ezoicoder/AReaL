@@ -84,6 +84,24 @@ def test_lb_by_dfs_and_tm_assigns_all_sequences_once():
     _assert_partition_valid(bins, n_items=len(token_seqs), k=2)
 
 
+def test_lb_by_dfs_and_tm_k1_returns_single_non_empty_bin():
+    """K=1 should place all sequences in the only bucket."""
+    token_seqs = _make_seqs()
+    config = SimpleNamespace(K=1, mode="backward", block_size=2)
+    bins = LB_by_DFS_and_TM(token_seqs, TreeTokenTimeModel(), config)
+
+    assert len(bins) == 1
+    assert sorted(bins[0]) == list(range(len(token_seqs)))
+
+
+def test_lb_by_dfs_and_tm_empty_returns_k_empty_bins():
+    """Empty input should return K empty bins without entering search."""
+    config = SimpleNamespace(K=3, mode="backward", block_size=2)
+    bins = LB_by_DFS_and_TM([], TreeTokenTimeModel(), config)
+
+    assert bins == [[], [], []]
+
+
 def test_pred_time_rejects_unsupported_mode():
     """pred_time should fail fast on unknown scheduling mode."""
     token_trie = TokenTrie(_make_seqs())
@@ -95,3 +113,32 @@ def test_pred_time_rejects_unsupported_mode():
         assert "Unsupported mode" in str(exc)
     else:
         raise AssertionError("pred_time should raise ValueError for invalid mode")
+
+
+def test_lb_by_n_tokens_empty_returns_k_empty_bins():
+    """LB_by_n_tokens on an empty input should yield K empty bins."""
+    bins = LB_by_n_tokens([], K=3)
+    assert bins == [[], [], []]
+
+
+def test_lb_by_tm_empty_returns_k_empty_bins():
+    """LB_by_TM should survive empty inputs now that CompressedTrie does."""
+    config = SimpleNamespace(K=3, mode="backward", block_size=2)
+    bins = LB_by_TM([], ConstantTimeModel(), config)
+    assert bins == [[], [], []]
+
+
+def test_pred_time_on_empty_trie_returns_finite_value():
+    """pred_time should work on an empty compressed trie."""
+    trie = TokenTrie([])
+    compressed_trie = CompressedTrie(trie.lens, trie.lcp_lens)
+
+    forward_time = pred_time(
+        compressed_trie, ConstantTimeModel(), mode="forward", block_size=None
+    )
+    backward_time = pred_time(
+        compressed_trie, ConstantTimeModel(), mode="backward", block_size=2
+    )
+
+    assert isinstance(forward_time, float)
+    assert isinstance(backward_time, float)

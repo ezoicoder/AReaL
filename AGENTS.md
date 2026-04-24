@@ -8,9 +8,9 @@
 
 ```bash
 # Environment
-uv sync --extra cuda            # dependencies (or `uv sync` without CUDA)
+uv sync --extra cuda            # CUDA + SGLang inference (default); for vLLM: cp pyproject.vllm.toml pyproject.toml && cp uv.vllm.lock uv.lock && uv sync --extra cuda
 source .venv/bin/activate        # activate venv BEFORE pre-commit or git commit if venv exists
-pre-commit install               # formatting hooks (Ruff, mdformat, clang-format, nbstripout, autoflake)
+pre-commit install --install-hooks  # hooks: Ruff, clang-format, mdformat, nbstripout, conventional-commits
 pre-commit run --all-files       # lint + format everything
 
 # Tests
@@ -18,6 +18,11 @@ uv run pytest tests/test_<topic>.py
 
 # CLI docs
 uv run python docs/generate_cli_docs.py
+
+# Docs build (canonical, release-aligned)
+./docs/build_all.sh
+# Do NOT use `jupyter-book build docs/en|docs/zh` directly for final preview/release,
+# because it skips AReaL-specific static setup and output packaging.
 ```
 
 **Hard rules** -- never violate:
@@ -34,8 +39,9 @@ uv run python docs/generate_cli_docs.py
 - Run `pre-commit run --all-files` before committing.
 - Follow existing code patterns in the same module.
 - Add tests for new functionality.
-- Use the `question` tool (structured options) when asking the user for decisions or
-  clarifications.
+- Ask for decisions and clarifications with short, structured options instead of broad
+  open-ended questions. Use the platform's native question/clarification tool if
+  available.
 
 **Ask first** before:
 
@@ -118,8 +124,23 @@ step-by-step implementation guides.
 | Unit tests                   | --                 | `add-unit-tests`    |
 | Distributed debugging        | --                 | `debug-distributed` |
 
-**How to fire an expert**:
-`task(subagent_type="fsdp-expert", load_skills=[], run_in_background=true, prompt="...")`
+**How to invoke experts and skills** (platform-specific):
+
+| Platform | Fire expert subagent                                                               | Load skill                                         |
+| -------- | ---------------------------------------------------------------------------------- | -------------------------------------------------- |
+| OpenCode | `task(subagent_type="<name>", load_skills=[], run_in_background=true, prompt="…")` | `skill(name="<name>")` or `load_skills=["<name>"]` |
+| Codex    | Invoke registered subagent by canonical name (see `.codex/config.toml`)            | Reference `.agents/skills/<name>/SKILL.md`         |
+
+**Harness layout**:
+
+| Component         | OpenCode                                | Codex                                                  |
+| ----------------- | --------------------------------------- | ------------------------------------------------------ |
+| Root instructions | `AGENTS.md`                             | `AGENTS.md`                                            |
+| Agent configs     | `.opencode/agents/*.md` (frontmatter)   | `.codex/config.toml` + `.codex/agents/*.toml` + `*.md` |
+| Skills            | `.opencode/skills/` + `.agents/skills/` | `.agents/skills/<name>/SKILL.md`                       |
+
+Directly executable workflows (both platforms): `add-workflow`, `review-pr`,
+`create-pr`, `translate-doc-zh`.
 
 ______________________________________________________________________
 
@@ -179,7 +200,7 @@ ______________________________________________________________________
 | OOM           | Unsharded tensor on wrong device | Verify DTensor placements |
 
 Debug env vars: `TORCH_DISTRIBUTED_DEBUG=DETAIL`, `NCCL_DEBUG=INFO`,
-`CUDA_LAUNCH_BLOCKING=1`. See `/debug-distributed` skill for comprehensive guide.
+`CUDA_LAUNCH_BLOCKING=1`. See the `debug-distributed` skill for the full workflow.
 
 ______________________________________________________________________
 
@@ -211,17 +232,18 @@ ______________________________________________________________________
 ## Collaboration & review
 
 - **Branches**: kebab-case (`feature/multi-turn-metrics`, `bugfix/fsdp-weight-sync`).
-- **Commits**: Conventional Commits (`feat:`, `fix:`, `docs:`), ~72 char subject,
-  imperative voice. Squash WIP before PR.
+- **Commits**: Conventional Commits (e.g., `feat:`, `fix:`, `docs:`, `gov:`), ~72 char
+  subject, imperative voice. Squash WIP before PR.
 - **Pre-merge**: full pre-commit stack; doc-only edits need at least `mdformat --check`.
 - **PRs**: tie to issue, highlight risk areas, list test commands executed, note skipped
   suites with reasons.
 
-| Command / Skill      | Purpose                                              |
-| -------------------- | ---------------------------------------------------- |
-| `/create-pr`         | Rebase, squash, create PR                            |
-| `commit-conventions` | Commit message conventions (auto-triggers on commit) |
-| `/review-pr`         | Dynamic agent-allocated PR review                    |
+| Skill                | Purpose                                                |
+| -------------------- | ------------------------------------------------------ |
+| `create-pr`          | Rebase, squash, and create or update a PR              |
+| `commit-conventions` | Commit message conventions to load before `git commit` |
+| `review-pr`          | Dynamic PR review with targeted expert consultation    |
+| `translate-doc-zh`   | Translate English docs to Chinese                      |
 
 ______________________________________________________________________
 

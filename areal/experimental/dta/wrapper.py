@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -60,6 +62,8 @@ class DTAWrapper:
 
         output = self._engine.forward(model=self.model, token_trie=trie)
         batch_size = len(output)
+        if batch_size == 0:
+            return torch.zeros((0, 0), dtype=torch.float32, device=self.device)
         output_padded = torch.zeros(
             (batch_size, max_seq_len),
             dtype=output[0].dtype,
@@ -116,13 +120,17 @@ class DTAWrapper:
             logprobs: torch.Tensor,
             entropy: torch.Tensor,
             seq_input_data: dict[str, Any],
+            **extra_kwargs: Any,
         ) -> torch.Tensor:
             # Keep current behavior: DTA engine expects one extra position.
             logprobs = torch.cat([logprobs, logprobs.new_zeros(1)], dim=0)
-            return (
-                loss_fn(logprobs, entropy, seq_input_data["original"])
-                * seq_input_data["scale"]
+            loss_val = loss_fn(
+                logprobs,
+                entropy,
+                seq_input_data["original"],
+                **extra_kwargs,
             )
+            return loss_val * seq_input_data["scale"]
 
         return self.run_backward(
             input_ids_batch=input_ids_batch,

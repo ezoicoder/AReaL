@@ -9,8 +9,8 @@
 | `compare_training_dumps.py`   | 离线对拍脚本，比较两个 dump 目录的 per-step loss 与 `diff.pt` 差异   |
 | `archon_training_test.yaml`   | 示例配置                                                             |
 
-目标场景：在同一份配置上跑两次（比如 DTA 开启 vs 关闭、或两种 `partition_mode`）， 然后用 `compare_training_dumps.py` 做
-"对拍"，验证训练逻辑的等价性 / 回归性。
+目标场景：在同一份配置上跑两次（比如 DTA 开启 vs 关闭、或两种 rollout `packing_algorithm`：`ffd`/`kk`/`dta`）， 然后用
+`compare_training_dumps.py` 做 "对拍"，验证训练逻辑的等价性 / 回归性。
 
 ______________________________________________________________________
 
@@ -33,45 +33,46 @@ ______________________________________________________________________
 
 ## 2. 配置：`training_test_config.py`
 
-顶层结构 `ArchonTrainingTestConfig` 由三段组成：
+该工具现在只支持：**普通 AReaL YAML + `test_config`**。
 
 ```yaml
-engine:         # AReaL 标准 TrainEngineConfig，全字段可用
-parallel:       # 推荐用 allocation_mode 风格字符串（如 archon:d8）
+experiment_name: xxx
+trial_name: xxx
+cluster:
+  fileroot: xxx
+actor:          # AReaL 标准 actor 段（含 backend）
 test_config:    # 本工具专属的测试参数
 ```
 
+- 不再支持测试专用顶层 `engine`/`parallel`。
+- 并行策略统一从 `actor.backend` 解析（例如 `archon:d8`）。
+
 ### 2.1 `test_config` 字段
 
-| 字段                  | 类型    | 默认值                         | 说明                                                                                        |
-| --------------------- | ------- | ------------------------------ | ------------------------------------------------------------------------------------------- |
-| `step`                | `int`   | 必填（>0）                     | 训练迭代步数；不复用 AReaL 原生 epoch 相关配置                                              |
-| `data_dir`            | `str`   | 必填                           | 放一组 `.pt` 文件的目录，每个文件是 `list[1-D Tensor]` 形式的 `input_ids`；按字典序循环使用 |
-| `disable_optimizer`   | `bool`  | `False`                        | 开启后 engine 不创建优化器、不更新参数，也不分配优化器状态显存                              |
-| `fileroot`            | `str`   | `/storage/openpsi/experiments` | 默认输出根目录；一般无需手动设置                                                            |
-| `prompt_ratio`        | `float` | `0.3`                          | 构造 `loss_mask` 时的 prompt 比例，前 `seq_len*ratio` 个 token mask=0                       |
-| `save_diff`           | `bool`  | `True`                         | 训练结束后在 rank 0 保存 `diff.pt`（参数更新统计）                                          |
-| `save_params`         | `bool`  | `False`                        | 兼容旧字段；低显存模式下忽略，不再导出 `params.pt`                                          |
-| `save_initial_params` | `bool`  | `False`                        | 兼容旧字段；低显存模式下忽略，不再导出 `params_initial.pt`                                  |
-| `seed`                | `int`   | `42`                           | 构造 `advantages`/`logprobs` 等合成字段的随机种子基值                                       |
+| 字段                  | 类型   | 默认值     | 说明                                                                                        |
+| --------------------- | ------ | ---------- | ------------------------------------------------------------------------------------------- |
+| `step`                | `int`  | 必填（>0） | 训练迭代步数；不复用 AReaL 原生 epoch 相关配置                                              |
+| `data_dir`            | `str`  | 必填       | 放一组 `.pt` 文件的目录，每个文件是 `list[1-D Tensor]` 形式的 `input_ids`；按字典序循环使用 |
+| `disable_optimizer`   | `bool` | `False`    | 开启后 engine 不创建优化器、不更新参数，也不分配优化器状态显存                              |
+| `save_diff`           | `bool` | `True`     | 训练结束后在 rank 0 保存 `diff.pt`（参数更新统计）                                          |
+| `save_params`         | `bool` | `False`    | 兼容旧字段；低显存模式下忽略，不再导出 `params.pt`                                          |
+| `save_initial_params` | `bool` | `False`    | 兼容旧字段；低显存模式下忽略，不再导出 `params_initial.pt`                                  |
+| `seed`                | `int`  | `42`       | 构造 `advantages`/`logprobs` 等合成字段的随机种子基值                                       |
 
 ### 2.2 配置加载器做了什么
 
 - 使用 OmegaConf 做 YAML 读取 + dotlist 覆盖（`test_config.step=5`、
-  `engine.mb_spec.max_tokens_per_mb=8192` 等语法）。
-- `parallel` 支持两种写法：
-  - 字符串：复用 `AllocationMode.from_str`（推荐），例如 `archon:d8` 或 `sglang:d16+archon:d8`；
-  - 映射：`data_parallel_size/tensor_parallel_size/...`（legacy）。
+  `actor.mb_spec.max_tokens_per_mb=8192` 等语法）。
+- 并行策略固定从 `actor.backend` 读取并解析（复用 `AllocationMode.from_str`）。
 - 训练 backend 当前只允许 `archon`；如果字符串解析成 `fsdp`/`megatron` 会直接报错。
-- 输出目录固定自动推导为
-  `/storage/openpsi/experiments/<exp>/<tree_training_mode>_<parallel_tag>_<model_name>`，
-  便于直接区分实验组合。
-- 默认 `fileroot` 为 `/storage/openpsi/experiments`；可通过 `test_config.fileroot` 覆盖。
+- 输出目录自动对齐普通训练日志根目录：
+  `<fileroot>/logs/<user>/<exp>/<trial>/<tree_training_mode>_<parallel_tag>_<model_name>`。
+- `fileroot` 优先级：`stats_logger.fileroot > cluster.fileroot`。
 - 手写了一个 dataclass 构造器 `_build_dataclass` / `_coerce_value`，递归把 `DictConfig` 子节点塞进
   `TrainEngineConfig` 等结构。原因是 `OmegaConf.structured(TrainEngineConfig)` 会在
   `Literal[...]` 字段 （例如 `tree_training_mode: Literal["disabled", "sparse", "dta"]`）上报
   `ValidationError`。
-- YAML 未出现的字段，保留 dataclass 默认值；出现未知字段会立即抛 `TypeError` 以便早发现拼写错误。
+- `actor` 中 `TrainEngineConfig` 未使用的字段（例如 PPO/GRPO 专属字段）会自动过滤，便于直接复用普通 YAML。
 
 ### 2.3 示例 YAML
 
@@ -79,8 +80,12 @@ test_config:    # 本工具专属的测试参数
 Qwen2.5-0.5B-Instruct + DTA + dp=2 为例）：
 
 ```yaml
-engine:
-  experiment_name: archon_train_test
+experiment_name: archon_train_test
+trial_name: trial0
+cluster:
+  fileroot: /storage/openpsi/experiments
+actor:
+  backend: archon:d2
   path: /storage/openpsi/models/Qwen__Qwen2.5-0.5B-Instruct/
   dtype: bfloat16
   mb_spec:
@@ -94,15 +99,12 @@ engine:
   tree_training_mode: dta        # {disabled, sparse, dta}
   dta_depth: 16384
   dta_block_size: 2048
-  partition_mode: seqlen         # {seqlen, dta}
-
-parallel: archon:d2
+  packing_algorithm: ffd         # rollout {ffd, kk, dta}；与 mb_spec.packing_algorithm 不同
 
 test_config:
   step: 4
   data_dir: ""                   # 必须通过 CLI 覆盖
   disable_optimizer: false
-  prompt_ratio: 0.3
   save_diff: true
   seed: 42
 ```
@@ -126,8 +128,8 @@ torch.save([
 - 序列数量必须 `>= dp_world_size`，否则抛错；多出来的尾巴会按 `len // dp_world_size * dp_world_size` 截断以保证每个
   rank 供给同样多条 `redistribute_trajectories` 预期下的输入。
 
-每条 `input_ids` 会被自动补齐成一个 GRPO 用的 trajectory dict： `attention_mask` 全 1、`loss_mask` 前
-`prompt_ratio` 置 0 后半置 1、 `logprobs/old_logprobs/advantages/rewards/values/prox_logp` 由
+每条 `input_ids` 会被自动补齐成一个 GRPO 用的 trajectory dict： `attention_mask` 全 1、`loss_mask` 前 30%
+token 置 0 后半置 1（当前固定比例）、 `logprobs/old_logprobs/advantages/rewards/values/prox_logp` 由
 `seed + step*100003 + global_idx` 确定，**保证同 step、同条序列在所有 rank 上生成的合成字段一致**。
 
 ______________________________________________________________________
@@ -144,8 +146,18 @@ torchrun --nproc_per_node=$NPROC \
     test_config.data_dir=/path/to/data_dir
 ```
 
-`--config` 后面的参数为 OmegaConf dotlist 覆盖，想改任意 `engine.*` / `parallel.*` / `test_config.*`
-直接写 `key=value` 即可。
+`--config` 后面的参数为 OmegaConf dotlist 覆盖，想改任意 `actor.*` / `test_config.*` 直接写 `key=value`
+即可。
+
+直接复用普通训练 YAML 即可（只额外补 `test_config.*` 覆盖）：
+
+```bash
+torchrun --nproc_per_node=8 \
+    tests/experimental/archon/torchrun/run_archon_training_test.py \
+    --config examples/math/gsm8k_sft_archon_fp8.yaml \
+    test_config.step=4 \
+    test_config.data_dir=/path/to/data_dir
+```
 
 ### 4.2 每一步做的事
 
@@ -153,8 +165,8 @@ torchrun --nproc_per_node=$NPROC \
 
 1. 每个 rank 按 `dp_rank::dp_world_size` 步长选自己的本地子集，用上述合成字段 构造 trajectory dict。
 
-1. `redistribute_trajectories(..., partition_mode=engine.config.partition_mode)`
-   按配置（`seqlen` / `dta`）重新分配到各 rank。
+1. `redistribute_trajectories(..., packing_algorithm=engine.config.packing_algorithm)`
+   按配置（`ffd` / `kk` / `dta`）重新分配到各 rank。
 
 1. `torch.cuda.reset_peak_memory_stats()` → `engine.train_batch(...)` → 计时。
 
@@ -268,13 +280,13 @@ torchrun --nproc_per_node=2 \
     test_config.step=8 \
     test_config.data_dir=/data/token_samples \
     test_config.disable_optimizer=true \
-    engine.tree_training_mode=disabled \
-    engine.partition_mode=seqlen
+    actor.tree_training_mode=disabled \
+    actor.packing_algorithm=ffd
 
 # 对拍
 python tests/experimental/archon/torchrun/compare_training_dumps.py \
-    --dump-a /storage/openpsi/experiments/archon_train_test/dta_d2_Qwen__Qwen2.5-0.5B-Instruct \
-    --dump-b /storage/openpsi/experiments/archon_train_test/disabled_d2_Qwen__Qwen2.5-0.5B-Instruct \
+    --dump-a /storage/openpsi/experiments/logs/$USER/archon_train_test/trial0/dta_d2_Qwen__Qwen2.5-0.5B-Instruct \
+    --dump-b /storage/openpsi/experiments/logs/$USER/archon_train_test/trial0/disabled_d2_Qwen__Qwen2.5-0.5B-Instruct \
     --loss-atol 1e-4 --loss-rtol 1e-4
 ```
 

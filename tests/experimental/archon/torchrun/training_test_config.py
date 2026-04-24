@@ -1,11 +1,15 @@
 """Configuration types + YAML/CLI loader for ArchonEngine training tests.
 
-The runner expects a YAML file with at least these sections:
+The runner accepts regular AReaL YAML plus ``test_config``:
 
 ```yaml
-engine:              # Standard AReaL TrainEngineConfig fields (see cli_args.py).
-  experiment_name: archon_train_test
-  # trial_name is optional in this test loader (defaults to "trial0").
+experiment_name: archon_train_test
+trial_name: trial0
+cluster:
+  fileroot: /storage/openpsi/experiments
+
+actor:               # Standard AReaL TrainEngineConfig/PPOActorConfig fields.
+  backend: archon:d2
   path: /path/to/model
   dtype: bfloat16
   mb_spec:
@@ -15,15 +19,12 @@ engine:              # Standard AReaL TrainEngineConfig fields (see cli_args.py)
     lr: 1e-5
     ...
   tree_training_mode: dta
-  partition_mode: seqlen
-
-parallel: archon:d2 # Or use a mapping with ParallelStrategy fields.
+  packing_algorithm: ffd
 
 test_config:         # Test-only knobs, see ``TestOnlyConfig``.
   step: 4
   data_dir: /path/to/data_dir
   disable_optimizer: false
-  fileroot: /storage/openpsi/experiments
   save_diff: true
 ```
 
@@ -38,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import getpass
 import os
 import re
 import types
@@ -48,8 +50,19 @@ from typing import Any, Union
 
 from omegaconf import DictConfig, OmegaConf
 
-from areal.api.alloc_mode import AllocationMode, ParallelStrategy
+from areal.api.alloc_mode import ParallelStrategy
+from areal.api.alloc_mode import _AllocationMode as AllocationMode
 from areal.api.cli_args import TrainEngineConfig
+from areal.utils.logging import getLogger
+
+_LOGGER = getLogger("TrainingTestConfig")
+
+
+def _log_config_info(msg: str, *args: object) -> None:
+    """Log once per node before process group init (torchrun sets LOCAL_RANK)."""
+    if int(os.environ.get("LOCAL_RANK", "0")) != 0:
+        return
+    _LOGGER.info(msg, *args)
 
 
 @dataclass
@@ -59,8 +72,6 @@ class TestOnlyConfig:
     step: int = -1
     data_dir: str = ""
     disable_optimizer: bool = False
-    fileroot: str = "/storage/openpsi/experiments"
-    prompt_ratio: float = 0.3
     save_diff: bool = True
     save_params: bool = False
     save_initial_params: bool = False
@@ -121,6 +132,7 @@ class ArchonTrainingTestConfig:
     engine: TrainEngineConfig = field(default_factory=TrainEngineConfig)
     parallel: TestParallelConfig = field(default_factory=TestParallelConfig)
     test_config: TestOnlyConfig = field(default_factory=TestOnlyConfig)
+    fileroot: str = ""
 
     @staticmethod
     def _safe_token(value: str, *, fallback: str) -> str:
@@ -139,10 +151,14 @@ class ArchonTrainingTestConfig:
         return os.path.expanduser(os.path.expandvars(path))
 
     def resolve_dump_dir(self) -> str:
-        """Pick a compact dump_dir rooted by experiment name."""
+        """Pick a compact dump_dir under regular training log roots."""
         exp = self._safe_token(
             str(self.engine.experiment_name or "archon_train_test"),
             fallback="archon_train_test",
+        )
+        trial = self._safe_token(
+            str(self.engine.trial_name or "trial0"),
+            fallback="trial0",
         )
         tree_mode = self._safe_token(
             str(getattr(self.engine, "tree_training_mode", "unknown") or "unknown"),
@@ -154,10 +170,18 @@ class ArchonTrainingTestConfig:
         )
         leaf = f"{tree_mode}_{parallel_tag}_{model_name}"
 
-        if self.test_config.fileroot:
-            base = Path(self._expand_path(self.test_config.fileroot)) / exp
+        if self.fileroot:
+            # Align with AReaL StatsLogger layout:
+            # <fileroot>/logs/<user>/<experiment>/<trial>
+            base = (
+                Path(self._expand_path(self.fileroot))
+                / "logs"
+                / getpass.getuser()
+                / exp
+                / trial
+            )
         else:
-            base = Path.cwd() / exp
+            base = Path.cwd() / exp / trial
         return str(base / leaf)
 
 
@@ -250,13 +274,34 @@ def _build_dataclass(cls: type, data: dict[str, Any]) -> Any:
     return cls(**init_kwargs)
 
 
-def _build_engine_config(section: Any) -> TrainEngineConfig:
-    """Build a :class:`TrainEngineConfig` from a YAML section dict."""
-    data = _as_dict(section)
-    # Keep test YAML concise: allow omitting experiment/trial names.
-    data.setdefault("experiment_name", "archon_train_test")
-    data.setdefault("trial_name", "trial0")
-    return _build_dataclass(TrainEngineConfig, data)
+def _build_engine_config_from_actor(actor_section: Any) -> TrainEngineConfig:
+    """Project actor config onto ``TrainEngineConfig`` fields only."""
+    actor_data = _as_dict(actor_section)
+    train_fields = {f.name for f in dataclasses.fields(TrainEngineConfig) if f.init}
+    engine_data = {k: v for k, v in actor_data.items() if k in train_fields}
+    return _build_dataclass(TrainEngineConfig, engine_data)
+
+
+def _build_engine_config(
+    actor_section: Any, merged_cfg: DictConfig
+) -> TrainEngineConfig:
+    """Build ``TrainEngineConfig`` from top-level ``actor`` section only."""
+    top_exp = merged_cfg.get("experiment_name") if merged_cfg is not None else None
+    top_trial = merged_cfg.get("trial_name") if merged_cfg is not None else None
+    default_exp = str(top_exp or "archon_train_test")
+    default_trial = str(top_trial or "trial0")
+
+    if actor_section is None:
+        raise ValueError("Missing required top-level 'actor' section in config YAML.")
+    actor_data = _as_dict(actor_section)
+    actor_data.setdefault("experiment_name", default_exp)
+    actor_data.setdefault("trial_name", default_trial)
+    cfg = _build_engine_config_from_actor(actor_data)
+
+    _log_config_info(
+        "Resolved TrainEngineConfig from top-level 'actor' section.",
+    )
+    return cfg
 
 
 def _parallel_strategy_to_test_config(strategy: ParallelStrategy) -> TestParallelConfig:
@@ -312,6 +357,20 @@ def _build_parallel_config(section: Any) -> TestParallelConfig:
     return TestParallelConfig(**_as_dict(section))
 
 
+def _resolve_output_fileroot(merged: DictConfig) -> str:
+    """Resolve output fileroot with priority: stats_logger > cluster."""
+    stats_logger = _as_dict(merged.get("stats_logger") if merged else None)
+    stats_logger_fileroot = stats_logger.get("fileroot")
+    if stats_logger_fileroot:
+        return str(stats_logger_fileroot)
+
+    cluster = _as_dict(merged.get("cluster") if merged else None)
+    cluster_fileroot = cluster.get("fileroot")
+    if cluster_fileroot:
+        return str(cluster_fileroot)
+    return ""
+
+
 def load_training_test_config(
     argv: list[str] | None = None,
 ) -> tuple[ArchonTrainingTestConfig, str]:
@@ -332,14 +391,35 @@ def load_training_test_config(
 
     merged = _merge_yaml_and_overrides(str(config_path), overrides)
 
-    engine_cfg = _build_engine_config(merged.get("engine") if merged else None)
-    parallel_cfg = _build_parallel_config(merged.get("parallel") if merged else None)
+    if merged and merged.get("engine") is not None:
+        raise ValueError(
+            "This runner only supports regular AReaL YAML + test_config. "
+            "Do not provide top-level 'engine'; use top-level 'actor' instead."
+        )
+    if merged and merged.get("parallel") is not None:
+        raise ValueError(
+            "This runner derives parallel strategy from actor.backend. "
+            "Do not provide top-level 'parallel'."
+        )
+
+    engine_cfg = _build_engine_config(merged.get("actor") if merged else None, merged)
+
+    actor_data = _as_dict(merged.get("actor") if merged else None)
+    actor_backend = actor_data.get("backend")
+    if not actor_backend:
+        raise ValueError("actor.backend is required and must be a non-empty string.")
+    parallel_section = actor_backend
+    _log_config_info("Resolved 'parallel' from actor.backend=%s", actor_backend)
+    parallel_cfg = _build_parallel_config(parallel_section)
+
     test_cfg = TestOnlyConfig(**_as_dict(merged.get("test_config") if merged else None))
+    fileroot = _resolve_output_fileroot(merged)
 
     cfg = ArchonTrainingTestConfig(
         engine=engine_cfg,
         parallel=parallel_cfg,
         test_config=test_cfg,
+        fileroot=fileroot,
     )
     return cfg, str(config_path)
 

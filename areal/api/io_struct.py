@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import os
 import subprocess
@@ -11,7 +13,7 @@ import torch.distributed as dist
 from PIL.Image import Image as ImageObject
 from transformers import PreTrainedTokenizerFast
 
-from areal.api.alloc_mode import AllocationMode
+from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import GenerationHyperparameters
 from areal.infra.platforms import current_platform
 from areal.utils import logging
@@ -163,9 +165,9 @@ def get_versioned_lora_name(lora_name: str, version: int) -> str:
 
 @dataclass
 class WeightUpdateMeta:
-    type: Literal["disk", "nccl"]
+    type: Literal["disk", "xccl", "awex"]
     path: str | None = None
-    alloc_mode: AllocationMode | None = None
+    gen_allocation: ModelAllocation | None = None
 
     nccl_master_address: str | None = None
     nccl_master_port: int | None = None
@@ -228,19 +230,7 @@ class WeightUpdateMeta:
     @classmethod
     def from_megatron_xccl(
         cls,
-        allocation_mode: AllocationMode,
-        weight_chunked_mem_mb: int = 1024,
-    ):
-        return cls(
-            type="xccl",
-            alloc_mode=allocation_mode,
-            weight_chunked_mem_mb=weight_chunked_mem_mb,
-        )
-
-    @classmethod
-    def from_fsdp_xccl(
-        cls,
-        allocation_mode: AllocationMode,
+        gen_allocation: ModelAllocation,
         weight_chunked_mem_mb: int = 1024,
         use_lora: bool = False,
         lora_name: str = "",
@@ -249,8 +239,44 @@ class WeightUpdateMeta:
     ):
         return cls(
             type="xccl",
-            alloc_mode=allocation_mode,
+            gen_allocation=gen_allocation,
             weight_chunked_mem_mb=weight_chunked_mem_mb,
+            use_lora=use_lora,
+            lora_name=lora_name,
+            lora_int_id=lora_int_id,
+            base_model_name=base_model_name,
+        )
+
+    @classmethod
+    def from_fsdp_xccl(
+        cls,
+        gen_allocation: ModelAllocation,
+        weight_chunked_mem_mb: int = 1024,
+        use_lora: bool = False,
+        lora_name: str = "",
+        lora_int_id: int = 1,
+        base_model_name: str = "",
+    ):
+        return cls(
+            type="xccl",
+            gen_allocation=gen_allocation,
+            weight_chunked_mem_mb=weight_chunked_mem_mb,
+            use_lora=use_lora,
+            lora_name=lora_name,
+            lora_int_id=lora_int_id,
+            base_model_name=base_model_name,
+        )
+
+    @classmethod
+    def from_awex(
+        cls,
+        use_lora: bool = False,
+        lora_name: str = "",
+        lora_int_id: int = 1,
+        base_model_name: str = "",
+    ):
+        return cls(
+            type="awex",
             use_lora=use_lora,
             lora_name=lora_name,
             lora_int_id=lora_int_id,
@@ -329,7 +355,7 @@ class LocalInfServerInfo:
 
     host: str
     port: int
-    process: subprocess.Popen
+    process: subprocess.Popen | None
 
 
 @dataclass

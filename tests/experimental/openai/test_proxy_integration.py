@@ -11,19 +11,19 @@ import torch
 
 from tests.utils import get_model_path
 
-from areal.api.alloc_mode import AllocationMode
+from areal.api import LocalInfServerInfo
 from areal.api.cli_args import (
     InferenceEngineConfig,
     SGLangConfig,
 )
-from areal.api.io_struct import LocalInfServerInfo
-from areal.engine.sglang_remote import RemoteSGLangEngine
+from areal.engine import RemoteSGLangEngine
 from areal.infra import RolloutController
 from areal.infra.rpc.rtensor import RTensor
 from areal.infra.scheduler.local import LocalScheduler
 from areal.infra.utils.proc import kill_process_tree
 from areal.utils import network, seeding
 
+pytestmark = pytest.mark.sglang
 # =============================================================================
 # Test Configuration
 # =============================================================================
@@ -160,6 +160,7 @@ class TestProxyIntegration:
         config = InferenceEngineConfig(
             experiment_name=EXPR_NAME,
             trial_name=TRIAL_NAME,
+            backend="sglang:d1",
             max_concurrent_rollouts=2,
             consumer_batch_size=1,
             tokenizer_path=get_test_model_path(),
@@ -181,7 +182,6 @@ class TestProxyIntegration:
 
             rollout.initialize(
                 role="rollout",
-                alloc_mode=AllocationMode.from_str("sglang:d1"),
                 server_infos=[server_info],
             )
 
@@ -206,11 +206,13 @@ class TestProxyIntegration:
                 workflow="tests.experimental.openai.utils.SimpleAgent",
             )
 
-            # Verify result structure
-            assert isinstance(result, dict)
-            assert "input_ids" in result
-            assert isinstance(result["input_ids"], RTensor)
-            assert result["input_ids"].ndim == 2  # [batch, seq_len]
+            # Verify result structure - rollout_batch now returns list[dict]
+            assert isinstance(result, list)
+            assert len(result) > 0
+            assert isinstance(result[0], dict)
+            assert "input_ids" in result[0]
+            assert isinstance(result[0]["input_ids"], RTensor)
+            assert result[0]["input_ids"].ndim == 2  # [batch, seq_len]
 
         finally:
             rollout.destroy()

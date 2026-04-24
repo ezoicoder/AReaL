@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """LangChain-based math agent implementation for AReaL training.
 
 This module provides math agents using LangChain that integrate with AReaL's
@@ -7,13 +9,12 @@ proxy-based training infrastructure via the AgentWorkflow pattern.
 import math
 import os
 
+from langchain.agents import create_agent
+from langchain.tools import tool
 from langchain_openai import ChatOpenAI
 from math_verify import parse, verify
 
-from langchain.agents import create_agent
-from langchain.tools import tool
-
-from areal.api.reward_api import AsyncRewardWrapper
+from areal.api import AsyncRewardWrapper
 
 
 def math_reward_fn(completions: str, answer: str) -> float:

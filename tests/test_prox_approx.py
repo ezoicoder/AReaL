@@ -259,7 +259,6 @@ class TestProximalApproximationIntegration:
             eps_clip=0.2,
             eps_clip_higher=None,
             c_clip=None,
-            behave_imp_weight_cap=None,
             current_version=5,
             prox_logp_method="recompute",  # Not metrics
         )
@@ -334,13 +333,14 @@ class TestComputeLogpOptimization:
     """
 
     def test_compute_logp_always_returns_tensor(self):
-        """Test that compute_logp() always returns a tensor (no longer returns None)."""
+        """Test that compute_logp() always returns a list of tensors (no longer returns None)."""
         from unittest.mock import MagicMock
 
         from areal.trainer.ppo.actor import PPOActor, PPOActorConfig
 
         # Create config with any method - compute_logp should always return tensor
         config = PPOActorConfig(
+            backend="fsdp:d1",
             use_decoupled_loss=True,
             prox_logp_method="recompute",
         )
@@ -353,16 +353,20 @@ class TestComputeLogpOptimization:
         actor = PPOActor(config, mock_engine)
 
         # Create dummy batch data
-        batch = {
-            "input_ids": torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
-            "attention_mask": torch.ones(1, 4, dtype=torch.bool),
-        }
+        batch = [
+            {
+                "input_ids": torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+                "attention_mask": torch.ones(1, 4, dtype=torch.bool),
+            }
+        ]
 
         # Call compute_logp - should always return tensor
         result = actor.compute_logp(batch)
 
         assert result is not None
-        assert isinstance(result, torch.Tensor)
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert isinstance(result[0], torch.Tensor)
         mock_engine.forward.assert_called_once()
 
     def test_skips_forward_pass_determines_call_decision(self):
@@ -397,6 +401,7 @@ class TestComputeLogpOptimization:
 
         for use_decoupled, method_str, recompute_logprob, expected in test_cases:
             config = PPOActorConfig(
+                backend="fsdp:d1",
                 use_decoupled_loss=use_decoupled,
                 prox_logp_method=method_str,
                 recompute_logprob=recompute_logprob,
@@ -445,7 +450,6 @@ class TestGrpoLossFnNoneHandling:
                 eps_clip=0.2,
                 eps_clip_higher=None,
                 c_clip=None,
-                behave_imp_weight_cap=None,
                 current_version=5,
                 prox_logp_method="recompute",
             )
@@ -479,7 +483,6 @@ class TestGrpoLossFnNoneHandling:
                 eps_clip=0.2,
                 eps_clip_higher=None,
                 c_clip=None,
-                behave_imp_weight_cap=None,
                 current_version=5,
                 prox_logp_method="loglinear",
             )
@@ -509,7 +512,6 @@ class TestGrpoLossFnNoneHandling:
             eps_clip=0.2,
             eps_clip_higher=None,
             c_clip=None,
-            behave_imp_weight_cap=None,
             current_version=5,
             prox_logp_method="loglinear",
         )
@@ -543,7 +545,6 @@ class TestGrpoLossFnNoneHandling:
             eps_clip=0.2,
             eps_clip_higher=None,
             c_clip=None,
-            behave_imp_weight_cap=None,
             current_version=5,
             prox_logp_method="loglinear",
         )
@@ -576,7 +577,6 @@ class TestGrpoLossFnNoneHandling:
             eps_clip=0.2,
             eps_clip_higher=None,
             c_clip=None,
-            behave_imp_weight_cap=None,
             current_version=5,
             prox_logp_method="loglinear",
         )
@@ -602,6 +602,7 @@ class TestEndToEndOptimization:
 
         # Setup: user configuration with optimization enabled (loglinear skips forward)
         config = PPOActorConfig(
+            backend="fsdp:d1",
             use_decoupled_loss=True,
             prox_logp_method="loglinear",
             recompute_logprob=False,
@@ -647,6 +648,7 @@ class TestEndToEndOptimization:
 
         for method_str, should_call, desc in test_cases:
             config = PPOActorConfig(
+                backend="fsdp:d1",
                 use_decoupled_loss=True,
                 prox_logp_method=method_str,
             )
@@ -667,9 +669,10 @@ class TestEndToEndOptimization:
             ) or (not config.use_decoupled_loss and config.recompute_logprob)
 
             if should_compute:
-                result = actor.compute_logp(batch)
+                result = actor.compute_logp([batch])
                 assert result is not None, f"Failed: {desc}"
-                assert isinstance(result, torch.Tensor), f"Failed: {desc}"
+                assert isinstance(result, list), f"Failed: {desc}"
+                assert isinstance(result[0], torch.Tensor), f"Failed: {desc}"
                 mock_engine.forward.assert_called_once()
             else:
                 # Caller skips, no call to compute_logp
@@ -697,6 +700,7 @@ class TestConfigValidation:
         valid_methods = PROX_LOGP_METHODS_ALL
         for method in valid_methods:
             config = PPOActorConfig(
+                backend="fsdp:d1",
                 use_decoupled_loss=True,
                 prox_logp_method=method,
             )
@@ -731,7 +735,7 @@ class TestConfigValidation:
         """Test that prox_logp_method has correct default value."""
         from areal.api.cli_args import PPOActorConfig
 
-        config = PPOActorConfig()
+        config = PPOActorConfig(backend="fsdp:d1")
         expected_default = PROX_LOGP_METHOD_RECOMPUTE
         if config.prox_logp_method != expected_default:
             assert False, f"Default should be '{expected_default}'"
@@ -797,7 +801,6 @@ class TestComputeLogpMetricsLogging:
                 eps_clip=0.2,
                 eps_clip_higher=None,
                 c_clip=None,
-                behave_imp_weight_cap=None,
                 current_version=5,
                 prox_logp_method="loglinear",
             )
@@ -850,7 +853,6 @@ class TestComputeLogpMetricsLogging:
                 eps_clip=0.2,
                 eps_clip_higher=None,
                 c_clip=None,
-                behave_imp_weight_cap=None,
                 current_version=5,
                 prox_logp_method="recompute",
             )
@@ -901,7 +903,6 @@ class TestComputeLogpMetricsLogging:
                 eps_clip=0.2,
                 eps_clip_higher=None,
                 c_clip=None,
-                behave_imp_weight_cap=None,
                 current_version=5,
                 prox_logp_method="metrics",
             )
@@ -966,7 +967,6 @@ class TestComputeLogpMetricsLogging:
                 eps_clip=0.2,
                 eps_clip_higher=None,
                 c_clip=None,
-                behave_imp_weight_cap=None,
                 current_version=5,
                 prox_logp_method="metrics",
             )

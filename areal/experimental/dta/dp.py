@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # This code is adapted with minor modifications from
 # https://github.com/Whisper-6/DynamicTreeAttn/blob/main/data_parallel.py.
 # Special thanks to Yuchen Yang for significant contributions to the load-balanced data parallel partitioning algorithm.
@@ -103,15 +105,20 @@ def try_divide(
 def LB_by_DFS_and_TM(token_seqs, time_model, config: SimpleNamespace):
     token_trie = TokenTrie(token_seqs)
     n_leaf_seqs = len(token_trie.inputs)
+    K = config.K
+    if n_leaf_seqs == 0:
+        return [[] for _ in range(K)]
+
     compressed_trie = CompressedTrie(token_trie.lens, token_trie.lcp_lens)
 
-    K = config.K
     R = float(pred_time(compressed_trie, time_model, config.mode, config.block_size))
     L = R / K
     eps = R * 1e-4
 
     divL = [0] * (K + 1)
-    divR = [n_leaf_seqs] * (K + 1)
+    # Maintain a valid initial partition boundary so K==1 (L==R) does not
+    # skip the search and accidentally produce empty bins.
+    divR = [0] + [n_leaf_seqs] * K
 
     while R - L > eps:
         mid = (L + R) / 2.0

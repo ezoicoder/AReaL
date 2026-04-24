@@ -1,11 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
 import getpass
 import os
+from typing import TYPE_CHECKING
 
-from transformers import AutoProcessor, PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizerFast
 
+if TYPE_CHECKING:
+    from transformers import AutoProcessor
+
+from areal.api import FinetuneSpec, SaveLoadMeta, TrainEngine
 from areal.api.cli_args import SaverConfig
-from areal.api.engine_api import TrainEngine
-from areal.api.io_struct import FinetuneSpec, SaveLoadMeta
 from areal.infra import TrainController
 from areal.utils import timeutil
 from areal.utils.async_checkpoint import AsyncCheckpointManager, AsyncMode

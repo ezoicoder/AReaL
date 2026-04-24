@@ -14,10 +14,9 @@ from datasets import load_dataset
 from torch.distributed.tensor import DTensor
 from transformers import AutoModelForCausalLM
 
-from areal.api.alloc_mode import ParallelStrategy
+from areal.api import FinetuneSpec, ParallelStrategy
 from areal.api.cli_args import MicroBatchSpec, OptimizerConfig, TrainEngineConfig
-from areal.api.io_struct import FinetuneSpec
-from areal.engine.fsdp_engine import FSDPLMEngine
+from areal.engine import FSDPLMEngine
 from areal.experimental.engine.archon_engine import ArchonLMEngine
 from areal.infra.platforms import current_platform
 from areal.utils.data import pad_sequences_to_tensors
@@ -152,7 +151,7 @@ def load_hf_model(model_path: str, dtype: torch.dtype = torch.bfloat16):
         model_path,
         torch_dtype=dtype,
         trust_remote_code=True,
-        attn_implementation="sdpa",
+        attn_implementation="flash_attention_2",
     )
     model = model.to(current_platform.device_type)
     model.eval()
@@ -347,6 +346,7 @@ def create_engine_config(
         TrainEngineConfig configured for testing.
     """
     return TrainEngineConfig(
+        backend="fsdp:d1",
         experiment_name=f"test_{engine_type}_grpo",
         trial_name="test",
         path=model_path,

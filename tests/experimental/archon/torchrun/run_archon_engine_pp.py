@@ -31,9 +31,8 @@ from tests.experimental.archon.torchrun.dist_utils import (
 )
 from tests.utils import get_model_path
 
-from areal.api.alloc_mode import ParallelStrategy
+from areal.api import FinetuneSpec, ParallelStrategy
 from areal.api.cli_args import MicroBatchSpec, OptimizerConfig, TrainEngineConfig
-from areal.api.io_struct import FinetuneSpec
 from areal.experimental.engine.archon_engine import ArchonEngine
 
 # Use a small model for testing
@@ -110,6 +109,7 @@ def create_archon_engine(
 ) -> ArchonEngine:
     """Create and initialize ArchonEngine with PP enabled."""
     engine_config = TrainEngineConfig(
+        backend=f"archon:d{dp_size}t{tp_size}p{pp_size}e{ep_size}",
         experiment_name="test-archon-pp",
         trial_name="test0",
         path=model_path,

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 
 from megatron.core.transformer import TransformerConfig
@@ -6,7 +8,7 @@ from megatron.core.transformer.pipeline_parallel_layer_layout import (
 )
 from transformers import PretrainedConfig
 
-from areal.api.alloc_mode import MegatronParallelStrategy
+from areal.api import MegatronParallelStrategy
 from areal.utils import logging
 
 logger = logging.getLogger("MCoreParallel")

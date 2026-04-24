@@ -18,18 +18,18 @@ excellent work in making distributed training accessible through pure PyTorch AP
 
 ## Engine Comparison
 
-| Feature           | FSDPEngine          | MegatronEngine  | ArchonEngine                |
-| ----------------- | ------------------- | --------------- | --------------------------- |
-| Backend           | HuggingFace + FSDP2 | Megatron-Core   | PyTorch-native              |
-| Model Source      | Any HF model        | Megatron models | Custom Archon models        |
-| torch.compile     | Limited             | No              | Yes (default)               |
-| Data Parallel     | FSDP2               | Megatron DP     | FSDP2                       |
-| Tensor Parallel   | PyTorch DTensor     | Megatron TP     | PyTorch DTensor             |
-| Pipeline Parallel | No                  | Yes (VPP)       | Yes (1F1B, I1F1B, IZB, ZBV) |
-| Expert Parallel   | No                  | Full EP/ETP     | Full EP/ETP                 |
-| Context Parallel  | Ulysses SP          | Megatron CP     | Ulysses SP                  |
-| Supported Models  | Any HF              | Via mbridge     | Built-in + User-defined     |
-| Status            | Production          | Production      | Experimental                |
+| Feature           | FSDPEngine          | MegatronEngine           | ArchonEngine                |
+| ----------------- | ------------------- | ------------------------ | --------------------------- |
+| Backend           | HuggingFace + FSDP2 | Megatron-Core            | PyTorch-native              |
+| Model Source      | Any HF model        | Megatron models          | Custom Archon models        |
+| torch.compile     | Limited             | No                       | Yes (default)               |
+| Data Parallel     | FSDP2               | Megatron DP              | FSDP2                       |
+| Tensor Parallel   | PyTorch DTensor     | Megatron TP              | PyTorch DTensor             |
+| Pipeline Parallel | No                  | Yes (VPP)                | Yes (1F1B, I1F1B, IZB, ZBV) |
+| Expert Parallel   | No                  | Full EP/ETP              | Full EP/ETP                 |
+| Context Parallel  | Ulysses SP          | Megatron CP              | Ulysses SP                  |
+| Supported Models  | Any HF              | mbridge/ megatron-bridge | Built-in + User-defined     |
+| Status            | Production          | Production               | Experimental                |
 
 ## Key Features
 
@@ -45,10 +45,10 @@ excellent work in making distributed training accessible through pure PyTorch AP
 
 ## Enabling Archon
 
-To use Archon as your training backend, specify it in the `allocation_mode`:
+To use Archon as your training backend, specify it in the `actor.backend` field:
 
 ```bash
-allocation_mode=sglang:d4+archon:d4
+rollout.backend=sglang:d4 actor.backend=archon:d4
 ```
 
 ### Supported Models
@@ -108,7 +108,7 @@ Basic example:
 
 ```bash
 # Dense model: 4 DP × 2 PP × 2 TP = 16 GPUs
-allocation_mode=sglang:d4t2+archon:d4p2t2
+rollout.backend=sglang:d4t2 actor.backend=archon:d4p2t2
 ```
 
 ### MoE Support
@@ -119,7 +119,7 @@ separate configurations for attention and FFN (expert) modules:
 
 ```bash
 # MoE model with hybrid parallelism
-allocation_mode=sglang:d4t4+archon:(attn:d1p4t2c2|ffn:d1p4t1e4)
+rollout.backend=sglang:d4t4 actor.backend=archon:(attn:d1p4t2c2|ffn:d1p4t1e4)
 ```
 
 This enables
@@ -140,6 +140,8 @@ Archon-specific options are configured under `actor.archon.*`:
 | `use_deterministic_algorithms` | `False`           | Deterministic training for reproducibility (see [below](#deterministic-mode)) |
 
 See [Performance Tuning](#performance-tuning) for detailed guidance on these options.
+
+(performance-tuning)=
 
 ## Performance Tuning
 
@@ -211,6 +213,8 @@ Enable AC debugging to capture detailed information (slower):
 +actor.archon.ac_debug=True
 ```
 
+(deterministic-mode)=
+
 ### Deterministic Mode
 
 Models can exhibit non-deterministic behavior across training runs due to GPU-level
@@ -238,14 +242,14 @@ This sets:
 
 To migrate from FSDPEngine to Archon:
 
-### 1. Update allocation_mode
+### 1. Update actor.backend
 
 ```bash
 # Before (FSDPEngine)
-allocation_mode=sglang:d4t2+fsdp:d8t2
+rollout.backend=sglang:d4t2 actor.backend=fsdp:d8t2
 
 # After (Archon)
-allocation_mode=sglang:d4t2+archon:d8t2
+rollout.backend=sglang:d4t2 actor.backend=archon:d8t2
 ```
 
 ### 2. Configuration Mapping
@@ -289,12 +293,14 @@ cluster:
   n_nodes: 3
   n_gpus_per_node: 8
 
-allocation_mode: sglang:d4t2+archon:d4p2t2
+rollout:
+  backend: "sglang:d4t2"
 
 scheduler:
   type: ray
 
 actor:
+  backend: "archon:d4p2t2"
   path: Qwen/Qwen3-8B
   gradient_checkpointing: true
   archon:
@@ -325,12 +331,14 @@ cluster:
   n_nodes: 4
   n_gpus_per_node: 8
 
-allocation_mode: "sglang:d4t4+archon:(attn:d1p4t2c2|ffn:d1p4t1e4)"
+rollout:
+  backend: "sglang:d4t4"
 
 scheduler:
   type: ray
 
 actor:
+  backend: "archon:(attn:d1p4t2c2|ffn:d1p4t1e4)"
   path: Qwen/Qwen3-30B-A3B
   gradient_checkpointing: true
   archon:
@@ -351,6 +359,8 @@ python3 examples/math/gsm8k_rl.py --config archon_qwen3_moe.yaml
   mode syntax
 - [Fine-tuning Large MoE Models](megatron.md) - MegatronEngine alternative for MoE
   models
+
+(appendix-pipeline-parallelism-memory-guide)=
 
 ## Appendix: Pipeline Parallelism Memory Guide
 
@@ -497,7 +507,10 @@ size:
 ```yaml
 # Before: archon:d2p2 (PP only, OOM)
 # After: archon:d1p2e2 (PP + EP, fits in memory)
-allocation_mode: sglang:d4+archon:d1p2e2
+rollout:
+  backend: "sglang:d4"
+actor:
+  backend: "archon:d1p2e2"
 ```
 
 ### A.6 Activation Checkpointing with PP

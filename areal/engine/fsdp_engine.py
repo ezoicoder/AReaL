@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import dataclasses
@@ -7,7 +9,7 @@ import os
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -41,17 +43,19 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
-from areal.api.alloc_mode import FSDPParallelStrategy, ParallelStrategy
-from areal.api.cli_args import PerfTracerConfig, TrainEngineConfig
-from areal.api.engine_api import InferenceEngine, TrainEngine
-from areal.api.io_struct import (
-    DeviceRuntimeInfo,
+from areal.api import (
     FinetuneSpec,
+    FSDPParallelStrategy,
+    InferenceEngine,
+    ParallelStrategy,
     ParamSpec,
     SaveLoadMeta,
+    TrainEngine,
     WeightUpdateMeta,
+    WorkflowLike,
 )
-from areal.api.workflow_api import WorkflowLike
+from areal.api.cli_args import PerfTracerConfig, TrainEngineConfig
+from areal.api.io_struct import DeviceRuntimeInfo
 from areal.engine.core import (
     aggregate_eval_losses,
     compute_total_loss_weight,
@@ -64,6 +68,7 @@ from areal.engine.core.distributed import (
 from areal.engine.core.model import (
     disable_dropout_in_model,
     is_gemma3_model,
+    is_qwen3_5_model,
     is_qwen3_moe_model,
     is_qwen3_vl_model,
     is_qwen_vl_model,
@@ -75,7 +80,7 @@ from areal.engine.fsdp_utils import (
 )
 from areal.engine.fsdp_utils.checkpoint import DCPState
 from areal.engine.fsdp_utils.grad import fsdp2_clip_grad_norm
-from areal.engine.fsdp_utils.optimizer import AnyPrecisionAdamW
+from areal.engine.fsdp_utils.optimizer import AnyPrecisionAdamW, PerLayerOptimWrapper
 from areal.engine.fsdp_utils.parallel import ParallelHelper, parallelize_model
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.platforms import current_platform
@@ -110,21 +115,23 @@ from areal.utils.data import (
     MicroBatchItem,
     MicroBatchList,
     amend_position_ids,
+    concat_batch,
     pack_tensor_dict,
     pad_mb_list,
+    split_batch,
     split_padded_tensor_dict_into_mb_list,
     unsqueeze_mb_list,
 )
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer, load_hf_tokenizer
-from areal.utils.network import find_free_ports, gethostip
+from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
 from areal.utils.save_load import get_state_dict_from_repo_id_or_path
 
 if TYPE_CHECKING:
+    from areal.api import Scheduler
     from areal.api.cli_args import PPOActorConfig, PPOCriticConfig
-    from areal.api.scheduler_api import Scheduler
 
 
 @dataclasses.dataclass
@@ -156,6 +163,14 @@ class FSDPTrainContext:
         recurse into TrieNode and hit ``RecursionError``).
         """
         return {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
+
+
+@dataclasses.dataclass
+class _PendingWeightUpdateBucket:
+    handles: list[Any]
+    fut: Future[None]
+    named_tensors: list[tuple[str, torch.Tensor]]
+    stream: torch.cuda.Stream | None = None
 
 
 class FSDPEngine(TrainEngine):
@@ -209,6 +224,8 @@ class FSDPEngine(TrainEngine):
                 "tree_training_mode='dta' is only supported by ArchonEngine. "
                 "Please use Archon backend or set tree_training_mode to 'disabled'/'sparse'."
             )
+        self._offload_depth: int = 0
+        self._per_layer_optim_wrapper: PerLayerOptimWrapper | None = None
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
         patch_dist_group_timeout(DIST_GROUP_DEFAULT_TIMEOUT)
@@ -277,6 +294,7 @@ class FSDPEngine(TrainEngine):
         apply_monkey_patch(
             model=self.model,
             ulysses_sp_size=self.parallel_helper.sp_size,
+            shard_vision_across_sp=self.config.fsdp.shard_vision_across_sp,
         )
         # Monkey patch: replace attention's forward() with tree attention.
         patch_fsdp_for_tree_training(enable=self.tree_training_mode == "sparse")
@@ -352,6 +370,19 @@ class FSDPEngine(TrainEngine):
         )
 
         self._create_optimizer(ft_spec)
+
+        if self.config.fsdp.per_layer_optim_step:
+            if self.optimizer_config.type != "adam":
+                raise ValueError(
+                    f"per_layer_optim_step only supports 'adam' optimizer, got '{self.optimizer_config.type}'."
+                )
+            self._per_layer_optim_wrapper = PerLayerOptimWrapper(
+                model=self.model,
+                optimizer=self.optimizer,
+                device_id=self.device,
+                prefetch_layers=self.config.fsdp.optim_step_prefetch_layers,
+            )
+
         self._initialized = True
 
     @property
@@ -381,6 +412,9 @@ class FSDPEngine(TrainEngine):
             del self.optimizer
         if hasattr(self, "model"):
             del self.model
+        if self._per_layer_optim_wrapper is not None:
+            del self._per_layer_optim_wrapper
+            self._per_layer_optim_wrapper = None
         gc.collect()
         current_platform.empty_cache()
         gc.collect()
@@ -430,7 +464,7 @@ class FSDPEngine(TrainEngine):
         workflow: WorkflowLike,
         workflow_kwargs: dict[str, Any] | None = None,
         group_size: int = 1,
-    ) -> dict[str, Any]:
+    ) -> list[dict[str, Any]]:
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.rollout_batch(
             data,
@@ -447,7 +481,7 @@ class FSDPEngine(TrainEngine):
         should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
         group_size: int = 1,
         dynamic_bs: bool = False,
-    ) -> dict[str, Any]:
+    ) -> list[dict[str, Any]]:
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.prepare_batch(
             dataloader,
@@ -460,20 +494,14 @@ class FSDPEngine(TrainEngine):
 
     def update_weights(self, meta: WeightUpdateMeta):
         self._check_rollout_engine_connected()
-        if meta.type == "xccl":
-            assert self.weight_update_group_initialized
-            # In offload mode, wakes up parameters as needed to perform the update.
-            tms_context = (
-                torch_memory_saver.disable()
-                if self.is_offload and not torch.version.hip
-                else nullcontext()
-            )
-            with tms_context:
+        with self._offload_aware_context():
+            if meta.type == "xccl":
+                assert self.weight_update_group_initialized
                 self._update_weights_from_distributed(meta)
-        elif meta.type == "disk":
-            self._update_weights_from_disk(meta)
-        else:
-            raise ValueError(f"Unknown weight update type {meta.type}")
+            elif meta.type == "disk":
+                self._update_weights_from_disk(meta)
+            else:
+                raise ValueError(f"Unknown weight update type {meta.type}")
 
     def set_version(self, version: int):
         self._version = version
@@ -482,26 +510,54 @@ class FSDPEngine(TrainEngine):
         return self._version
 
     def save(self, meta: SaveLoadMeta):
-        if meta.weight_format == "hf":
-            self._save_model_to_hf(meta.path, meta.tokenizer, meta.processor)
-        elif meta.weight_format == "dcp":
-            self._save_to_dcp(meta.path, meta.with_optim)
-        else:
-            raise ValueError(f"Unknown weight format {meta.weight_format}. ")
+        with self._offload_aware_context():
+            if meta.weight_format == "hf":
+                self._save_model_to_hf(meta.path, meta.tokenizer, meta.processor)
+            elif meta.weight_format == "dcp":
+                self._save_to_dcp(meta.path, meta.with_optim)
+            else:
+                raise ValueError(f"Unknown weight format {meta.weight_format}. ")
 
-        if meta.with_optim and meta.weight_format == "hf":
-            self._save_optimizer_state(meta.path)
+            if meta.with_optim and meta.weight_format == "hf":
+                self._save_optimizer_state(meta.path)
 
     def load(self, meta: SaveLoadMeta):
-        if meta.weight_format == "hf":
-            self._load_model_from_hf(meta.path)
-        elif meta.weight_format == "dcp":
-            self._load_from_dcp(meta.path, meta.with_optim)
-        else:
-            raise ValueError(f"Unknown weight format {meta.weight_format}. ")
+        with self._offload_aware_context():
+            if meta.weight_format == "hf":
+                self._load_model_from_hf(meta.path)
+            elif meta.weight_format == "dcp":
+                self._load_from_dcp(meta.path, meta.with_optim)
+            else:
+                raise ValueError(f"Unknown weight format {meta.weight_format}. ")
 
-        if meta.with_optim and meta.weight_format == "hf":
-            self._load_optimizer_state(meta.path)
+            if meta.with_optim and meta.weight_format == "hf":
+                self._load_optimizer_state(meta.path)
+
+            # Checkpoint load replaces optimizer state tensor objects, losing
+            # pinning and normalization established by PerLayerOptimWrapper.__init__.
+            if meta.with_optim and self._per_layer_optim_wrapper is not None:
+                self._per_layer_optim_wrapper.refresh_states()
+
+    @contextmanager
+    def _offload_aware_context(self):
+        """Temporarily onload parameters for offload-unsafe operations.
+
+        Reentrant: nested calls increment depth; only the outermost
+        call performs actual onload/offload transitions.
+        """
+        if not self.is_offload:
+            yield
+            return
+
+        self._offload_depth += 1
+        if self._offload_depth == 1:
+            self.onload()
+        try:
+            yield
+        finally:
+            self._offload_depth -= 1
+            if self._offload_depth == 0:
+                self.offload()
 
     def optimizer_zero_grad(self):
         assert self.optimizer is not None
@@ -523,6 +579,11 @@ class FSDPEngine(TrainEngine):
         if not math.isfinite(grad_norm):
             self.optimizer_zero_grad()
             update_successful = False
+        elif self.config.fsdp.per_layer_optim_step:
+            assert self._per_layer_optim_wrapper is not None
+            with trace_scope("fsdp_engine.step"):
+                self._per_layer_optim_wrapper.step()
+            update_successful = True
         else:
             with trace_scope("fsdp_engine.step"):
                 self.optimizer.step()
@@ -582,15 +643,17 @@ class FSDPEngine(TrainEngine):
 
     def train_batch(
         self,
-        input_: dict[str, Any],
+        input_: list[dict[str, Any]] | dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     ) -> dict[str, float]:
         self._ensure_ready()
         self.optimizer_zero_grad()
 
+        input_batched, _ = self._normalize_batch_input(input_)
+
         # Step 1: Prepare micro-batches
-        mb_list = self._prepare_mb_list(input_).to(self.device)
+        mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
         # Step 2: Compute total loss weight
         total_loss_weight = compute_total_loss_weight(
@@ -619,14 +682,16 @@ class FSDPEngine(TrainEngine):
     @torch.no_grad()
     def eval_batch(
         self,
-        input_: dict[str, Any],
+        input_: list[dict[str, Any]] | dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     ) -> torch.Tensor | None:
         self._ensure_ready()
 
+        input_batched, _ = self._normalize_batch_input(input_)
+
         # Step 1: Prepare micro-batches
-        mb_list = self._prepare_mb_list(input_).to(self.device)
+        mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
         # Step 2: Compute total loss weight
         total_loss_weight = compute_total_loss_weight(
@@ -658,21 +723,33 @@ class FSDPEngine(TrainEngine):
     @torch.no_grad()
     def forward_batch(
         self,
-        input_: dict[str, Any],
+        input_: list[dict[str, Any]] | dict[str, Any],
         output_seqlens: list[int] | None = None,
-        aggregate_fn: Callable[[list[Any]], Any] = torch.cat,
-    ) -> torch.Tensor:
+        aggregate_fn: Callable[[list[torch.Tensor]], torch.Tensor] = torch.cat,
+    ) -> torch.Tensor | list[torch.Tensor]:
         self._ensure_ready()
 
+        input_batched, meta = self._normalize_batch_input(input_)
+
         # Step 1: Prepare sequence lengths
-        cu_seqlens = pack_tensor_dict(input_)["cu_seqlens"]
+        if meta is not None:
+            assert isinstance(input_, list)
+            inferred_seqlens = [d["attention_mask"].shape[-1] for d in input_]
+            if output_seqlens is not None and output_seqlens != inferred_seqlens:
+                raise ValueError(
+                    f"output_seqlens mismatch for list input: "
+                    f"given {output_seqlens}, "
+                    f"inferred {inferred_seqlens} from attention_mask shapes."
+                )
+            output_seqlens = inferred_seqlens
+        cu_seqlens = pack_tensor_dict(input_batched)["cu_seqlens"]
         if output_seqlens is None:
             output_seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).cpu().numpy().tolist()
         assert output_seqlens is not None
         batch_size = len(output_seqlens)
 
         # Step 2: Prepare micro-batches
-        mb_list = self._prepare_mb_list(input_).to(self.device)
+        mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
         # Step 3: Forward using process_output_fn callback, collecting results
         outputs: list[torch.Tensor] = []
@@ -688,16 +765,30 @@ class FSDPEngine(TrainEngine):
         # Step 4: Aggregate and reorder outputs
         if self.tree_training_mode == "sparse":
             return merge_packed_tree_results(outputs, batch_size)
-        return reorder_and_pad_outputs(outputs, output_seqlens, mb_list, aggregate_fn)
+        else:
+            result = reorder_and_pad_outputs(
+                outputs, output_seqlens, mb_list, aggregate_fn
+            )
+
+        if meta is None:
+            return result
+        return split_batch(result, meta)
 
     def export_stats(self) -> dict[str, float]:
-        return stats_tracker.export_all(reduce_group=self.data_parallel_group)
+        with self._offload_aware_context():
+            return stats_tracker.export_all(
+                reduce_group=self.data_parallel_group,
+            )
 
     def offload(self) -> None:
         """Offload model memory to CPU using torch_memory_saver.
 
         Ref: https://github.com/THUDM/slime/blob/main/slime/backends/fsdp_utils/actor.py
         """
+        if not is_tms_enabled():
+            raise RuntimeError(
+                "torch_memory_saver requires `enable_offload=True` in yaml config."
+            )
 
         self.get_device_stats().log("before offload model")
 
@@ -779,12 +870,24 @@ class FSDPEngine(TrainEngine):
 
     def _create_device_model(self):
         current_platform.set_device(int(os.environ["LOCAL_RANK"]))
-        self.device = torch.device(int(os.environ["LOCAL_RANK"]))
+        current_platform.set_numa_affinity(int(os.environ["LOCAL_RANK"]))
+        if current_platform.device_type == "cpu":
+            self.device = torch.device("cpu")
+        else:
+            self.device = torch.device(int(os.environ["LOCAL_RANK"]))
 
         dtype = getattr(torch, self.config.dtype)
 
         if self.config.fsdp.memory_efficient_load:
-            loading_device = "cpu"
+            # Only rank 0 loads on CPU; other ranks use meta device (zero memory)
+            # to avoid CPU OOM when multiple workers share a node.
+            # Weights are broadcast from rank 0 after FSDP sharding in initialize().
+            # Note: meta device optimization only applies to LLM (not VLM), because
+            # VLM uses from_pretrained() which doesn't support meta device context.
+            if not self.is_vision_model and dist.get_rank() != 0:
+                loading_device = "meta"
+            else:
+                loading_device = "cpu"
         else:
             loading_device = current_platform.device_type
 
@@ -830,6 +933,8 @@ class FSDPEngine(TrainEngine):
             model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
+        if self.config.use_kernels:
+            model.use_kernels = True
         self.logger.info(
             f"Model creation and loading time: {time.perf_counter() - tik:.2f}s"
         )
@@ -953,10 +1058,36 @@ class FSDPEngine(TrainEngine):
         if self.parallel_helper.sp_size > 1:
             set_ulysses_sequence_parallel_group(self.sp_group)
 
-    def _get_model_name_parameters(self) -> Iterator[tuple[str, nn.Parameter]]:
+    @staticmethod
+    def _normalize_batch_input(
+        input_: list[dict[str, Any]] | dict[str, Any],
+    ) -> tuple[dict[str, Any], Any | None]:
+        """Normalize list/dict batch input to a single batched dict.
+
+        Returns ``(batched_input, meta)`` where ``meta`` is non-None only when
+        input is list-based and can be used to split forward outputs back into
+        per-trajectory results.
+        """
+        if isinstance(input_, list):
+            return concat_batch(input_)
+        return input_, None
+
+    def _get_model_name_parameters(
+        self, meta: WeightUpdateMeta
+    ) -> Iterator[tuple[str, nn.Parameter]]:
         name_params_iterator = self.model.named_parameters()
         if self.is_vision_model and is_qwen_vl_model(self.model_config.model_type):
             for name, value in name_params_iterator:
+                if meta.gen_allocation.backend == "sglang":
+                    # SGLang 0.5.9 branch
+                    # LLM part: "model.language_model.norm.weight" -> "model.norm.weight"
+                    # Vision part: "model.visual.blocks.5.mlp.gate_proj.weight" -> "visual.blocks.5.mlp.gate_proj.weight"
+                    new_name = name.replace("language_model.", "", 1)
+                    if new_name.startswith("model.visual."):
+                        new_name = new_name.replace("model.", "", 1)
+                    yield new_name, value
+                    continue
+                # vLLM 0.17.0 branch
                 new_name = name.replace("model.", "", 1)
                 if new_name.startswith("language_model."):
                     new_name = new_name.replace(
@@ -1000,14 +1131,15 @@ class FSDPEngine(TrainEngine):
                 tensor = tensor.to(current_platform.device_type)
             return tensor
 
-    def _update_bucket_weights_from_distributed(
+    def _update_bucket_weights_from_distributed_async(
         self,
         meta: WeightUpdateMeta,
         named_tensors: list[tuple[str, nn.Parameter | torch.Tensor]],
-    ):
+        stream: torch.cuda.Stream | None = None,
+    ) -> _PendingWeightUpdateBucket | None:
         # Early exit when chunk size is relatively small
         if not named_tensors:
-            return
+            return None
 
         param_specs = [
             ParamSpec(
@@ -1036,18 +1168,48 @@ class FSDPEngine(TrainEngine):
         fut = self.rollout_engine.update_weights_from_distributed(meta, param_specs)
 
         handles = []
-        for _, tensor in named_tensors:
-            handles.append(
-                dist.broadcast(
-                    tensor, src=0, group=self.weight_update_group, async_op=True
+        if stream is not None:
+            stream.wait_stream(torch.cuda.current_stream())
+            context = torch.cuda.stream(stream)
+        else:
+            context = nullcontext()
+
+        with context:
+            for _, tensor in named_tensors:
+                handles.append(
+                    dist.broadcast(
+                        tensor, src=0, group=self.weight_update_group, async_op=True
+                    )
                 )
-            )
-        for handle in handles:
+
+        return _PendingWeightUpdateBucket(
+            handles=handles,
+            fut=fut,
+            named_tensors=named_tensors,
+            stream=stream,
+        )
+
+    def _wait_pending_weight_update_bucket(
+        self, pending_bucket: _PendingWeightUpdateBucket | None
+    ):
+        if pending_bucket is None:
+            return
+
+        for handle in pending_bucket.handles:
             handle.wait()
 
-        fut.result()
+        pending_bucket.fut.result()
+        pending_bucket.named_tensors.clear()
 
-        named_tensors.clear()
+    def _update_bucket_weights_from_distributed(
+        self,
+        meta: WeightUpdateMeta,
+        named_tensors: list[tuple[str, nn.Parameter | torch.Tensor]],
+    ):
+        pending_bucket = self._update_bucket_weights_from_distributed_async(
+            meta, named_tensors
+        )
+        self._wait_pending_weight_update_bucket(pending_bucket)
 
     def _init_weight_update_from_distributed(self, meta: WeightUpdateMeta):
         assert meta.type == "xccl"
@@ -1061,19 +1223,21 @@ class FSDPEngine(TrainEngine):
         # which blocks creating another TCP store for weight update.
         os.environ["TORCHELASTIC_USE_AGENT_STORE"] = str(False)
         if dist.get_rank() == 0:
-            assert meta.alloc_mode is not None
+            assert meta.gen_allocation is not None
 
             fut = self.rollout_engine.init_weights_update_group(meta)
 
+            gen_world_size = meta.gen_allocation.parallel.world_size
+            init_method = f"tcp://{format_host_for_url(meta.nccl_master_address)}:{meta.nccl_master_port}"
             self.logger.info(
                 f"Initializing weight update group: type={meta.type} "
-                f"init_method=tcp://{meta.nccl_master_address}:{meta.nccl_master_port} "
+                f"init_method={init_method} "
                 f"group={meta.nccl_group_name}"
             )
             self.weight_update_group = init_custom_process_group(
                 backend=current_platform.communication_backend,
-                world_size=meta.alloc_mode.gen.world_size + 1,
-                init_method=f"tcp://{meta.nccl_master_address}:{meta.nccl_master_port}",
+                world_size=gen_world_size + 1,
+                init_method=init_method,
                 rank=0,
                 group_name=meta.nccl_group_name,
                 timeout=DIST_GROUP_DEFAULT_TIMEOUT,
@@ -1083,58 +1247,88 @@ class FSDPEngine(TrainEngine):
 
     @trace_perf("fsdp_engine.update_weights_from_distributed", category="comm")
     def _update_weights_from_distributed(self, meta: WeightUpdateMeta):
-        """Broadcast parameters (chunked) from rank 0 (FSDP2 compatible)."""
+        """Broadcast parameters with single-pending-bucket pipelining."""
 
         # Reset weight weight meta with local info
         meta.nccl_master_address = self.weight_update_master_addr
         meta.nccl_master_port = self.weight_update_master_port
         meta.nccl_group_name = self.weight_update_group_name
 
-        if dist.get_rank() == 0:
+        main_rank = dist.get_rank() == 0
+        if main_rank:
             self.rollout_engine.pause_generation()
 
         dist.barrier(group=self.cpu_group)
 
         weight_chunked_mem_size = meta.weight_chunked_mem_mb * 1024 * 1024
-        main_rank = dist.get_rank() == 0
+        broadcast_stream = None
+
+        if (
+            main_rank
+            and current_platform.device_type == "cuda"
+            and torch.cuda.is_available()
+        ):
+            broadcast_stream = torch.cuda.Stream()
 
         buffer_size = 0
         named_tensors: list[tuple[str, torch.Tensor]] = []
+        pending_bucket: _PendingWeightUpdateBucket | None = None
 
         if self.config.use_lora:
             # For LoRA, only iterate over trainable LoRA parameters
             param_iterator = (
                 (name, param)
-                for name, param in self._get_model_name_parameters()
+                for name, param in self._get_model_name_parameters(meta)
                 if param.requires_grad
             )
         else:
             # For full model, iterate over all parameters
-            param_iterator = self._get_model_name_parameters()
+            param_iterator = self._get_model_name_parameters(meta)
 
-        for name, param in param_iterator:
-            tensor = self._get_full_tensor(param)
+        try:
+            for name, param in param_iterator:
+                # Ranks other than 0 only help to get the full tensor
+                tensor = self._get_full_tensor(param)
+                if not main_rank:
+                    continue
 
-            # Ranks other than 0 only help to get the full tensor
-            if not main_rank:
-                continue
+                tensor_size = tensor.numel() * tensor.element_size()
+                bucket_overflow = (
+                    buffer_size > 0
+                    and tensor_size + buffer_size > weight_chunked_mem_size
+                )
+                if bucket_overflow:
+                    # Only middle buckets need drain+align before the next all-gather.
+                    if pending_bucket is not None:
+                        self._wait_pending_weight_update_bucket(pending_bucket)
+                        pending_bucket = None
 
-            tensor_size = tensor.numel() * tensor.element_size()
+                    pending_bucket = self._update_bucket_weights_from_distributed_async(
+                        meta,
+                        named_tensors,
+                        stream=broadcast_stream,
+                    )
 
-            if tensor_size + buffer_size > weight_chunked_mem_size:
+                    named_tensors = []
+                    buffer_size = 0
+
+                buffer_size += tensor_size
+                named_tensors.append((name, tensor))
+
+            if pending_bucket:
+                self._wait_pending_weight_update_bucket(pending_bucket)
+                pending_bucket = None
+
+            # Process remaining parameters
+            if buffer_size > 0:
                 self._update_bucket_weights_from_distributed(meta, named_tensors)
-                buffer_size = 0
-
-            named_tensors.append((name, tensor))
-            buffer_size += tensor_size
-
-        # Process remaining parameters
-        if named_tensors:
-            self._update_bucket_weights_from_distributed(meta, named_tensors)
+        finally:
+            if main_rank and pending_bucket is not None:
+                self._wait_pending_weight_update_bucket(pending_bucket)
+                pending_bucket = None
 
         dist.barrier(group=self.cpu_group)
-
-        if dist.get_rank() == 0:
+        if main_rank:
             self.rollout_engine.continue_generation()
 
         current_platform.synchronize()
@@ -1145,6 +1339,7 @@ class FSDPEngine(TrainEngine):
         fut = Future()
 
         if dist.get_rank() == 0:
+            self.rollout_engine.pause_generation()
             fut = self.rollout_engine.update_weights_from_disk(meta)
 
         assert meta.path is not None
@@ -1162,6 +1357,7 @@ class FSDPEngine(TrainEngine):
             )
 
             fut.result()
+            self.rollout_engine.continue_generation()
 
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
@@ -1187,9 +1383,9 @@ class FSDPEngine(TrainEngine):
             os.makedirs(path, exist_ok=True)
             self.model.save_pretrained(path, state_dict=state_dict)
             self.model_config.save_pretrained(path)
-            if tokenizer is not None:
+            if tokenizer is not None and not self.config.use_lora:
                 tokenizer.save_pretrained(path)
-            if processor is not None:
+            if processor is not None and not self.config.use_lora:
                 processor.save_pretrained(path)
         dist.barrier(group=self.cpu_group)
 
@@ -1279,6 +1475,13 @@ class FSDPEngine(TrainEngine):
         if is_qwen_vl_model(self.model_config.model_type):
             attn_mask = input_["attention_mask"]
             input_ids = input_["input_ids"]
+            # NOTE: Qwen-VL get_rope_index performs indexed assignment where
+            # source positions are int64 and position_ids inherits input_ids.dtype.
+            # Ensure input_ids uses int64 so destination/source dtypes align and
+            # avoid "Index put requires the source and destination dtypes match".
+            if input_ids.dtype != torch.long:
+                input_ids = input_ids.to(torch.long)
+                input_["input_ids"] = input_ids
             image_grid_thw = None
             video_grid_thw = None
             if "multi_modal_input" in input_:
@@ -1299,7 +1502,10 @@ class FSDPEngine(TrainEngine):
                     video_grid_thw = torch.cat(video_grid_thw_list)
 
             position_ids, _ = self.model.model.get_rope_index(
-                input_ids, image_grid_thw, video_grid_thw, attn_mask
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                attention_mask=attn_mask,
             )
             position_ids = torch.einsum("ijk->jki", position_ids)
             input_["position_ids"] = position_ids
@@ -1341,8 +1547,10 @@ class FSDPEngine(TrainEngine):
             ]
             mb["use_cache"] = False
             padded_mb["use_cache"] = False
-            if is_qwen3_moe_model(self.model_config.model_type) or is_qwen3_vl_model(
-                self.model_config.model_type
+            if (
+                is_qwen3_moe_model(self.model_config.model_type)
+                or is_qwen3_vl_model(self.model_config.model_type)
+                or is_qwen3_5_model(self.model_config.model_type)
             ):
                 mb["attention_mask"] = None
                 padded_mb["attention_mask"] = None
@@ -1534,6 +1742,10 @@ class FSDPEngine(TrainEngine):
         loss_multiplier: float = 1.0,
     ) -> torch.Tensor:
         """Compute logprobs/entropy and return scaled loss."""
+        local_weight = loss_weight_fn(ctx.mb_input)
+        if local_weight == 0:
+            return logits.mean() * 0.0
+
         if self.config.is_critic and self.tree_training_mode == "sparse":
             raise NotImplementedError(
                 "Tree training with critic model is not supported yet."
@@ -1545,7 +1757,7 @@ class FSDPEngine(TrainEngine):
                 if ctx.trie_node is None or not ctx.trie_node.all_sequence_ids:
                     # Return zero loss that maintains gradient connection to logits
                     # This ensures backward() works correctly for FSDP synchronization
-                    return logits.sum() * 0.0
+                    return logits.mean() * 0.0
 
                 # For tree training, use gather_packed_tree_vocab_stats to properly
                 # unpack vocab stats from tree structure back to per-sequence format.
@@ -1588,7 +1800,7 @@ class FSDPEngine(TrainEngine):
                 values = values[: -ctx.pad_length]
             loss = loss_fn(values, ctx.mb_input)
 
-        loss_scale = loss_weight_fn(ctx.mb_input) / total_loss_weight * loss_multiplier
+        loss_scale = local_weight / total_loss_weight * loss_multiplier
         return loss * loss_scale
 
     def _compute_forward_result(
@@ -1638,11 +1850,11 @@ class FSDPPPOActor(FSDPEngine):
         self.actor = PPOActor(config, self)
 
     @torch.no_grad()
-    def compute_logp(self, *args, **kwargs) -> torch.Tensor | None:
+    def compute_logp(self, *args, **kwargs) -> list[torch.Tensor] | None:
         return self.actor.compute_logp(*args, **kwargs)
 
     @torch.no_grad()
-    def compute_advantages(self, *args, **kwargs) -> dict[str, Any]:
+    def compute_advantages(self, *args, **kwargs) -> list[dict[str, Any]]:
         return self.actor.compute_advantages(*args, **kwargs)
 
     def ppo_update(self, *args, **kwargs) -> None:
@@ -1650,6 +1862,15 @@ class FSDPPPOActor(FSDPEngine):
 
     @classmethod
     def as_controller(cls, config: PPOActorConfig, scheduler: Scheduler):
+        if config._version == "v2":
+            from areal.trainer.ppo.actor import PPOActorControllerV2
+
+            return PPOActorControllerV2(
+                train_engine=cls,
+                config=config,
+                scheduler=scheduler,
+            )
+
         from areal.trainer.ppo.actor import PPOActorController
 
         return PPOActorController(train_engine=cls, config=config, scheduler=scheduler)
@@ -1673,6 +1894,15 @@ class FSDPPPOCritic(FSDPEngine):
 
     @classmethod
     def as_controller(cls, config: PPOCriticConfig, scheduler: Scheduler):
+        if config._version == "v2":
+            from areal.trainer.ppo.critic import PPOCriticControllerV2
+
+            return PPOCriticControllerV2(
+                train_engine=cls,
+                config=config,
+                scheduler=scheduler,
+            )
+
         from areal.trainer.ppo.critic import PPOCriticController
 
         return PPOCriticController(train_engine=cls, config=config, scheduler=scheduler)
@@ -1695,6 +1925,15 @@ class FSDPLMEngine(FSDPEngine):
 
     @classmethod
     def as_controller(cls, config: TrainEngineConfig, scheduler: Scheduler):
+        if config._version == "v2":
+            from areal.trainer.sft.lm_engine import LMControllerV2
+
+            return LMControllerV2(
+                train_engine=cls,
+                config=config,
+                scheduler=scheduler,
+            )
+
         from areal.trainer.sft.lm_engine import LMController
 
         return LMController(train_engine=cls, config=config, scheduler=scheduler)
@@ -1711,7 +1950,7 @@ class FSDPRWEngine(FSDPEngine):
         super().__init__(config)
         self.rw_engine = RWEngine(self)
         if self.config.mb_spec.granularity != 2:
-            logger = logging.getLogger("RW engine")
+            logger = logging.getLogger("RWEngine")
             logger.warning("mb_spec.granularity must be 2 for reward modeling")
             self.config = deepcopy(self.config)
             self.config.mb_spec.granularity = 2
@@ -1724,6 +1963,11 @@ class FSDPRWEngine(FSDPEngine):
 
     @classmethod
     def as_controller(cls, config: TrainEngineConfig, scheduler: Scheduler):
+        if config._version == "v2":
+            from areal.trainer.rw.rw_engine import RWControllerV2
+
+            return RWControllerV2(train_engine=cls, config=config, scheduler=scheduler)
+
         from areal.trainer.rw.rw_engine import RWController
 
         return RWController(train_engine=cls, config=config, scheduler=scheduler)

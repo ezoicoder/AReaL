@@ -17,10 +17,9 @@ from datasets import load_dataset
 from tests.experimental.archon.torchrun.dist_utils import write_result
 from tests.utils import get_dataset_path, get_model_path
 
-from areal.api.alloc_mode import ParallelStrategy
+from areal.api import FinetuneSpec, ParallelStrategy
 from areal.api.cli_args import MicroBatchSpec, OptimizerConfig, TrainEngineConfig
-from areal.api.io_struct import FinetuneSpec
-from areal.engine.fsdp_engine import FSDPLMEngine
+from areal.engine import FSDPLMEngine
 from areal.experimental.engine.archon_engine import ArchonLMEngine
 from areal.infra.platforms import current_platform
 from areal.utils.data import pad_sequences_to_tensors
@@ -75,6 +74,7 @@ def create_batch(model_path: str, dataset_path: str) -> dict:
 def create_config(engine_type: str, model_path: str) -> TrainEngineConfig:
     """Create engine configuration."""
     return TrainEngineConfig(
+        backend="fsdp:d1",
         experiment_name=f"test_{engine_type}_logits",
         trial_name="test",
         path=model_path,

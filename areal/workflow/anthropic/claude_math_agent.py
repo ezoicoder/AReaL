@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 import os
 from typing import Any
@@ -12,7 +14,7 @@ from claude_agent_sdk import (
 )
 from math_verify import parse, verify
 
-from areal.api.reward_api import AsyncRewardWrapper
+from areal.api import AsyncRewardWrapper
 
 
 def math_reward_fn(completions: str, answer: str) -> float:

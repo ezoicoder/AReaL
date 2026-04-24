@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Common utilities for testing and profiling.
 
 This module provides utilities that are shared between tests and profiling tools.
@@ -12,8 +14,7 @@ import torch
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig
 
-from areal.api.engine_api import InferenceEngine
-from areal.api.workflow_api import RolloutWorkflow
+from areal.api import InferenceEngine, RolloutWorkflow
 from areal.experimental.models.archon import get_model_spec, is_supported_model
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.utils import logging
@@ -94,6 +95,10 @@ DENSE_MODEL_PATHS = {
         "/storage/openpsi/models/Qwen__Qwen3-0.6B/",
         "Qwen/Qwen3-0.6B",
     ),
+    "qwen3_5": get_model_path(
+        "/storage/openpsi/models/Qwen__Qwen3.5-0.8B/",
+        "Qwen/Qwen3.5-0.8B",
+    ),
 }
 
 # MoE models (slow to instantiate due to large number of experts)
@@ -101,6 +106,10 @@ MOE_MODEL_PATHS = {
     "qwen3_moe": get_model_path(
         "/storage/openpsi/models/Qwen__Qwen3-30B-A3B/",
         "Qwen/Qwen3-30B-A3B",
+    ),
+    "qwen3_5_moe": get_model_path(
+        "/storage/openpsi/models/Qwen__Qwen3.5-35B-A3B",
+        "Qwen/Qwen3.5-35B-A3B",
     ),
 }
 

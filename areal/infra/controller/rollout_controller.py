@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import asyncio
@@ -14,28 +16,31 @@ from flask import Flask, jsonify, request
 from torchdata.stateful_dataloader import StatefulDataLoader
 from werkzeug.serving import make_server
 
-from areal.api.alloc_mode import AllocationMode
+from areal.api import (
+    InferenceEngine,
+    Job,
+    LocalInfServerInfo,
+    ModelRequest,
+    ModelResponse,
+    ParamSpec,
+    RolloutWorkflow,
+    Scheduler,
+    WeightUpdateMeta,
+    Worker,
+    WorkflowLike,
+)
+from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import (
     InferenceEngineConfig,
     PerfTracerConfig,
     SchedulingSpec,
 )
-from areal.api.engine_api import InferenceEngine
-from areal.api.io_struct import (
-    LocalInfServerInfo,
-    ModelRequest,
-    ModelResponse,
-    ParamSpec,
-    WeightUpdateMeta,
-)
-from areal.api.scheduler_api import Job, Scheduler, Worker
-from areal.api.workflow_api import RolloutWorkflow, WorkflowLike
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.concurrent import run_async_task
 from areal.utils import logging, perf_tracer
-from areal.utils.data import concat_padded_tensors, cycle_dataloader
+from areal.utils.data import cycle_dataloader
 from areal.utils.dynamic_import import import_from_string
-from areal.utils.network import find_free_ports, gethostip
+from areal.utils.network import find_free_ports, format_hostport, gethostip
 from areal.utils.perf_tracer import trace_perf
 
 from ..staleness_manager import StalenessManager
@@ -74,6 +79,9 @@ class RolloutController:
         self.inf_engine = inf_engine
         self.config = config
         self.scheduler = scheduler
+
+        # Parse allocation from config.backend
+        self.rollout_alloc = ModelAllocation.from_str(config.backend)
 
         # Worker management
         self.workers: list[Worker] = []  # List of Worker objects from scheduler
@@ -150,7 +158,6 @@ class RolloutController:
     def initialize(
         self,
         role: str,
-        alloc_mode: AllocationMode,
         server_args: dict[str, Any] | None = None,
         server_infos: list[LocalInfServerInfo] | None = None,
         *args,
@@ -161,16 +168,21 @@ class RolloutController:
         # usually TP x PP.
         self._worker_role = role
 
+        instance_size = (
+            self.rollout_alloc.parallel.tp_size * self.rollout_alloc.parallel.pp_size
+        )
+        dp_size = self.rollout_alloc.parallel.dp_size
+
         # The first element of `self.config.scheduling_spec` is the resource spec
         # of workers, aka the RPC server process. Since a worker exactly matches
         # to a single engine instance in the local environment, we can dirrectly
         # use the spec of engines  as the spec of workers here. Engine scheduling
         # specs are ignored.
         sch_spec = SchedulingSpec(**asdict(self.config.scheduling_spec[0]))
-        sch_spec.cpu *= alloc_mode.gen_instance_size
-        sch_spec.mem *= alloc_mode.gen_instance_size
+        sch_spec.cpu *= instance_size
+        sch_spec.mem *= instance_size
         if sch_spec.gpu > 0:
-            sch_spec.gpu = alloc_mode.gen_instance_size
+            sch_spec.gpu = instance_size
 
         if sch_spec.ray_placement_strategy == "shared":
             # do not support shared placement for rollout
@@ -180,8 +192,8 @@ class RolloutController:
             sch_spec.ray_placement_strategy = "separate"
 
         job = Job(
-            replicas=alloc_mode.gen.dp_size,
-            tasks=[sch_spec for _ in range(alloc_mode.gen.dp_size)],
+            replicas=dp_size,
+            tasks=[sch_spec for _ in range(dp_size)],
             scheduling_strategy=self.config.scheduling_strategy,
             role=self._worker_role,
         )
@@ -392,7 +404,9 @@ class RolloutController:
                     addr=f"{server_info.host}:{server_info.port}",
                 )
             )
-            self.proxy_addrs.append(f"http://{worker.ip}:{worker.worker_ports[0]}")
+            self.proxy_addrs.append(
+                f"http://{format_hostport(worker.ip, int(worker.worker_ports[0]))}"
+            )
         await asyncio.gather(*init_tasks)
 
         logger.info(f"Proxy servers initialized. Addresses: {self.proxy_addrs}")
@@ -505,7 +519,7 @@ class RolloutController:
         """Single URL for external users."""
         if self._proxy_gateway_host is None:
             raise RuntimeError("Proxy gateway not started")
-        return f"http://{self._proxy_gateway_host}:{self._proxy_gateway_port}"
+        return f"http://{format_hostport(self._proxy_gateway_host, self._proxy_gateway_port)}"
 
     def _stop_proxy_gateway(self) -> None:
         """Stop the proxy gateway server if running."""
@@ -611,7 +625,7 @@ class RolloutController:
             # Signal that the loop is ready
             self._callback_loop_ready.set()
             logger.info(
-                f"Callback server started on {self._callback_host}:{self._callback_port}"
+                f"Callback server started on {format_hostport(self._callback_host, self._callback_port)}"
             )
             self._callback_server.serve_forever()
 
@@ -642,7 +656,7 @@ class RolloutController:
         """Return callback server address as 'host:port'."""
         if self._callback_host is None or self._callback_port is None:
             raise RuntimeError("Callback server not started")
-        return f"{self._callback_host}:{self._callback_port}"
+        return format_hostport(self._callback_host, self._callback_port)
 
     def _resolve_task_future(self, task_id: int):
         """Resolve a pending future with the task result."""
@@ -902,7 +916,7 @@ class RolloutController:
         workflow_kwargs: dict[str, Any] | None = None,
         should_accept_fn: str | None = None,
         group_size: int = 1,
-    ) -> dict[str, Any]:
+    ) -> list[dict[str, Any]]:
         perf_tracer.instant(
             "rollout_controller.rollout_batch",
             category="scheduler",
@@ -917,8 +931,8 @@ class RolloutController:
                 group_size=group_size,
             )
         results = self.wait(count=len(data))
-        # Concatenate into batch tensor format
-        return concat_padded_tensors([r for r in results if r is not None])
+        # Return list of trajectories
+        return [r for r in results if r is not None]
 
     @trace_perf("rollout_controller.prepare_batch", category="scheduler")
     def prepare_batch(
@@ -929,7 +943,7 @@ class RolloutController:
         should_accept_fn: str | None = None,
         group_size: int = 1,
         dynamic_bs: bool = False,
-    ) -> dict[str, Any]:
+    ) -> list[dict[str, Any]]:
         """Prepare a batch with controlled staleness.
 
         Continuously submits from dataloader and waits for results, ensuring at least
@@ -963,9 +977,9 @@ class RolloutController:
             self.data_generator, batch_size=dataloader.batch_size, dynamic_bs=dynamic_bs
         )
 
-        # Extract trajectories and concatenate
+        # Return list of trajectories
         trajectories = [r.trajectory if r is not None else None for r in results]
-        return concat_padded_tensors([t for t in trajectories if t is not None])
+        return [t for t in trajectories if t is not None]
 
     async def agenerate(self, req: ModelRequest) -> ModelResponse:
         """Asynchronously generate a response for the given request.
@@ -1024,6 +1038,14 @@ class RolloutController:
 
     async def continue_generation(self):
         await self._collective_rpc_async("continue_generation")
+
+    def offload(self) -> None:
+        """Offload rollout model memory on all inference workers."""
+        self._collective_rpc("offload")
+
+    def onload(self, tags: list[str] | None = None) -> None:
+        """Onload rollout model memory on all inference workers."""
+        self._collective_rpc("onload", tags=tags)
 
     def set_version(self, version: int) -> None:
         with self._version_lock:

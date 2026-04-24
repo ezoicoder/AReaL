@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import aiohttp
 
-from areal.api.workflow_api import RolloutWorkflow
+from areal.api import RolloutWorkflow
 from areal.infra import workflow_context
 from areal.utils import logging, stats_tracker
 from areal.utils.perf_tracer import session_context, trace_session

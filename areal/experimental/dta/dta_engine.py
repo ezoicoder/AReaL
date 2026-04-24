@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # The following code is adapted with minor modifications from
 # https://github.com/Whisper-6/DynamicTreeAttn/blob/main/tree_training_engine.py.
 # Special thanks to Yuchen Yang for outstanding contributions to core DTA algorithms
@@ -190,6 +192,17 @@ class DTAEngine:
         assert self.cur_len + B <= self.max_seq_len, (
             f"Exceeds max_seq_len: cur_len={self.cur_len}, new_tokens={B}, max={self.max_seq_len}"
         )
+        if B == 0:
+            for attachment, length in attach_list:
+                seq_id = attachment["_sequence_batch_id"]
+                if length == 0:
+                    self.returns[seq_id] = torch.empty(
+                        0, device=self.device, dtype=torch.float32
+                    )
+                else:
+                    logprobs = self.logprobs[: length - 1]
+                    self.returns[seq_id] = logprobs.clone()
+            return
 
         start, end = self.cur_len, self.cur_len + B
 
@@ -256,6 +269,11 @@ class DTAEngine:
         # -------------------------------------------------------------
         for attachment, length in attach_list:
             seq_id = attachment["_sequence_batch_id"]
+            if length == 0:
+                self.returns[seq_id] = torch.empty(
+                    0, device=self.device, dtype=torch.float32
+                )
+                continue
             logprobs = self.logprobs[: length - 1]
             self.returns[seq_id] = logprobs.clone()
 
@@ -448,6 +466,8 @@ class DTAEngine:
             # Compute loss
             loss = 0.0
             for attachment, length in attachs_in_block:
+                if length == 0:
+                    continue
                 loss += loss_fn(logprobs[: length - 1], entropys[:length], attachment)
 
         # ---------------------------------------------------------------------------------

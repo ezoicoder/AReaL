@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -7,19 +9,18 @@ import torch
 import torch.distributed as dist
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from areal.api.engine_api import InferenceEngine, TrainEngine
-from areal.api.workflow_api import WorkflowLike
+from areal.api import InferenceEngine, TrainEngine, WorkflowLike
 from areal.infra.platforms import current_platform
 from areal.utils import stats_tracker
 from areal.utils.data import (
     all_gather_tensor_container,
     broadcast_tensor_container,
-    concat_padded_tensors,
     extract_single_valid_token_sequence,
     get_total_valid_tokens,
+    split_and_unpad_tensor,
     tensor_container_to,
 )
-from areal.utils.datapack import ffd_allocate
+from areal.utils.seqpack import get_allocate_fn
 
 
 class _TreeTokenOnlyTimeModel:
@@ -49,7 +50,7 @@ def _validate_group_indices(
 @dataclass
 class RedistributedData:
     all_data: list[dict[str, Any]]
-    data: dict[str, Any]
+    data: list[dict[str, Any]]
     rank: int
     group_indices: list[list[int]]
     dta_metrics: "DTAMetrics | None" = None
@@ -79,28 +80,6 @@ class DTAAllocationResult:
     metrics: DTAMetrics
 
 
-def _remove_padding_from_trajectory(d: dict[str, Any]) -> dict[str, Any]:
-    """Remove padding from a single trajectory dict based on attention_mask.
-
-    Modifies the dict in-place and returns it.
-    """
-    if "attention_mask" not in d:
-        return d.copy()
-    new_d = {}
-    max_sequence_length = int(d["attention_mask"].sum(-1).max().item())
-    attn_mask_shape = d["attention_mask"].shape
-    for k, v in d.items():
-        if (
-            torch.is_tensor(v)
-            and len(v.shape) >= 2
-            and v.shape[:2] == attn_mask_shape[:2]
-        ):
-            new_d[k] = v[:, :max_sequence_length]
-        else:
-            new_d[k] = v
-    return new_d
-
-
 def _dta_allocate(
     trajectories: list[dict[str, Any]],
     n_groups: int,
@@ -124,6 +103,8 @@ def _dta_allocate(
 
     config = SimpleNamespace(K=n_groups, mode="backward", block_size=None)
     group_indices = LB_by_DFS_and_TM(token_seqs, _TreeTokenOnlyTimeModel(), config)
+
+    print(f"len of group_indices:{len(group_indices)}")
 
     n_tree_tokens_after = 0.0
     for group in group_indices:
@@ -156,7 +137,7 @@ def _dta_allocate(
 def redistribute_trajectories(
     trajectories: list[dict[str, Any]],
     group=None,
-    partition_mode: str = "seqlen",
+    packing_algorithm: str = "ffd",
 ) -> RedistributedData:
     """Redistribute a list of trajectory dicts across a process group.
 
@@ -171,17 +152,17 @@ def redistribute_trajectories(
         contains tensors with shape [batch_size, seqlen, ...].
     group : dist.ProcessGroup, optional
         The process group for communication. If None, uses the default group.
-    partition_mode : str, optional
-        Data-parallel partition policy. "seqlen" uses first-fit-decreasing on
-        total sequence lengths. "dta" uses DTA DFS-order partitioning with
-        `n_tree_tokens` as cost. Defaults to "seqlen".
+    packing_algorithm : str, optional
+        How to pack trajectories across data-parallel ranks: ``"ffd"`` or ``"kk"``
+        balance by total sequence length; ``"dta"`` uses DTA DFS-order partitioning
+        with ``n_tree_tokens`` as cost. Default ``"ffd"``.
 
     Returns
     -------
     RedistributedData
         Contains:
         - all_data: All trajectories gathered from all ranks (with padding removed)
-        - data: Concatenated trajectories assigned to the local rank
+        - data: List of trajectories assigned to the local rank
         - rank: Local rank in the group
         - group_indices: Assignment of trajectory indices to each rank
     """
@@ -196,28 +177,38 @@ def redistribute_trajectories(
     # Compute sequence lengths for load balancing
     seqlens = [get_total_valid_tokens(d) for d in all_data]
 
-    # Remove pad positions from each trajectory
-    for d in all_data:
-        _remove_padding_from_trajectory(d)
+    # Remove pad positions from each trajectory (split_and_unpad_tensor
+    # auto-derives trim lengths from attention_mask when traj_seqlens=None)
+    all_data = [
+        split_and_unpad_tensor(
+            d, n_trajs=1, traj_group_sizes=[d["attention_mask"].shape[0]]
+        )[0]
+        for d in all_data
+    ]
 
     n_groups = dist.get_world_size(group)
-    if partition_mode == "dta":
+    if packing_algorithm == "dta":
         dta_result = _dta_allocate(all_data, n_groups)
         group_indices = dta_result.group_indices
         dta_metrics = dta_result.metrics
-    elif partition_mode == "seqlen":
-        group_indices = ffd_allocate(seqlens, capacity=int(1e12), min_groups=n_groups)
+    elif packing_algorithm in ("ffd", "kk"):
+        allocate_fn = get_allocate_fn(packing_algorithm)
+        # Allocate trajectories to ranks using the configured packing algorithm
+        # No capacity limit leads to balanced partition across this group
+        group_indices = allocate_fn(
+            seqlens, capacity=int(1e12), min_groups=dist.get_world_size(group)
+        )
         dta_metrics = None
     else:
         raise ValueError(
-            f"Unsupported partition_mode: {partition_mode}. "
-            "Expected one of {'seqlen', 'dta'}."
+            f"Unsupported packing_algorithm: {packing_algorithm!r}. "
+            "Expected one of {'ffd', 'kk', 'dta'}."
         )
     _validate_group_indices(group_indices, n_groups=n_groups, n_items=len(all_data))
-    local_indices = group_indices[dist.get_rank(group=group)]
 
-    # Concatenate assigned trajectories for this rank
-    data = concat_padded_tensors([all_data[i] for i in local_indices])
+    # Select assigned trajectories for this rank (no concatenation — deferred to train side)
+    local_indices = group_indices[dist.get_rank(group=group)]
+    data = [all_data[i] for i in local_indices]
     return RedistributedData(
         all_data=all_data,
         data=data,
@@ -235,7 +226,7 @@ class DistRolloutCoordinator:
     def _broadcast_and_redistribute_trajectories(
         self,
         trajectories: list[dict[str, Any]] | None,
-    ) -> dict[str, Any]:
+    ) -> list[dict[str, Any]]:
         """Broadcast and redistribute trajectories across distributed workers.
 
         This helper encapsulates:
@@ -252,16 +243,16 @@ class DistRolloutCoordinator:
 
         Returns
         -------
-        dict[str, Any]
-            Redistributed and broadcast batch available on all ranks (concatenated)
+        list[dict[str, Any]]
+            Redistributed and broadcast batch available on all ranks (list of trajs)
         """
-        partition_mode = self.train_engine.config.partition_mode
+        rollout_packing = self.train_engine.config.packing_algorithm
 
         if trajectories is not None:
             redist = redistribute_trajectories(
                 trajectories,
                 group=self.train_engine.data_parallel_group,
-                partition_mode=partition_mode,
+                packing_algorithm=rollout_packing,
             )
             batch = redist.data
             dta_metrics_payload = [redist.dta_metrics]
@@ -298,7 +289,7 @@ class DistRolloutCoordinator:
         workflow: WorkflowLike,
         workflow_kwargs: dict[str, Any] | None = None,
         group_size: int = 1,
-    ) -> dict[str, Any]:
+    ) -> list[dict[str, Any]]:
         """Generate rollout batch with distributed coordination (synchronous).
 
         This method orchestrates distributed rollout generation:
@@ -323,8 +314,8 @@ class DistRolloutCoordinator:
 
         Returns
         -------
-        Dict[str, Any]
-            Generated rollout batch on all ranks
+        list[dict[str, Any]]
+            Redistributed rollout trajectories on all ranks
 
         Raises
         ------
@@ -354,7 +345,7 @@ class DistRolloutCoordinator:
         should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
         group_size: int = 1,
         dynamic_bs: bool = False,
-    ) -> dict[str, Any]:
+    ) -> list[dict[str, Any]]:
         """Prepare async rollout batch with distributed coordination.
 
         Similar to rollout_batch but uses prepare_batch for async training,
@@ -380,8 +371,8 @@ class DistRolloutCoordinator:
 
         Returns
         -------
-        Dict[str, Any]
-            Prepared rollout batch on all ranks
+        list[dict[str, Any]]
+            Prepared rollout trajectories on all ranks
 
         Raises
         ------

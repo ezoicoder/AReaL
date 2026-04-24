@@ -16,12 +16,11 @@ import torch.distributed as dist
 
 from tests.utils import get_model_path
 
-from areal.api.alloc_mode import ParallelStrategy
+from areal.api import FinetuneSpec, ParallelStrategy
 from areal.api.cli_args import (
     MicroBatchSpec,
     TrainEngineConfig,
 )
-from areal.api.io_struct import FinetuneSpec
 from areal.experimental.engine.archon_engine import ArchonEngine
 from areal.infra.platforms import current_platform
 from areal.utils.data import tensor_container_to
@@ -82,6 +81,7 @@ def mock_input(
 def make_engine(model_type: str, mb_spec: MicroBatchSpec):
     """Create and initialize a ArchonEngine."""
     config = TrainEngineConfig(
+        backend="archon:d1",
         experiment_name="test_archon_forward",
         trial_name="test",
         path=MODEL_PATHS[model_type],

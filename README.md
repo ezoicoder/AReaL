@@ -3,27 +3,35 @@
 </h1>
 
 <p align="center">
-| <a href="https://arxiv.org/pdf/2505.24298"><b>Paper</b></a> | <a href="https://inclusionai.github.io/AReaL/"><b>Documentation</b></a> | <a href="https://deepwiki.com/inclusionAI/AReaL"><b>Ask DeepWiki</b></a> | <a href="https://huggingface.co/collections/inclusionAI/"><b>🤗 Models & Data</b></a> |
-<a href="./assets/wechat_qrcode.png" target="_blank"><img src="./assets/wechat_icon.png" width="20" style="vertical-align: middle;"> <b>WeChat (微信) Group</b></a> |
+| <a href="https://arxiv.org/pdf/2505.24298"><b>Paper</b></a> | <a href="https://inclusionai.github.io/AReaL/"><b>Documentation</b></a> | <a href="https://inclusionai.github.io/AReaL/zh/"><b>中文文档</b></a> | <a href="https://deepwiki.com/inclusionAI/AReaL"><b>Ask DeepWiki</b></a> | <a href="https://huggingface.co/collections/inclusionAI/"><b>🤗 Models & Data</b></a> |
+<a href="./assets/figures/wechat_qrcode.png" target="_blank"><img src="./assets/figures/wechat_icon.png" width="20" style="vertical-align: middle;"> <b>WeChat (微信) Group</b></a> |
+  <a href="https://gitcgr.com/inclusionAI/AReaL">
+    <img src="https://gitcgr.com/badge/inclusionAI/AReaL.svg" alt="gitcgr" />
+  </a>
 </p>
 
-<img align="right" alt="ReaL" src="/assets/logo.png" width="20%">
+<img align="right" alt="ReaL" src="/assets/figures/logo.png" width="20%">
 
-AReaL is an open-source **fully asynchronous** reinforcement learning training system
-for large **reasoning and agentic models**, developed by members from Tsinghua IIIS and
-the AReaL Team at Ant Group. Built upon the open-source project
-[ReaLHF](https://github.com/openpsi-project/ReaLHF), we are fully committed to
-open-source principles by providing the training details, data, and infrastructure
-required to reproduce our results, along with the models themselves. AReaL aims to help
-everyone build their own AI agents easily and affordably. Our team loves milk tea
-because it's delicious, customizable, and affordable—we hope you enjoy our project just
-as much as you'd enjoy real milk tea. Cheers!
+**AReaL** is a reinforcement learning (RL) infrastructure designed to bridge foundation
+model training with modern agent-based applications. It was originally developed by
+researchers and engineers from Tsinghua IIIS and the AReaL Team at Ant Group.
+
+Built on a **fully asynchronous RL training paradigm**, AReaL is optimized for
+efficiency and scalability, making it particularly well-suited for training large-scale
+**reasoning and agentic models**.
+
+AReaL’s mission is to make building AI agents **accessible, efficient, and
+cost-effective** for a broad community of developers and researchers.
+
+> Like milk tea - customizable, scalable, and enjoyable - we hope AReaL brings both
+> flexibility and delight to your AI development experience. Cheers!
 
 **AReaL Highlights**
 
 - ⚡ **Flexibility**: Seamless customization for
-  [agentic RL](https://inclusionai.github.io/AReaL/tutorial/agentic_rl.html) and
-  [online RL training](./examples/openclaw/) by simply replacing the `base_url`.
+  [agentic RL](https://inclusionai.github.io/AReaL/en/tutorial/agentic_rl.html) and
+  [online RL training](https://www.inclusion-ai.org/AReaL/en/tutorial/online_proxy.html)
+  for **black-box agent applications** by simply replacing the `base_url`.
 - 📈 **Scalability**: **Stable** fully asynchronous RL training with **industry-leading
   speed**.
 - ✨ **Cutting-Edge Performance**: State-of-the-art [math](/blog/AReaL_v0_2.md),
@@ -32,9 +40,30 @@ as much as you'd enjoy real milk tea. Cheers!
 
 ## 📰 News
 
+**\[2026/04/23\]** 🚀 We’re excited to release our integration with
+[Scaffoldings](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding)
+for agentic RL training - now live in our
+[examples](https://github.com/inclusionAI/AReaL/tree/main/examples/scaffolding)! Huge
+shoutout to @narutolhy and @WeiHaocheng for making this happen 🙌. The modular design of
+the Scaffoldings enables it to achieve a thorough decoupling of agent execution, reward
+calculation, and trajectory acquisition. This enables developers to reuse existing
+modules when implementing an agentic RL method, allowing them to focus on their own
+innovative modules.
+
+**\[2026/04/18\]** We are thrilled to announce that **AReaL's first Community Biweekly
+Meeting** was successfully held! Thank you to everyone who joined us. Meeting materials
+are now available
+[here](https://github.com/inclusionAI/AReaL/tree/main/assets/community). Our next
+meeting is scheduled for **2026/05/01** and will also be conducted in Chinese;
+English-language meetings will be scheduled in the future. We warmly welcome everyone to
+participate! See [Community](./assets/community/README.md) for more details.
+
 **\[2026/03/02\]** We provide [a complete example](./examples/openclaw/) to train your
 own 🦞 OpenClaw agent by simply replacing the `base_url` and `api_key` with AReaL's RL
 service - no complicated dependencies, no code changes, works with any agentic runtime!
+
+<details>
+<summary><b>📋 Previous Releases</b></summary>
 
 **\[2026/02/06\]** We are delighted to introduce **AReaL-SEA**, a self-evolving data
 synthesis engine. Combined with RL training on AReaL, the 235B MoE model surpasses GPT 5
@@ -50,14 +79,11 @@ trained with AReaL! Check out
 [their training workflow](https://github.com/camel-ai/seta/tree/main/training/tbench_areal_workflow)
 and the [announcement on X](https://x.com/guohao_li/status/2009678513574408636).
 
-<details>
-<summary><b>📋 Previous Releases</b></summary>
-
 **\[2026/01/01\]** Happy New Year! Thanks to the outstanding contribution from
 @HwVanICI, we are excited to officially announce stable support for AReaL training on
 **Ascend NPU devices**! The code is actively maintained and continuously updated in the
 [`ascend` branch](https://github.com/inclusionAI/AReaL/tree/ascend). Check out
-[our documentation](https://inclusionai.github.io/AReaL/tutorial/installation_npu.html)
+[our documentation](https://inclusionai.github.io/AReaL/en/tutorial/installation_npu.html)
 to get started, and feel free to report any issues!
 
 **\[2025/08/30\]** Introducing ASearcher, a state-of-the-art search agent built with
@@ -70,8 +96,8 @@ features an **algorithm-first** API design that prioritizes ease of use and algo
 development, while natively supporting **fully asynchronous agentic RL**. With 80% fewer
 lines of code, AReaL-lite maintains 90% of AReaL's performance and core functionality.
 Check out [our AReaL-lite design documentation](/areal/README.md) and
-[the quickstart guide](https://inclusionai.github.io/AReaL/tutorial/quickstart.html) to
-begin your journey with **AReaL-lite**!
+[the quickstart guide](https://inclusionai.github.io/AReaL/en/tutorial/quickstart.html)
+to begin your journey with **AReaL-lite**!
 
 **\[2025/06/03\] (v0.3, boba²)** We release **boba²** (double-boba) for fully
 asynchronous RL training, which achieves **2.77× speedup while delivering comparable or
@@ -99,7 +125,11 @@ First, install the package:
 git clone https://github.com/inclusionAI/AReaL
 cd AReaL
 pip install uv
-uv sync --extra cuda
+# Install flash-attn pre-built wheel first to avoid compiling from source
+# (pick the wheel matching your Python version; see https://github.com/mjun0812/flash-attention-prebuild-wheels/releases)
+uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu128torch2.9-cp312-cp312-linux_x86_64.whl"
+uv sync --extra cuda  # installs training packages + SGLang (default inference backend)
+# For vLLM instead: cp pyproject.vllm.toml pyproject.toml && cp uv.vllm.lock uv.lock && uv sync --extra cuda
 ```
 
 Our training scripts automatically download the required dataset (openai/gsm8k) and
@@ -109,17 +139,18 @@ model (Qwen/Qwen2-1.5B-Instruct). To run on a single node:
 python3 examples/math/gsm8k_rl.py --config examples/math/gsm8k_grpo.yaml scheduler.type=local
 ```
 
-To run on a Ray cluster with 2 nodes and 8 GPUs per node (remember to update paths in
-the YAML file to point to your shared storage):
+If you prefer to run experiments on a Ray cluster, update paths in the YAML file to
+point to your shared storage, and run:
 
 ```bash
 python3 examples/math/gsm8k_rl.py --config examples/math/gsm8k_grpo.yaml \
   cluster.n_nodes=2 cluster.n_gpus_per_node=8 \
+  cluster.fileroot=/path/to/nfs \
   scheduler.type=ray
 ```
 
 For comprehensive setup instructions, see
-[our quickstart guide](https://inclusionai.github.io/AReaL/tutorial/quickstart.html).
+[our quickstart guide](https://inclusionai.github.io/AReaL/en/tutorial/quickstart.html).
 
 ## 📚 Examples
 
@@ -164,20 +195,21 @@ For comprehensive setup instructions, see
 All RL algorithms support both asynchronous and synchronous versions by setting
 `max_head_offpolicyness=0`. See [Asynchronous RL Guide](docs/algorithms/async.md).
 
-| Algorithm                | Documentation                             | Paper                                          | Configuration                                                |
-| ------------------------ | ----------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------ |
-| **GRPO**                 | [📖 Docs](docs/algorithms/grpo_series.md) | [📄 Paper](https://arxiv.org/pdf/2402.03300)   | [🔗 GSM8K Example](examples/math/gsm8k_grpo.yaml)            |
-| **GSPO**                 | [📖 Docs](docs/algorithms/grpo_series.md) | [📄 Paper](https://arxiv.org/abs/2507.18071)   | [🔗 GSM8K Example](examples/math/gsm8k_gspo.yaml)            |
-| **PPO**                  | [📖 Docs](docs/algorithms/grpo_series.md) | [📄 Paper](https://arxiv.org/pdf/2203.02155)   | [🔗 GSM8K Example](examples/math/gsm8k_ppo.yaml)             |
-| **DAPO**                 | [📖 Docs](docs/algorithms/grpo_series.md) | [📄 Paper](https://arxiv.org/abs/2503.14476)   | [🔗 GSM8K Example](examples/math/gsm8k_dapo_dynamic_bs.yaml) |
-| **LitePPO**              | [📖 Docs](docs/algorithms/grpo_series.md) | [📄 Paper](https://arxiv.org/abs/2508.08221)   | [🔗 GSM8K Example](examples/math/gsm8k_liteppo.yaml)         |
-| **Dr.GRPO**              | [📖 Docs](docs/algorithms/grpo_series.md) | [📄 Paper](https://arxiv.org/abs/2503.20783)   | [🔗 GSM8K Example](examples/math/gsm8k_drgrpo.yaml)          |
-| **REINFORCE++**          | -                                         | [📄 Paper](https://arxiv.org/pdf/2501.03262)   | [🔗 GSM8K Example](examples/math/gsm8k_reinforce.yaml)       |
-| **RLOO**                 | [📖 Docs](docs/algorithms/grpo_series.md) | [📄 Paper](https://arxiv.org/pdf/2402.14740v1) | [🔗 GSM8K Example](examples/math/gsm8k_rloo.yaml)            |
-| **SAPO**                 | [📖 Docs](docs/algorithms/grpo_series.md) | [📄 Paper](https://arxiv.org/abs/2511.20347)   | [🔗 GSM8K Example](examples/math/gsm8k_sapo.yaml)            |
-| **M2PO**                 | [📖 Docs](docs/algorithms/m2po.md)        | [📄 Paper](https://arxiv.org/abs/2510.01161)   | [🔗 GSM8K Example](examples/math/gsm8k_m2po.yaml)            |
-| **RLHF Reward Modeling** | -                                         | -                                              | [🔗 RLHF Example](examples/alignment/)                       |
-| **SFT**                  | -                                         | -                                              | [🔗 GSM8K Example](examples/math/gsm8k_sft.py)               |
+| Algorithm                | Documentation                                 | Paper                                          | Configuration                                                     |
+| ------------------------ | --------------------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------- |
+| **GRPO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/pdf/2402.03300)   | [🔗 GSM8K Example](examples/math/gsm8k_grpo.yaml)                 |
+| **GSPO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/abs/2507.18071)   | [🔗 GSM8K Example](examples/math/gsm8k_gspo.yaml)                 |
+| **PPO**                  | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/pdf/2203.02155)   | [🔗 GSM8K Example](examples/math/gsm8k_ppo.yaml)                  |
+| **DAPO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/abs/2503.14476)   | [🔗 GSM8K Example](examples/math/gsm8k_dapo_dynamic_bs.yaml)      |
+| **LitePPO**              | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/abs/2508.08221)   | [🔗 GSM8K Example](examples/math/gsm8k_liteppo.yaml)              |
+| **Dr.GRPO**              | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/abs/2503.20783)   | [🔗 GSM8K Example](examples/math/gsm8k_drgrpo.yaml)               |
+| **REINFORCE++**          | -                                             | [📄 Paper](https://arxiv.org/pdf/2501.03262)   | [🔗 GSM8K Example](examples/math/gsm8k_reinforce.yaml)            |
+| **RLOO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/pdf/2402.14740v1) | [🔗 GSM8K Example](examples/math/gsm8k_rloo.yaml)                 |
+| **SAPO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/abs/2511.20347)   | [🔗 GSM8K Example](examples/math/gsm8k_sapo.yaml)                 |
+| **M2PO**                 | [📖 Docs](docs/algorithms/m2po.md)            | [📄 Paper](https://arxiv.org/abs/2510.01161)   | [🔗 GSM8K Example](examples/math/gsm8k_m2po.yaml)                 |
+| **RLHF Reward Modeling** | -                                             | -                                              | [🔗 RLHF Example](examples/alignment/)                            |
+| **SFT**                  | -                                             | -                                              | [🔗 GSM8K Example](examples/math/gsm8k_sft.py)                    |
+| **Distillation**         | [📖 Docs](docs/en/algorithms/distillation.md) | [📄 Paper](https://arxiv.org/pdf/2506.02208)   | [🔗 GSM8K Example](examples/distillation/gsm8k_grpo_distill.yaml) |
 
 ### Models
 
@@ -195,11 +227,11 @@ Check the [AI Coding Assistant Guide](docs/reference/ai_assisted_dev.md) and
 
 ### Training Backends
 
-| Backend            | DP          | Tensor Parallel | Sequence Parallel within TP | Context Parallel | Pipeline Parallel | Expert Parallel | 1D Sequence Packing | LoRA |
-| ------------------ | ----------- | --------------- | --------------------------- | ---------------- | ----------------- | --------------- | ------------------- | ---- |
-| **Megatron**       | ✅ (ZeRO-1) | ✅              | ✅                          | ✅               | ✅                | ✅              | ✅                  | ❌   |
-| **PyTorch FSDP**   | ✅ (FSDP2)  | ✅              | ✅                          | ✅               | ❌                | ❌              | ✅                  | ✅   |
-| **PyTorch Archon** | ✅ (FSDP2)  | ✅              | ✅                          | ✅               | ✅                | ✅              | ✅                  | ❌   |
+| Backend            | DP          | Tensor Parallel | Sequence Parallel within TP | Context Parallel | Pipeline Parallel | Expert Parallel | 1D Sequence Packing | LoRA                             |
+| ------------------ | ----------- | --------------- | --------------------------- | ---------------- | ----------------- | --------------- | ------------------- | -------------------------------- |
+| **Megatron**       | ✅ (ZeRO-1) | ✅              | ✅                          | ✅               | ✅                | ✅              | ✅                  | ✅ (with vLLM inference backend) |
+| **PyTorch FSDP**   | ✅ (FSDP2)  | ✅              | ✅                          | ✅               | ❌                | ❌              | ✅                  | ✅                               |
+| **PyTorch Archon** | ✅ (FSDP2)  | ✅              | ✅                          | ✅               | ✅                | ✅              | ✅                  | ❌                               |
 
 ### Inference Backends
 
@@ -212,45 +244,46 @@ Check the [AI Coding Assistant Guide](docs/reference/ai_assisted_dev.md) and
 
 ### Tutorial
 
-- [Installation](https://inclusionai.github.io/AReaL/tutorial/installation.html)
-- [Quickstart](https://inclusionai.github.io/AReaL/tutorial/quickstart.html)
-- [Agentic RL](https://inclusionai.github.io/AReaL/tutorial/agentic_rl.html)
-- [Evaluation](https://inclusionai.github.io/AReaL/tutorial/eval.html)
-- [Large MoE with Megatron](https://inclusionai.github.io/AReaL/tutorial/megatron.html)
-- [Large MoE with PyTorch Archon](https://inclusionai.github.io/AReaL/tutorial/archon.html)
+- [Installation](docs/en/tutorial/installation.md)
+- [Quickstart](docs/en/tutorial/quickstart.md)
+- [Agentic RL](docs/en/tutorial/agentic_rl.md)
+- [Evaluation](docs/en/tutorial/eval.md)
+- [Large MoE with Megatron](docs/en/tutorial/megatron.md)
+- [Large MoE with PyTorch Archon](docs/en/tutorial/archon.md)
 
 ### Code Walkthrough
 
-- [Running GRPO on GSM8K dataset](https://inclusionai.github.io/AReaL/tutorial/gsm8k_grpo.html)
+- [Running GRPO on GSM8K dataset](docs/en/tutorial/gsm8k_grpo.md)
 
 ### Best Practices
 
-- [Improving Algorithm Performance](https://inclusionai.github.io/AReaL/best_practices/algo_perf.html)
-- [Agent Workflow Best Practices](https://inclusionai.github.io/AReaL/best_practices/workflow.html)
-- [Debugging](https://inclusionai.github.io/AReaL/best_practices/debugging.html)
-- [Handling OOM Issues](https://inclusionai.github.io/AReaL/best_practices/handling_oom.html)
-- [Performance Profiling](https://inclusionai.github.io/AReaL/best_practices/perf_profiling.html)
+- [Improving Algorithm Performance](docs/en/best_practices/algo_perf.md)
+- [Agent Workflow Best Practices](docs/en/best_practices/workflow.md)
+- [Debugging](docs/en/best_practices/debugging.md)
+- [Handling OOM Issues](docs/en/best_practices/handling_oom.md)
+- [Performance Profiling](docs/en/best_practices/perf_profiling.md)
 
 ### Customization
 
-- [Customize Dataset](https://inclusionai.github.io/AReaL/customization/dataset.html)
-- [Customize Agentic/RVLR Rollout Workflows](https://inclusionai.github.io/AReaL/customization/agent.html)
+- [Customize Dataset](docs/en/customization/dataset.md)
+- [Customize Agentic/RVLR Rollout Workflows](docs/en/customization/agent.md)
 
 ### Algorithms
 
-- [Asynchronous RL Explained](https://inclusionai.github.io/AReaL/algorithms/async.html)
-- [PPO, GRPO, and Related Algorithms](https://inclusionai.github.io/AReaL/algorithms/grpo_series.html)
-- [M2PO](https://inclusionai.github.io/AReaL/algorithms/m2po.html)
+- [Asynchronous RL Explained](docs/en/algorithms/async.md)
+- [PPO, GRPO, and Related Algorithms](docs/en/algorithms/grpo_series.md)
+- [M2PO](docs/en/algorithms/m2po.md)
 
 ### Reference
 
-- [CLI Configurations](https://inclusionai.github.io/AReaL/cli_reference.html)
-- [Checkpointing](https://inclusionai.github.io/AReaL/reference/checkpointing.html)
-- [Metrics Tracking](https://inclusionai.github.io/AReaL/reference/metrics_tracking.html)
-- [Allocation Mode](https://inclusionai.github.io/AReaL/reference/alloc_mode.html)
-- [Rollout Workflow](https://inclusionai.github.io/AReaL/reference/rollout_workflow.html)
-- [Agent Workflow](https://inclusionai.github.io/AReaL/reference/agent_workflow.html)
-- [AI-Assisted Development](https://inclusionai.github.io/AReaL/reference/ai_assisted_dev.html)
+- [CLI Configurations](docs/en/cli_reference.md)
+- [LoRA RL](docs/en/reference/lora.md)
+- [Checkpointing](docs/en/reference/checkpointing.md)
+- [Metrics Tracking](docs/en/reference/metrics_tracking.md)
+- [Allocation Mode](docs/en/reference/alloc_mode.md)
+- [Rollout Workflow](docs/en/reference/rollout_workflow.md)
+- [Agent Workflow](docs/en/reference/agent_workflow.md)
+- [AI-Assisted Development](docs/en/reference/ai_assisted_dev.md)
 
 ## 🤝 Contributing
 
@@ -265,26 +298,30 @@ cd AReaL
 
 # Install uv and sync dependencies
 pip install uv
-# Use `--extra cuda` on Linux with CUDA for full functionality
+# Install flash-attn pre-built wheel to avoid compiling from source
+uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu128torch2.9-cp312-cp312-linux_x86_64.whl"
+# Use `--extra cuda` on Linux with CUDA (installs training packages + SGLang)
 uv sync --extra cuda --group dev
+# For vLLM instead:
+# cp pyproject.vllm.toml pyproject.toml && cp uv.vllm.lock uv.lock && uv sync --extra cuda --group dev
 # Or without CUDA support
 # uv sync --group dev
 
-# Set up pre-commit hooks for automatic formatting
-pre-commit install
+# Set up pre-commit hooks (formatting, linting, commit message checks)
+pre-commit install --install-hooks
 
 # Make changes
 git checkout -b feat/gpt-o5
 git add .
-# `git commit` will automatically format your file
-git commit -m "Implement gpt-o5 training loop"
+# `git commit` will automatically check your files and commit messages
+git commit -m "feat: implement gpt-o5 training loop"
 git push
 ```
 
 ## 🗺️ Future Roadmap
 
 - **[Full Roadmap](ROADMAP.md)**
-- **[2025 Q4 Roadmap](https://github.com/inclusionAI/AReaL/issues/542)**
+- **[2026 Q1 Roadmap](https://github.com/inclusionAI/AReaL/issues/907)**
 
 AReaL is under active development with planned minor releases weekly and major releases
 monthly. We warmly welcome community engagement and contributions. We are also
@@ -326,6 +363,10 @@ outstanding projects, including but not limited to
 [SGLang](https://github.com/sgl-project/sglang), [QwQ](https://github.com/QwenLM/QwQ),
 [Light-R1](https://github.com/Qihoo360/Light-R1), and
 [DAPO](https://github.com/BytedTsinghua-SIA/DAPO).
+
+## 📜 License
+
+This project is licensed under the [Apache License 2.0](LICENSE).
 
 ## 📄 Citation
 

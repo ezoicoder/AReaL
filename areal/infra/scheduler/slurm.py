@@ -1,8 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import getpass
 import re
 import shlex
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,12 +15,13 @@ import aiohttp
 import orjson
 import requests
 
+from areal.api import Job, Scheduler, Worker
 from areal.api.cli_args import (
     BaseExperimentConfig,
     NameResolveConfig,
+    SchedulingSpec,
     SchedulingStrategyType,
 )
-from areal.api.scheduler_api import Job, Scheduler, SchedulingSpec, Worker
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.scheduler.exceptions import (
     EngineCallError,
@@ -46,6 +50,7 @@ from areal.infra.utils.slurm import (
 )
 from areal.utils import logging, name_resolve, names
 from areal.utils.fs import validate_shared_path
+from areal.utils.network import format_hostport, split_hostport
 from areal.utils.offload import get_tms_env_vars
 
 logger = logging.getLogger("SlurmScheduler")
@@ -271,7 +276,7 @@ class SlurmScheduler(Scheduler):
             return False
 
         port = int(worker_info.worker.worker_ports[0])
-        url = f"http://{worker_info.worker.ip}:{port}/health"
+        url = f"http://{format_hostport(worker_info.worker.ip, port)}/health"
 
         try:
             response = requests.get(url, timeout=2.0)
@@ -286,7 +291,7 @@ class SlurmScheduler(Scheduler):
 
         worker_id = worker_info.worker.id
         port = int(worker_info.worker.worker_ports[0])
-        url = f"http://{worker_info.worker.ip}:{port}/configure"
+        url = f"http://{format_hostport(worker_info.worker.ip, port)}/configure"
 
         try:
             response = requests.post(
@@ -308,10 +313,10 @@ class SlurmScheduler(Scheduler):
                 logger.info(f"Configuration successful on worker '{worker_id}'")
                 return
             elif response.status_code == 400:
-                error_detail = response.json().get("detail", "Unknown error")
+                error_detail = response.json().get("error", "Unknown error")
                 raise WorkerConfigurationError(worker_id, error_detail, str(400))
             elif response.status_code == 500:
-                error_detail = response.json().get("detail", "Unknown error")
+                error_detail = response.json().get("error", "Unknown error")
                 raise WorkerConfigurationError(worker_id, error_detail, str(500))
             else:
                 raise WorkerConfigurationError(
@@ -353,18 +358,18 @@ class SlurmScheduler(Scheduler):
                 addr = name_resolve.get(key)
             except name_resolve.NameEntryNotFoundError:
                 continue
-            ip, ports_str = addr.split(":")
+            ip, port = split_hostport(addr)
             worker_info.worker.ip = ip
-            worker_info.discovered = True
-            worker_ports = [ports_str]
+            worker_ports = [str(port)]
             worker_info.worker.worker_ports = worker_ports
+            worker_info.discovered = True
 
             self._wait_worker_ready(worker_info)
 
             # Allocate new ports from the worker
             if worker_info.spec.port_count > 1:
                 resp = requests.post(
-                    f"http://{addr}/alloc_ports",
+                    f"http://{format_hostport(ip, port)}/alloc_ports",
                     json=dict(count=worker_info.spec.port_count - 1),
                 )
                 resp.raise_for_status()
@@ -431,6 +436,27 @@ class SlurmScheduler(Scheduler):
         except subprocess.CalledProcessError as e:
             raise WorkerCreationError(target_role, f"Failed to query target job: {e}")
 
+    @staticmethod
+    async def _wait_for_fork_ready(
+        session: aiohttp.ClientSession,
+        host: str,
+        port: int,
+        timeout: float = 60,
+    ) -> bool:
+        url = f"http://{format_hostport(host, port)}/health"
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=2)
+                ) as resp:
+                    if resp.status == 200:
+                        return True
+            except (TimeoutError, aiohttp.ClientError):
+                pass
+            await asyncio.sleep(0.5)
+        return False
+
     async def _fork_single_worker(
         self,
         session: aiohttp.ClientSession,
@@ -446,19 +472,65 @@ class SlurmScheduler(Scheduler):
         ----------
         command : str, optional
             Custom module path to run instead of the default rpc_server.
-            If specified, the forked process runs this module.
         """
         worker_id = f"{role}/{idx}"
-        target_url = (
-            f"http://{target_wi.worker.ip}:{target_wi.worker.worker_ports[0]}/fork"
-        )
+        guard_url = f"http://{format_hostport(target_wi.worker.ip, int(target_wi.worker.worker_ports[0]))}"
 
         try:
-            payload = {"role": role, "worker_index": idx}
-            if command is not None:
-                payload["command"] = command
+            # 1. Allocate a port on the target guard
             async with session.post(
-                target_url,
+                f"{guard_url}/alloc_ports",
+                json={"count": 1},
+            ) as alloc_resp:
+                if alloc_resp.status != 200:
+                    error_text = await alloc_resp.text()
+                    raise WorkerCreationError(
+                        role,
+                        f"Port allocation failed for worker {idx}",
+                        f"HTTP {alloc_resp.status}: {error_text}",
+                    )
+                alloc_data = await alloc_resp.json()
+                forked_host = alloc_data["host"]
+                forked_port = alloc_data["ports"][0]
+
+            # 2. Build the full raw command
+            module_path = command or "areal.infra.rpc.rpc_server"
+            raw_cmd = [
+                sys.executable,
+                "-m",
+                module_path,
+                "--host",
+                "0.0.0.0",
+                "--port",
+                str(forked_port),
+                "--experiment-name",
+                str(self.experiment_name),
+                "--trial-name",
+                str(self.trial_name),
+                "--role",
+                role,
+                "--worker-index",
+                str(idx),
+            ]
+            if self.name_resolve_config.type:
+                raw_cmd.extend(["--name-resolve-type", self.name_resolve_config.type])
+            if self.name_resolve_config.nfs_record_root:
+                raw_cmd.extend(
+                    ["--nfs-record-root", self.name_resolve_config.nfs_record_root]
+                )
+            if self.name_resolve_config.etcd3_addr:
+                raw_cmd.extend(["--etcd3-addr", self.name_resolve_config.etcd3_addr])
+            if self.fileroot:
+                raw_cmd.extend(["--fileroot", str(self.fileroot)])
+
+            # 3. Fork via raw_cmd
+            payload = {
+                "role": role,
+                "worker_index": idx,
+                "raw_cmd": raw_cmd,
+            }
+            async with session.post(
+                f"{guard_url}/fork",
                 json=payload,
             ) as response:
                 if response.status != 200:
@@ -478,14 +550,28 @@ class SlurmScheduler(Scheduler):
                         result.get("error", "Unknown error"),
                     )
 
-                forked_host = result["host"]
-                forked_port = result["port"]
                 forked_pid = result.get("pid")
 
-                logger.info(
-                    f"Forked worker {worker_id} created at {forked_host}:{forked_port} "
-                    f"(pid={forked_pid}) from {target_role}/{idx}"
+            # 4. Wait for the forked worker to become ready
+            if not await self._wait_for_fork_ready(session, forked_host, forked_port):
+                try:
+                    async with session.post(
+                        f"{guard_url}/kill_forked_worker",
+                        json={"role": role, "worker_index": idx},
+                    ):
+                        pass
+                except Exception:
+                    pass
+                raise WorkerCreationError(
+                    role,
+                    f"Forked worker {idx} failed to become ready",
+                    f"Readiness timeout at {forked_host}:{forked_port}",
                 )
+
+            logger.info(
+                f"Forked worker {worker_id} created at {forked_host}:{forked_port} "
+                f"(pid={forked_pid}) from {target_role}/{idx}"
+            )
 
         except aiohttp.ClientError as e:
             raise WorkerCreationError(
@@ -503,7 +589,7 @@ class SlurmScheduler(Scheduler):
         port_cnt = len(self._workers[target_role][0].worker.worker_ports)
         if port_cnt > 1:
             async with session.post(
-                f"http://{forked_host}:{forked_port}/alloc_ports",
+                f"http://{format_hostport(forked_host, forked_port)}/alloc_ports",
                 json=dict(count=port_cnt - 1),
             ) as response:
                 if response.status != 200:
@@ -534,7 +620,7 @@ class SlurmScheduler(Scheduler):
         target_wi: SlurmWorkerInfo,
     ) -> None:
         """Kill a single forked worker via its parent's RPC server."""
-        target_url = f"http://{target_wi.worker.ip}:{target_wi.worker.worker_ports[0]}/kill_forked_worker"
+        target_url = f"http://{format_hostport(target_wi.worker.ip, int(target_wi.worker.worker_ports[0]))}/kill_forked_worker"
 
         try:
             payload = {"role": role, "worker_index": idx}
@@ -1217,7 +1303,7 @@ class SlurmScheduler(Scheduler):
 
         payload = {"env": env}
         port = int(worker_info.worker.worker_ports[0])
-        url = f"http://{worker_info.worker.ip}:{port}/set_env"
+        url = f"http://{format_hostport(worker_info.worker.ip, port)}/set_env"
 
         try:
             timeout = aiohttp.ClientTimeout(total=30.0)
@@ -1302,7 +1388,7 @@ class SlurmScheduler(Scheduler):
         }
 
         port = int(worker_info.worker.worker_ports[0])
-        url = f"http://{worker_info.worker.ip}:{port}/create_engine"
+        url = f"http://{format_hostport(worker_info.worker.ip, port)}/create_engine"
 
         try:
             logger.debug(
@@ -1328,7 +1414,7 @@ class SlurmScheduler(Scheduler):
                         return result.get("result")
                     elif response.status == 400:
                         error_detail = (await response.json()).get(
-                            "detail", "Unknown error"
+                            "error", "Unknown error"
                         )
                         if "Failed to import" in error_detail:
                             raise EngineImportError(engine, error_detail)
@@ -1336,7 +1422,7 @@ class SlurmScheduler(Scheduler):
                             raise EngineCreationError(worker_id, error_detail, 400)
                     elif response.status == 500:
                         error_detail = (await response.json()).get(
-                            "detail", "Unknown error"
+                            "error", "Unknown error"
                         )
                         raise EngineCreationError(worker_id, error_detail, 500)
                     else:
@@ -1363,6 +1449,7 @@ class SlurmScheduler(Scheduler):
         method: str,
         engine_name: str | None = None,
         *args,
+        rpc_meta: dict[str, Any] | None = None,
         http_timeout: float = 7200.0,
         max_retries: int = 3,
         retry_delay: float = 1.0,
@@ -1418,10 +1505,11 @@ class SlurmScheduler(Scheduler):
             "engine_name": engine_name,
             "args": serialized_args,
             "kwargs": serialized_kwargs,
+            "rpc_meta": rpc_meta,
         }
 
         port = int(worker_info.worker.worker_ports[0])
-        url = f"http://{worker_info.worker.ip}:{port}/call"
+        url = f"http://{format_hostport(worker_info.worker.ip, port)}/call"
         last_error = None
 
         for attempt in range(1, max_retries + 1):
@@ -1438,7 +1526,7 @@ class SlurmScheduler(Scheduler):
                     result = response.json()
                     return deserialize_value(result.get("result"))
                 elif response.status_code == 500:
-                    error_detail = response.json().get("detail", "Unknown error")
+                    error_detail = response.json().get("error", "Unknown error")
                     # Check if retryable
                     if attempt < max_retries and "timeout" in error_detail.lower():
                         last_error = f"Engine method timeout: {error_detail}"
@@ -1456,7 +1544,7 @@ class SlurmScheduler(Scheduler):
                         f"Worker temporarily unavailable, retry {attempt}/{max_retries}"
                     )
                 else:
-                    error_detail = response.json().get("detail", "Unknown error")
+                    error_detail = response.json().get("error", "Unknown error")
                     raise EngineCallError(
                         worker_id,
                         method,
@@ -1494,6 +1582,7 @@ class SlurmScheduler(Scheduler):
         method: str,
         engine_name: str | None = None,
         *args,
+        rpc_meta: dict[str, Any] | None = None,
         http_timeout: float = 7200.0,
         max_retries: int = 3,
         retry_delay: float = 1.0,
@@ -1549,10 +1638,11 @@ class SlurmScheduler(Scheduler):
             "engine_name": engine_name,
             "args": serialized_args,
             "kwargs": serialized_kwargs,
+            "rpc_meta": rpc_meta,
         }
 
         port = int(worker_info.worker.worker_ports[0])
-        url = f"http://{worker_info.worker.ip}:{port}/call"
+        url = f"http://{format_hostport(worker_info.worker.ip, port)}/call"
         last_error = None
 
         for attempt in range(1, max_retries + 1):
@@ -1579,7 +1669,7 @@ class SlurmScheduler(Scheduler):
                             return deserialize_value(result.get("result"))
                         elif response.status == 500:
                             error_detail = (await response.json()).get(
-                                "detail", "Unknown error"
+                                "error", "Unknown error"
                             )
                             if (
                                 attempt < max_retries
@@ -1600,7 +1690,7 @@ class SlurmScheduler(Scheduler):
                             )
                         else:
                             error_detail = (await response.json()).get(
-                                "detail", "Unknown error"
+                                "error", "Unknown error"
                             )
                             raise EngineCallError(
                                 worker_id,

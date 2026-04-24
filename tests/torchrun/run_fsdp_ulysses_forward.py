@@ -7,14 +7,13 @@ import torch.distributed as dist
 
 from tests.utils import get_model_path
 
-from areal.api.alloc_mode import ParallelStrategy
+from areal.api import FinetuneSpec, ParallelStrategy
 from areal.api.cli_args import (
     MicroBatchSpec,
     OptimizerConfig,
     TrainEngineConfig,
 )
-from areal.api.io_struct import FinetuneSpec
-from areal.engine.fsdp_engine import FSDPEngine
+from areal.engine import FSDPEngine
 from areal.infra.platforms import current_platform
 
 MODEL_PATHS = {
@@ -76,6 +75,7 @@ def mock_input(
 
 def make_engine(model_type, mb_spec, ulysses_sp_size=1, init_optimizer=False):
     config = TrainEngineConfig(
+        backend="fsdp:d2",
         experiment_name="test",
         trial_name="test",
         path=MODEL_PATHS[model_type],
