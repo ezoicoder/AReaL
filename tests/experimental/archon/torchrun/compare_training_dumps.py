@@ -13,6 +13,8 @@ Given two directories produced by :mod:`run_archon_training_test`, this script:
    PASS/FAIL summary.  ``requires_grad=True`` only means a parameter *may* receive
    gradients; a zero ``.grad`` after backward is normal if the loss graph does not
    flow to that parameter for that step (e.g. critic value head only).
+4. If both dumps contain ``forward.step*.summary.pt`` (from
+   ``test_config.dump_forward_compare``), compares valid-token forward outputs.
 
 The tool is launched as a plain Python script -- no distributed setup required.
 
@@ -31,6 +33,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -207,6 +210,18 @@ class DiffFileGap:
     max_abs_rel_gap: float
     l2_gap: float
     l2_rel_gap: float
+
+
+@dataclass
+class ForwardTensorGap:
+    key: str
+    shape_match: bool
+    max_diff: float
+    mean_diff: float
+    l2_rel_gap: float
+
+
+_FORWARD_SUMMARY_RE = re.compile(r"forward\.step(\d+)\.summary\.pt$")
 
 
 def _load_diff_signatures(path: str) -> dict[str, ParamUpdateStat]:
@@ -520,6 +535,55 @@ def _compare_state_dicts(
     return diffs, only_a, only_b
 
 
+def _discover_forward_summary_files(dump_dir: str) -> dict[int, str]:
+    out: dict[int, str] = {}
+    for p in Path(dump_dir).glob("forward.step*.summary.pt"):
+        m = _FORWARD_SUMMARY_RE.fullmatch(p.name)
+        if m is None:
+            continue
+        step = int(m.group(1))
+        out[step] = str(p)
+    return out
+
+
+def _load_forward_compare_payload(path: str) -> dict[str, Any]:
+    payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected dict payload in {path}, got {type(payload)}")
+    return payload
+
+
+def _compare_forward_tensor(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    key: str,
+) -> ForwardTensorGap:
+    ta = a.detach().float().cpu()
+    tb = b.detach().float().cpu()
+    if ta.shape != tb.shape:
+        return ForwardTensorGap(
+            key=key,
+            shape_match=False,
+            max_diff=float("inf"),
+            mean_diff=float("inf"),
+            l2_rel_gap=float("inf"),
+        )
+    delta = (ta - tb).abs()
+    max_diff = float(delta.max().item()) if delta.numel() > 0 else 0.0
+    mean_diff = float(delta.mean().item()) if delta.numel() > 0 else 0.0
+    l2a = float(ta.norm().item())
+    l2b = float(tb.norm().item())
+    l2_rel_gap = _relative_gap(l2a, l2b)
+    return ForwardTensorGap(
+        key=key,
+        shape_match=True,
+        max_diff=max_diff,
+        mean_diff=mean_diff,
+        l2_rel_gap=l2_rel_gap,
+    )
+
+
 def _summarize_param_diffs(diffs: list[ParamDiff]) -> dict[str, float]:
     if not diffs:
         return {
@@ -810,6 +874,133 @@ def _print_name_gap_report(
             print(f"{name[:80]:<80} {norm_value:>12.3e} {delta_value:>12.3e}")
 
 
+def _print_forward_compare_report(
+    dump_a: str,
+    dump_b: str,
+    *,
+    rel_gap_tol: float,
+    max_abs_tol: float,
+) -> bool:
+    summary_a = _discover_forward_summary_files(dump_a)
+    summary_b = _discover_forward_summary_files(dump_b)
+    if not summary_a and not summary_b:
+        print("\n[info] no forward.step*.summary.pt in either dump.")
+        return True
+    if not summary_a or not summary_b:
+        print(
+            "\n[warn] forward summaries present on only one side "
+            f"(a={bool(summary_a)}, b={bool(summary_b)}); skipping forward comparison."
+        )
+        return False
+
+    steps_a = set(summary_a.keys())
+    steps_b = set(summary_b.keys())
+    shared_steps = sorted(steps_a & steps_b)
+    only_a_steps = sorted(steps_a - steps_b)
+    only_b_steps = sorted(steps_b - steps_a)
+
+    print("\n=== valid-token forward output comparison ===")
+    print(
+        f"  step_coverage: shared={len(shared_steps)} only_a={len(only_a_steps)} "
+        f"only_b={len(only_b_steps)}"
+    )
+    if only_a_steps or only_b_steps:
+        print(
+            _colorize(
+                f"[warn] forward summary mismatch: only_a={only_a_steps[:6]} "
+                f"only_b={only_b_steps[:6]}",
+                _ANSI_YELLOW,
+                bold=True,
+            )
+        )
+
+    ok = not only_a_steps and not only_b_steps
+    tensor_gaps: list[ForwardTensorGap] = []
+    global_max_gap = 0.0
+    global_mean_gap = 0.0
+    for step in shared_steps:
+        pa = _load_forward_compare_payload(summary_a[step])
+        pb = _load_forward_compare_payload(summary_b[step])
+        meta_ok = (
+            pa.get("output_kind") == pb.get("output_kind")
+            and int(pa.get("global_input_tokens", -1))
+            == int(pb.get("global_input_tokens", -2))
+            and int(pa.get("global_valid_output_numel", -1))
+            == int(pb.get("global_valid_output_numel", -2))
+            and int(pa.get("global_mask_mismatch_ranks", -1))
+            == int(pb.get("global_mask_mismatch_ranks", -2))
+        )
+        ok = ok and meta_ok
+        ranks_a = {
+            int(x["rank"]): x for x in pa.get("per_rank", []) if isinstance(x, dict)
+        }
+        ranks_b = {
+            int(x["rank"]): x for x in pb.get("per_rank", []) if isinstance(x, dict)
+        }
+        rank_shared = sorted(set(ranks_a) & set(ranks_b))
+        ok = ok and set(ranks_a) == set(ranks_b)
+        for rank in rank_shared:
+            ra = ranks_a[rank]
+            rb = ranks_b[rank]
+            pos_a = ra.get("valid_token_positions")
+            pos_b = rb.get("valid_token_positions")
+            positions_ok = (
+                isinstance(pos_a, torch.Tensor)
+                and isinstance(pos_b, torch.Tensor)
+                and torch.equal(pos_a, pos_b)
+            )
+            ok = ok and positions_ok
+            ta = ra.get("valid_forward_fp32")
+            tb = rb.get("valid_forward_fp32")
+            if isinstance(ta, torch.Tensor) and isinstance(tb, torch.Tensor):
+                tg = _compare_forward_tensor(
+                    ta, tb, key=f"step={step},rank={rank},valid_forward"
+                )
+                tensor_gaps.append(tg)
+                global_max_gap = max(global_max_gap, tg.max_diff)
+                global_mean_gap = max(global_mean_gap, tg.mean_diff)
+                ok = (
+                    ok
+                    and tg.shape_match
+                    and tg.max_diff <= max_abs_tol
+                    and tg.l2_rel_gap < rel_gap_tol
+                )
+            else:
+                ok = False
+                print(
+                    _colorize(
+                        f"[warn] missing valid_forward_fp32 for step={step}, rank={rank}",
+                        _ANSI_YELLOW,
+                        bold=True,
+                    )
+                )
+
+    print(
+        f"  valid_forward_max_diff_max={global_max_gap:.3e}, "
+        f"valid_forward_mean_diff_max={global_mean_gap:.3e} "
+        f"(tol abs={max_abs_tol:.3e}, rel={rel_gap_tol:.3e})"
+    )
+    if tensor_gaps:
+        worst = sorted(tensor_gaps, key=lambda g: g.max_diff, reverse=True)[:10]
+        print(f"  top-{len(worst)} forward tensor gaps by max_diff:")
+        for g in worst:
+            print(
+                f"    {g.key:<52} max={g.max_diff:.3e} "
+                f"mean={g.mean_diff:.3e} l2_rel={g.l2_rel_gap:.3e} "
+                f"shape_match={g.shape_match}"
+            )
+
+    print(
+        "  forward_compare overall: "
+        + (
+            _colorize("PASS", _ANSI_GREEN, bold=True)
+            if ok
+            else _colorize("FAIL", _ANSI_RED, bold=True)
+        )
+    )
+    return ok
+
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
@@ -836,6 +1027,12 @@ def run_comparison(
     full_delta_ok = True
     grad_ok = True
     grad_full_ok = True
+    forward_ok = _print_forward_compare_report(
+        dump_a,
+        dump_b,
+        rel_gap_tol=diff_rel_gap_tol,
+        max_abs_tol=full_delta_rel_gap_tol,
+    )
 
     diff_a = Path(dump_a) / "diff.pt"
     diff_b = Path(dump_b) / "diff.pt"
@@ -1005,7 +1202,14 @@ def run_comparison(
             f"(a={lg_a.is_file()}, b={lg_b.is_file()}); skipping grad comparison."
         )
 
-    return loss_ok and diff_ok and full_delta_ok and grad_ok and grad_full_ok
+    return (
+        loss_ok
+        and diff_ok
+        and full_delta_ok
+        and grad_ok
+        and grad_full_ok
+        and forward_ok
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

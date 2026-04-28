@@ -579,8 +579,6 @@ class ArchonEngine(TrainEngine):
             self.logger.info("tree_training_mode='dta' in train_batch")
             self.logger.info(f"total_loss_weight: {total_loss_weight}")
             dta_stats = self.dta_wrapper.run_backward_with_scaled_loss(
-                input_ids_batch=input_batched["input_ids"],
-                attention_mask=input_batched["attention_mask"],
                 mb_list=mb_list,
                 prepare_mb_inputs_fn=self._prepare_mb_inputs,
                 loss_fn=loss_fn,
@@ -689,13 +687,6 @@ class ArchonEngine(TrainEngine):
 
         input_batched, meta = self._normalize_batch_input(input_)
 
-        if self.tree_training_mode == "dta":
-            self.logger.info("tree_training_mode='dta' in forward_batch")
-            return self.dta_wrapper.run_forward(
-                input_ids_batch=input_batched["input_ids"],
-                attention_mask=input_batched["attention_mask"],
-            )
-
         if meta is not None:
             assert isinstance(input_, list)
             inferred_seqlens = [d["attention_mask"].shape[-1] for d in input_]
@@ -713,16 +704,26 @@ class ArchonEngine(TrainEngine):
         batch_size = len(output_seqlens)
 
         mb_list = self._prepare_mb_list(input_batched).to(self.device)
+        if self.tree_training_mode == "dta":
+            self.logger.info("tree_training_mode='dta' in forward_batch")
+            dta_out = self.dta_wrapper.run_forward(mb_list=mb_list)
+            # Build per-sequence outputs in forward microbatch order so we can reuse
+            # the standard reorder_and_pad_outputs post-processing path.
+            seq_outputs = [
+                dta_out[i, : int(output_seqlens[i])] for i in range(batch_size)
+            ]
+            outputs = [seq_outputs[i] for i in mb_list.forward_indices]
+        else:
 
-        def process_output(
-            logits: torch.Tensor, ctx_dict: dict[str, Any]
-        ) -> torch.Tensor:
-            ctx = ArchonTrainContext(**ctx_dict)
-            return self._compute_forward_result(logits, ctx)
+            def process_output(
+                logits: torch.Tensor, ctx_dict: dict[str, Any]
+            ) -> torch.Tensor:
+                ctx = ArchonTrainContext(**ctx_dict)
+                return self._compute_forward_result(logits, ctx)
 
-        outputs = self.forward_backward_batch(
-            mb_list, process_output, forward_only=True
-        )
+            outputs = self.forward_backward_batch(
+                mb_list, process_output, forward_only=True
+            )
 
         if self.pp_has_last_stage:
             assert outputs is not None

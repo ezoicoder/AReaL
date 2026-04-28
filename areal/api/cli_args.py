@@ -1670,7 +1670,8 @@ class PPOActorConfig(TrainEngineConfig):
                             f"{norm_name} uses 'group' level normalization, which is incompatible "
                             "with packing_algorithm='dta'. DTA requires sequence-level independence, "
                             "but 'group' normalization relies on contiguous group slices. Please use "
-                            "'batch' level normalization or set packing_algorithm='ffd'."
+                            "'batch' level normalization or set packing_algorithm='ffd'. "
+                            "(Group-level support for DTA will be provided in a future release.)"
                         )
 
         super().__post_init__()

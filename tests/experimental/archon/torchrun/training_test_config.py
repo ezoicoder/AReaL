@@ -93,6 +93,9 @@ class TestOnlyConfig:
     # After ``ArchonLMEngine.initialize`` (HF load + buffers), export weights with
     # ``ArchonEngine.save`` / ``save_model_to_hf`` into this directory. ``None`` = skip.
     save_hf_checkpoint_dir: str | None = None
+    # Optional forward parity check: compare current tree_training_mode output with
+    # a baseline engine forced to ``tree_training_mode=disabled`` at one step.
+    dump_forward_compare: bool = False
 
     def __post_init__(self) -> None:
         if self.step is None or int(self.step) < 0:

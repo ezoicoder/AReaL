@@ -11,7 +11,6 @@ from transformers.cache_utils import DynamicCache
 
 from areal.experimental.dta.dta_engine import DTAEngine
 from areal.experimental.dta.token_trie import TokenTrie
-from areal.utils.data import extract_valid_token_sequences
 
 
 class KVCacheModel(Protocol):
@@ -51,14 +50,9 @@ class DTAWrapper:
         )
 
     @torch.no_grad()
-    def run_forward(
-        self,
-        input_ids_batch: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        input_ids_list, max_seq_len = extract_valid_token_sequences(
-            input_ids_batch, attention_mask
-        )
+    def run_forward(self, mb_list: Any) -> torch.Tensor:
+        input_ids_list = self._extract_input_ids_list_from_mb_list(mb_list)
+        max_seq_len = max((ids.numel() for ids in input_ids_list), default=0)
         input_data = [{} for _ in input_ids_list]
         trie = TokenTrie(input_ids_list, input_data, sorted=False)
         trie.forward_permute()
@@ -77,33 +71,27 @@ class DTAWrapper:
             output_padded[i, :seq_len] = seq
         return output_padded
 
-    def run_backward(
-        self,
-        input_ids_batch: torch.Tensor,
-        attention_mask: torch.Tensor,
-        per_seq_input_data: list[dict[str, Any]],
-        loss_fn: Any,
-        block_size: int | None = None,
-    ) -> dict[str, float]:
-        input_ids_list, _ = extract_valid_token_sequences(
-            input_ids_batch, attention_mask
-        )
+    @staticmethod
+    def _extract_input_ids(mb_input: dict[str, Any]) -> torch.Tensor:
+        if "input_ids" not in mb_input:
+            raise ValueError("DTA expects `input_ids` in micro-batch input.")
+        input_ids = mb_input["input_ids"]
+        if not torch.is_tensor(input_ids) or input_ids.ndim != 1:
+            raise ValueError(
+                "DTA expects packed 1D `input_ids` in micro-batch input, "
+                f"got {type(input_ids)} with ndim="
+                f"{getattr(input_ids, 'ndim', 'N/A')}."
+            )
+        return input_ids
 
-        trie = TokenTrie(input_ids_list, per_seq_input_data, sorted=False)
-        trie.backward_permute()
-
-        total_loss = self._engine.backward(
-            model=self.model,
-            token_trie=trie,
-            block_size=block_size or self.block_size,
-            loss_fn=loss_fn,
-        )
-        return {"dta_loss": float(total_loss)}
+    def _extract_input_ids_list_from_mb_list(self, mb_list: Any) -> list[torch.Tensor]:
+        input_ids_list: list[torch.Tensor] = []
+        for mb_item in mb_list:
+            input_ids_list.append(self._extract_input_ids(mb_item.orig_mb))
+        return input_ids_list
 
     def run_backward_with_scaled_loss(
         self,
-        input_ids_batch: torch.Tensor,
-        attention_mask: torch.Tensor,
         mb_list: Any,
         prepare_mb_inputs_fn: Any,
         loss_fn: Any,
@@ -111,13 +99,22 @@ class DTAWrapper:
         total_loss_weight: torch.Tensor,
         block_size: int | None = None,
     ) -> dict[str, float]:
+        input_ids_list = self._extract_input_ids_list_from_mb_list(mb_list)
         per_seq_input_data: list[dict[str, Any]] = []
-        for mb_item in mb_list:
+        for idx, mb_item in enumerate(mb_list):
             _, ctx = prepare_mb_inputs_fn(mb_item)
+            mb_input = ctx.mb_input
+            # Keep backward input source aligned with forward input source.
+            self._extract_input_ids(mb_input)
+            if mb_input["input_ids"].shape != input_ids_list[idx].shape:
+                raise ValueError(
+                    "DTA expects `ctx.mb_input['input_ids']` to align with "
+                    "`mb_item.orig_mb['input_ids']` for each micro-batch."
+                )
             loss_scale = loss_weight_fn(ctx.mb_input) / total_loss_weight
             if isinstance(loss_scale, torch.Tensor):
                 loss_scale = loss_scale.item()
-            per_seq_input_data.append({"original": ctx.mb_input, "scale": loss_scale})
+            per_seq_input_data.append({"original": mb_input, "scale": loss_scale})
 
         if self.is_critic:
 
@@ -150,10 +147,13 @@ class DTAWrapper:
                 )
                 return loss_val * seq_input_data["scale"]
 
-        return self.run_backward(
-            input_ids_batch=input_ids_batch,
-            attention_mask=attention_mask,
-            per_seq_input_data=per_seq_input_data,
+        trie = TokenTrie(input_ids_list, per_seq_input_data, sorted=False)
+        trie.backward_permute()
+
+        total_loss = self._engine.backward(
+            model=self.model,
+            token_trie=trie,
+            block_size=block_size or self.block_size,
             loss_fn=scaled_loss_fn,
-            block_size=block_size,
         )
+        return {"dta_loss": float(total_loss)}

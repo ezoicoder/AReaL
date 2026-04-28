@@ -693,19 +693,17 @@ def _save_diff_snapshot(
 # -----------------------------------------------------------------------------
 
 
-def _run_single_step(
+def _build_step_batch(
     *,
     engine: ArchonLMEngine,
     cfg: ArchonTrainingTestConfig,
     step_idx: int,
     step_file: str,
     device: torch.device,
-    loss_fn,
 ) -> dict[str, Any]:
-    """Run one training step and return a global (all-rank) stats record."""
+    """Build one local stride-sharded batch for a data file."""
     dp_rank = engine.data_parallel_rank
     dp_world_size = engine.data_parallel_world_size
-
     seqs = _load_sequences(step_file)
     cap = int(cfg.test_config.max_sequences_per_pt)
     if cap > 0:
@@ -716,7 +714,6 @@ def _run_single_step(
                 f"no sequences left in {step_file}."
             )
     max_tokens = int(engine.config.mb_spec.max_tokens_per_mb)
-
     trajectories = _build_local_trajectories(
         seqs=seqs,
         dp_rank=dp_rank,
@@ -725,19 +722,133 @@ def _run_single_step(
         max_tokens=max_tokens,
         device=device,
     )
-
-    # Keep stride-local shards for all tree_training_mode / packing_algorithm
-    # settings so DP ranks are not forced through a global rebalance.
-    local_trajectories = trajectories
-    if not local_trajectories:
+    if not trajectories:
         raise RuntimeError(
             f"Step {step_idx}: local trajectory list is empty for rank {dp_rank}."
         )
-    batch, _ = concat_batch(local_trajectories)
-    batch = {
+    batch, _ = concat_batch(trajectories)
+    return {
         k: (v.to(device) if isinstance(v, torch.Tensor) else v)
         for k, v in batch.items()
     }
+
+
+def _dump_forward_outputs(
+    *,
+    engine: ArchonLMEngine,
+    cfg: ArchonTrainingTestConfig,
+    step_idx: int,
+    step_file: str,
+    device: torch.device,
+    dump_dir: str,
+) -> dict[str, Any]:
+    """Run forward_batch and dump valid-token outputs for this step.
+
+    Actor outputs are token logprobs; critic outputs are token values.
+    """
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    batch = _build_step_batch(
+        engine=engine,
+        cfg=cfg,
+        step_idx=step_idx,
+        step_file=step_file,
+        device=device,
+    )
+    out = engine.forward_batch(input_=batch)
+    if not torch.is_tensor(out):
+        raise TypeError(
+            f"forward dump expects dict input and tensor output, got {type(out)}."
+        )
+    out_cpu = out.detach().to(device="cpu", dtype=torch.float32)
+    valid_mask_cpu = batch["attention_mask"].detach().to(device="cpu").bool()
+    local_input_tokens = int(valid_mask_cpu.sum().item())
+    mask_matches_output = tuple(valid_mask_cpu.shape) == tuple(out_cpu.shape)
+    if mask_matches_output:
+        valid_positions = valid_mask_cpu.nonzero(as_tuple=False).to(torch.int32)
+        valid_forward = out_cpu[valid_mask_cpu].contiguous()
+    else:
+        valid_positions = torch.empty((0, 2), dtype=torch.int32)
+        valid_forward = torch.empty(0, dtype=torch.float32)
+    mismatch_t = torch.tensor(
+        [0.0 if mask_matches_output else 1.0],
+        dtype=torch.float64,
+        device=device,
+    )
+    token_reduce_t = torch.tensor(
+        [
+            float(local_input_tokens),
+            float(valid_forward.numel()),
+        ],
+        dtype=torch.float64,
+        device=device,
+    )
+    if dist.is_initialized():
+        dist.all_reduce(mismatch_t, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_reduce_t, op=dist.ReduceOp.SUM)
+    global_mask_mismatch_ranks = int(round(float(mismatch_t.item())))
+    global_input_tokens = int(round(float(token_reduce_t[0].item())))
+    global_valid_output_numel = int(round(float(token_reduce_t[1].item())))
+
+    local_summary = {
+        "rank": int(rank),
+        "local_input_tokens": local_input_tokens,
+        "local_valid_output_numel": int(valid_forward.numel()),
+        "local_padded_output_numel": int(out_cpu.numel()),
+        "shape": list(out_cpu.shape),
+        "local_valid_mask_matches_output": bool(mask_matches_output),
+        "global_input_tokens": global_input_tokens,
+        "global_valid_output_numel": global_valid_output_numel,
+        "global_mask_mismatch_ranks": global_mask_mismatch_ranks,
+        "valid_token_positions": valid_positions,
+        "valid_forward_fp32": valid_forward,
+    }
+    if dist.is_initialized():
+        all_summaries: list[dict[str, Any] | None] = [
+            None for _ in range(dist.get_world_size())
+        ]
+        dist.all_gather_object(all_summaries, local_summary)
+    else:
+        all_summaries = [local_summary]
+    if rank == 0:
+        summary_payload = {
+            "schema_version": 1,
+            "step": int(step_idx),
+            "file": os.path.abspath(step_file),
+            "tree_training_mode": str(engine.config.tree_training_mode),
+            "is_critic": bool(engine.config.is_critic),
+            "output_kind": "value" if engine.config.is_critic else "logprob",
+            "global_input_tokens": global_input_tokens,
+            "global_valid_output_numel": global_valid_output_numel,
+            "global_mask_mismatch_ranks": global_mask_mismatch_ranks,
+            "per_rank": all_summaries,
+        }
+        summary_path = os.path.join(dump_dir, f"forward.step{step_idx}.summary.pt")
+        torch.save(summary_payload, summary_path)
+    if dist.is_initialized():
+        dist.barrier(group=engine.cpu_group)
+    return {
+        "step": int(step_idx),
+        "file": os.path.abspath(step_file),
+        "global_input_tokens": global_input_tokens,
+        "global_valid_output_numel": global_valid_output_numel,
+        "global_mask_mismatch_ranks": global_mask_mismatch_ranks,
+    }
+
+
+def _run_single_step(
+    *,
+    engine: ArchonLMEngine,
+    cfg: ArchonTrainingTestConfig,
+    step_idx: int,
+    step_file: str,
+    device: torch.device,
+    loss_fn,
+) -> dict[str, Any]:
+    """Run one training step and return a global (all-rank) stats record."""
+    dp_world_size = engine.data_parallel_world_size
+    batch = _build_step_batch(
+        engine=engine, cfg=cfg, step_idx=step_idx, step_file=step_file, device=device
+    )
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -920,7 +1031,6 @@ def main(argv: list[str] | None = None) -> None:
             initial_params = _snapshot_initial_full_params(engine)
 
         loss_fn = _make_loss_fn(cfg)
-
         num_steps = int(cfg.test_config.step)
         for step_idx in range(num_steps):
             file_idx = step_idx % len(step_files)
@@ -933,6 +1043,27 @@ def main(argv: list[str] | None = None) -> None:
                     step_idx,
                     os.path.abspath(step_file),
                 )
+
+            if cfg.test_config.dump_forward_compare:
+                forward_record = _dump_forward_outputs(
+                    engine=engine,
+                    cfg=cfg,
+                    step_idx=step_idx,
+                    step_file=step_file,
+                    device=device,
+                    dump_dir=dump_dir,
+                )
+                if rank == 0:
+                    logger.info(
+                        "Forward output dumped: step=%d file=%s output_kind=%s "
+                        "global_tokens=%d global_valid_outputs=%d mask_mismatch_ranks=%d",
+                        forward_record["step"],
+                        os.path.basename(forward_record["file"]),
+                        "value" if engine.config.is_critic else "logprob",
+                        forward_record["global_input_tokens"],
+                        forward_record["global_valid_output_numel"],
+                        forward_record["global_mask_mismatch_ranks"],
+                    )
 
             record = _run_single_step(
                 engine=engine,

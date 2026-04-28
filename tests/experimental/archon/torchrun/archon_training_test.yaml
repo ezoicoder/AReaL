@@ -68,3 +68,5 @@ test_config:
   save_full_last_grad_tensors_fp32: true
   # Optional: ``null``/omit = no HF export after init; else directory for ``save_model_to_hf``.
   save_hf_checkpoint_dir: null
+  # Optional: dump forward_batch parity payload (current mode vs disabled baseline).
+  dump_forward_compare: true
