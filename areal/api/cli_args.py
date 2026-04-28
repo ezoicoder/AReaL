@@ -557,7 +557,7 @@ class ArchonEngineConfig:
 
     # Whether to enable torch.compile
     enable_compile: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "Enable torch.compile for TransformerBlocks."},
     )
 
@@ -2629,6 +2629,14 @@ class _DatasetConfig:
             "If set, dataset loading will be offloaded to a data service with remote workers."
         },
     )
+    setup_timeout: float = field(
+        default=120.0,
+        metadata={
+            "help": "Timeout in seconds for the data service to load and register a dataset. "
+            "Increase this value when loading large datasets for the first time "
+            "(e.g. HuggingFace datasets that require downloading and preprocessing)."
+        },
+    )
 
 
 @dataclass
@@ -2763,6 +2771,52 @@ class RWConfig(BaseExperimentConfig):
             raise ValueError(
                 "RWConfig requires actor.is_critic=True for reward modeling. "
                 "Set 'actor.is_critic: true' in your YAML config."
+            )
+
+
+@dataclass
+class DPOEngineConfig(TrainEngineConfig):
+    """Engine configuration for DPO training, extending TrainEngineConfig with DPO-specific fields."""
+
+    beta: float = field(
+        default=0.1,
+        metadata={"help": "KL penalty coefficient for DPO loss."},
+    )
+
+    loss_type: str = field(
+        default="sigmoid",
+        metadata={
+            "help": "DPO loss variant. "
+            "'sigmoid': original DPO loss (Rafailov et al. 2023). "
+            "'ipo': Identity Preference Optimization with per-token length normalization (Azar et al. 2023).",
+            "choices": ["sigmoid", "ipo"],
+        },
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        _valid = {"sigmoid", "ipo"}
+        if self.loss_type not in _valid:
+            raise ValueError(
+                f"Unsupported DPO loss_type '{self.loss_type}'. "
+                f"Must be one of {sorted(_valid)}."
+            )
+
+
+@dataclass
+class DPOConfig(BaseExperimentConfig):
+    """Configuration for Direct Preference Optimization (DPO) experiments."""
+
+    actor: DPOEngineConfig = field(default_factory=DPOEngineConfig)
+
+    ref: DPOEngineConfig = field(default_factory=DPOEngineConfig)
+
+    def __post_init__(self):
+        super().__post_init__()
+        if getattr(self.actor, "is_critic", False):
+            raise ValueError(
+                "DPOConfig requires a language model (is_critic=False). "
+                "Remove 'actor.is_critic: true' from your YAML config."
             )
 
 

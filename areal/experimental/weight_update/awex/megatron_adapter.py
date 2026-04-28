@@ -22,7 +22,7 @@ from areal.experimental.weight_update.nccl_group import (
     setup_batch_isend_irecv,
 )
 from areal.experimental.weight_update.training_adapter import (
-    WeightUpdateTrainingAdapter,
+    AwexTrainingAdapter,
 )
 from areal.utils import logging
 
@@ -32,13 +32,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger("AwexMegatronAdapter")
 
 
-class AwexMegatronAdapter(WeightUpdateTrainingAdapter):
-    """Awex training adapter wrapping MegatronEngine for DP-only NCCL P2P weight updates.
+class AwexMegatronAdapter(AwexTrainingAdapter):
+    """Awex training adapter for MegatronEngine supporting DP, TP, and PP.
 
-    Scope: DP-only (tp=1, pp=1). Each rank holds a full replica of every
-    parameter. Parameters are converted to HF naming via convert_to_hf before
-    being handed to the awex transfer planner, matching what the inference
-    engine (SGLang) expects.
+    PP: get_named_parameters already yields only the current stage's layers
+    (with globally-correct HF layer indices via get_transformer_layer_offset),
+    so each rank naturally reports and sends only its own subset of parameters.
+    The gateway's _merge_training_meta_by_name unions disjoint PP stage params
+    by name, so the full model is covered across all PP ranks.
+
+    TP: all_gather_param gathers the full tensor on every TP rank before
+    convert_to_hf. dp_replicated=True tells awex that TP ranks within a DP
+    group hold identical full tensors and only one needs to send.
     """
 
     def __init__(self, engine: MegatronEngine):
@@ -52,13 +57,14 @@ class AwexMegatronAdapter(WeightUpdateTrainingAdapter):
         from megatron.core import parallel_state as mpu
 
         tp_size = mpu.get_tensor_model_parallel_world_size()
+        cp_size = mpu.get_context_parallel_world_size()
         return {
             "world_size": self._engine.world_size,
             "tp_size": tp_size,
             "pp_size": mpu.get_pipeline_model_parallel_world_size(),
             "dp_size": self._engine.data_parallel_world_size,
             "ep_size": mpu.get_expert_model_parallel_world_size(),
-            "dp_replicated": tp_size > 1,
+            "dp_replicated": tp_size > 1 or cp_size > 1,
         }
 
     def get_weight_metadata(self) -> list[ParameterMeta]:
@@ -198,6 +204,10 @@ class AwexMegatronAdapter(WeightUpdateTrainingAdapter):
         pp_rank = mpu.get_pipeline_model_parallel_rank()
         ep_size = mpu.get_expert_model_parallel_world_size()
         ep_rank = mpu.get_expert_model_parallel_rank()
+        etp_size = mpu.get_expert_tensor_parallel_world_size()
+        etp_rank = mpu.get_expert_tensor_parallel_rank()
+        cp_size = mpu.get_context_parallel_world_size()
+        cp_rank = mpu.get_context_parallel_rank()
         local_rank = int(os.environ.get("LOCAL_RANK", self._engine.rank))
 
         return RankInfo(
@@ -209,8 +219,8 @@ class AwexMegatronAdapter(WeightUpdateTrainingAdapter):
             dp_rank=self._engine.data_parallel_rank,
             ep_rank=ep_rank,
             ep_size=ep_size,
-            ep_tp_rank=0,
-            ep_tp_size=1,
+            ep_tp_rank=etp_rank,
+            ep_tp_size=etp_size,
             attn_tp_rank=tp_rank,
             attn_tp_size=tp_size,
             attn_dp_rank=self._engine.data_parallel_rank,
@@ -219,20 +229,18 @@ class AwexMegatronAdapter(WeightUpdateTrainingAdapter):
             local_rank=local_rank,
             engine_rank=0,
             is_infer=False,
-            cp_rank=0,
-            cp_size=1,
-            cp_mode="none",
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            cp_mode="ring" if cp_size > 1 else "none",
         )
 
     def _iter_hf_params(self):
         """Yield (hf_name, tensor) for every parameter on this rank.
 
-        Uses the same get_named_parameters + all_gather_param + convert_to_hf
-        pipeline that MegatronEngine._collect_param uses for weight broadcast,
-        so the names and shapes are guaranteed to match what SGLang expects.
-
-        For DP-only (tp=1, pp=1): all_gather_param is a no-op (returns
-        param.data directly) and convert_to_hf remaps mcore names to HF names.
+        Uses get_named_parameters + all_gather_param + convert_to_hf to produce
+        HF-style per-expert names (e.g. experts.0.gate_proj.weight). The SGLang
+        adapter's _unfuse_params converts SGLang's fused w13/w2 format to the
+        same per-expert names, so both sides match for the transfer plan.
         """
         from areal.engine.megatron_utils.megatron import (
             all_gather_param,
@@ -242,6 +250,9 @@ class AwexMegatronAdapter(WeightUpdateTrainingAdapter):
 
         num_moe_experts = getattr(self._engine.tf_config, "num_moe_experts", None)
         model_name = self._engine.hf_config.model_type
+        tie_word_embeddings = getattr(
+            self._engine.hf_config, "tie_word_embeddings", False
+        )
 
         for mcore_name, param in get_named_parameters(
             self._engine.model, num_moe_experts
@@ -262,4 +273,6 @@ class AwexMegatronAdapter(WeightUpdateTrainingAdapter):
                 mcore_name,
                 gathered,
             ):
+                if tie_word_embeddings and hf_name == "lm_head.weight":
+                    continue
                 yield hf_name, tensor.detach()

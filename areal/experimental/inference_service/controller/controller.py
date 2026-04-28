@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from threading import Lock
 from typing import TYPE_CHECKING, Any, cast
 
+import httpx
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 
 if TYPE_CHECKING:
@@ -98,7 +99,7 @@ class GatewayInferenceController:
 
             self.rollout_alloc = ModelAllocation.from_str(config.backend)
 
-        # Multi-node: derive nnodes_per_instance from n_gpus_per_node.
+        # Multi-node: derive nnodes_per_instance from scheduler's n_gpus_per_node.
         # External mode has no local inference servers, so always single-node.
         if self.rollout_alloc is None:
             nnodes_per_instance = 1
@@ -107,19 +108,17 @@ class GatewayInferenceController:
                 self.rollout_alloc.parallel.tp_size
                 * self.rollout_alloc.parallel.pp_size
             )
-            n_gpus_per_node = config.n_gpus_per_node
-            if n_gpus_per_node is None:
+            n_gpus_per_node = self.scheduler.n_gpus_per_node
+            if n_gpus_per_node < 1:
+                raise ValueError(f"n_gpus_per_node must be >= 1, got {n_gpus_per_node}")
+            if total_gpus <= n_gpus_per_node:
                 nnodes_per_instance = 1
+            elif total_gpus % n_gpus_per_node != 0:
+                raise ValueError(
+                    f"tp_size * pp_size ({total_gpus}) must be divisible "
+                    f"by n_gpus_per_node ({n_gpus_per_node})"
+                )
             else:
-                if n_gpus_per_node < 1:
-                    raise ValueError(
-                        f"n_gpus_per_node must be >= 1, got {n_gpus_per_node}"
-                    )
-                if total_gpus % n_gpus_per_node != 0:
-                    raise ValueError(
-                        f"tp_size * pp_size ({total_gpus}) must be divisible "
-                        f"by n_gpus_per_node ({n_gpus_per_node})"
-                    )
                 nnodes_per_instance = total_gpus // n_gpus_per_node
         self._nnodes_per_instance = nnodes_per_instance
 
@@ -167,6 +166,12 @@ class GatewayInferenceController:
         # Track services forked directly via RPCGuard /fork (raw_cmd mode).
         # Each entry: (guard_addr, role, worker_index) for /kill_forked_worker.
         self._forked_services: list[tuple[str, str, int]] = []
+
+        # Shared HTTP clients
+        self._sync_client = httpx.Client(timeout=30.0)
+        self._async_client: httpx.AsyncClient | None = None
+        self._async_client_loop: asyncio.AbstractEventLoop | None = None
+        self._destroyed = False
 
         # Proxy compatibility (no-ops — gateway IS the proxy)
         self._proxy_started = False
@@ -258,8 +263,6 @@ class GatewayInferenceController:
           start with an empty ``--backend-addr``.
         """
         from dataclasses import asdict
-
-        import requests
 
         from areal.api.cli_args import SchedulingSpec, SchedulingStrategy
         from areal.api.scheduler_api import Job
@@ -431,10 +434,9 @@ class GatewayInferenceController:
                 # Allocate rendezvous port on head node for distributed init
                 dist_init_addr = None
                 if nnodes_per_instance > 1:
-                    resp = requests.post(
+                    resp = self._sync_client.post(
                         f"{head_guard_addr}/alloc_ports",
                         json={"count": 1},
-                        timeout=30,
                     )
                     resp.raise_for_status()
                     rendezvous_data = resp.json()
@@ -449,10 +451,9 @@ class GatewayInferenceController:
                     guard_addr = f"http://{format_hostport(worker.ip, int(worker.worker_ports[0]))}"
 
                     # Allocate port for inference server on this node
-                    resp = requests.post(
+                    resp = self._sync_client.post(
                         f"{guard_addr}/alloc_ports",
                         json={"count": 1},
-                        timeout=30,
                     )
                     resp.raise_for_status()
                     port_data = resp.json()
@@ -494,10 +495,9 @@ class GatewayInferenceController:
                             "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
                         }
 
-                    resp = requests.post(
+                    resp = self._sync_client.post(
                         f"{guard_addr}/fork",
                         json=fork_payload,
-                        timeout=30,
                     )
                     resp.raise_for_status()
                     self._forked_services.append(
@@ -659,41 +659,54 @@ class GatewayInferenceController:
         self, url: str, name: str, timeout: float | None = None
     ) -> None:
         """Wait for a service to become healthy."""
-        import requests
-
         timeout = timeout or self.config.setup_timeout
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
-                resp = requests.get(url, timeout=2)
+                resp = self._sync_client.get(url, timeout=2)
                 if resp.status_code == 200:
                     logger.info("%s is ready at %s", name, url)
                     return
-            except requests.RequestException:
+            except httpx.HTTPError:
                 pass
             time.sleep(0.1)
         raise TimeoutError(f"{name} did not become healthy at {url} within {timeout}s")
 
     def _register_data_proxies_in_router(self) -> None:
         """Register all data proxy workers in the router and store their worker IDs."""
-        import requests
+        if not self._data_proxy_addrs:
+            return
 
-        for data_proxy_addr in self._data_proxy_addrs:
-            resp = requests.post(
-                f"{self._router_addr}/register",
-                json={"worker_addr": data_proxy_addr},
-                headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
-                timeout=5,
-            )
+        from concurrent.futures import ThreadPoolExecutor
+
+        admin_key = self.config.admin_api_key
+        router_addr = self._router_addr
+
+        def _register_one(data_proxy_addr: str) -> tuple[str, str | None]:
+            # Each thread gets its own httpx.Client because httpx.Client
+            # is not thread-safe and must not be shared across threads.
+            with httpx.Client() as client:
+                resp = client.post(
+                    f"{router_addr}/register",
+                    json={"worker_addr": data_proxy_addr},
+                    headers={"Authorization": f"Bearer {admin_key}"},
+                    timeout=5,
+                )
             resp.raise_for_status()
             worker_id = resp.json().get("worker_id")
-            if worker_id:
-                self._worker_ids[data_proxy_addr] = worker_id
             logger.info(
                 "Registered data proxy %s in router (worker_id=%s)",
                 data_proxy_addr,
                 worker_id,
             )
+            return data_proxy_addr, worker_id
+
+        with ThreadPoolExecutor(max_workers=len(self._data_proxy_addrs)) as pool:
+            results = list(pool.map(_register_one, self._data_proxy_addrs))
+
+        for data_proxy_addr, worker_id in results:
+            if worker_id:
+                self._worker_ids[data_proxy_addr] = worker_id
 
     def register_model(
         self,
@@ -702,11 +715,9 @@ class GatewayInferenceController:
         api_key: str | None = None,
         data_proxy_addrs: list[str] | None = None,
     ) -> None:
-        import requests
-
         if data_proxy_addrs is None:
             data_proxy_addrs = self._data_proxy_addrs
-        resp = requests.post(
+        resp = self._sync_client.post(
             f"{self._gateway_addr}/register_model",
             json={
                 "model": model,
@@ -872,6 +883,9 @@ class GatewayInferenceController:
 
     def destroy(self) -> None:
         """Tear down all services and release resources."""
+        if self._destroyed:
+            return
+        self._destroyed = True
         self._stop_online_callback_server()
 
         # Destroy workflow executor
@@ -892,6 +906,18 @@ class GatewayInferenceController:
                     traceback.format_exc(),
                 )
         self._forked_services.clear()
+
+        # Close shared HTTP clients after all kill requests have been sent
+        self._sync_client.close()
+        if self._async_client is not None:
+            try:
+                from areal.infra.utils.concurrent import run_async_task
+
+                run_async_task(self._async_client.aclose)
+            except Exception:
+                pass
+            self._async_client = None
+            self._async_client_loop = None
 
         # RPCGuard's shutdown `finally` block automatically kills all
         # forked children, so explicit teardown above is best-effort.
@@ -939,8 +965,20 @@ class GatewayInferenceController:
 
     async def _async_set_version(self, version: int) -> None:
         payload = {"version": version}
-        for wid in self._worker_ids.values():
-            await self._async_gateway_http_post(f"/set_version/{wid}", payload)
+        results = await asyncio.gather(
+            *[
+                self._async_gateway_http_post(f"/set_version/{wid}", payload)
+                for wid in self._worker_ids.values()
+            ],
+            return_exceptions=True,
+        )
+        failed = [r for r in results if isinstance(r, Exception)]
+        for r in failed:
+            logger.error("Failed to set version on a worker: %s", r)
+        if failed and len(failed) == len(results):
+            raise RuntimeError(
+                f"set_version({version}) failed on ALL {len(failed)} workers"
+            )
 
     def get_version(self) -> int:
         """Return the local version (compatible with VersionProvider protocol)."""
@@ -1196,8 +1234,9 @@ class GatewayInferenceController:
             return self._stream_chat_completion(url, body, headers)
 
         # Non-streaming path
-        timeout = aiohttp.ClientTimeout(total=self.config.request_timeout)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self.config.request_timeout)
+        ) as session:
             async with session.post(url, json=body, headers=headers) as resp:
                 if resp.status != 200:
                     text = await resp.text()
@@ -1217,8 +1256,9 @@ class GatewayInferenceController:
         """Parse SSE stream from the gateway into ChatCompletionChunk objects."""
         import aiohttp
 
-        timeout = aiohttp.ClientTimeout(total=self.config.request_timeout)
-        session = aiohttp.ClientSession(timeout=timeout)
+        session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self.config.request_timeout)
+        )
         try:
             resp = await session.post(url, json=body, headers=headers)
             if resp.status != 200:
@@ -1245,7 +1285,7 @@ class GatewayInferenceController:
         finally:
             await session.close()
 
-    # -- Pause / Resume ----------------------------------------------------
+    # -- Pause / Resume / Offload -------------------------------------------
 
     def pause(self) -> None:
         """Pause dispatcher + pause all workers."""
@@ -1263,6 +1303,53 @@ class GatewayInferenceController:
         if self._workflow_executor is not None:
             self._workflow_executor.resume()
 
+    def offload(self) -> None:
+        """Offload model memory on all inference workers."""
+        from areal.infra.utils.concurrent import run_async_task
+
+        run_async_task(self._async_offload)
+
+    async def _async_offload(self) -> None:
+        if not self._gateway_addr:
+            return
+        results = await asyncio.gather(
+            *(
+                self._async_gateway_http_post(f"/release_memory_occupation/{wid}", {})
+                for wid in self._worker_ids.values()
+            ),
+            return_exceptions=True,
+        )
+        failed = [r for r in results if isinstance(r, Exception)]
+        for r in failed:
+            logger.error("Failed to offload a worker: %s", r)
+        if failed and len(failed) == len(results):
+            raise RuntimeError(f"offload failed on ALL {len(failed)} workers")
+
+    def onload(self, tags: list[str] | None = None) -> None:
+        """Reload model memory on all inference workers."""
+        from areal.infra.utils.concurrent import run_async_task
+
+        run_async_task(self._async_onload, tags)
+
+    async def _async_onload(self, tags: list[str] | None = None) -> None:
+        if not self._gateway_addr:
+            return
+        payload: dict = {"tags": tags} if tags is not None else {}
+        results = await asyncio.gather(
+            *(
+                self._async_gateway_http_post(
+                    f"/resume_memory_occupation/{wid}", payload
+                )
+                for wid in self._worker_ids.values()
+            ),
+            return_exceptions=True,
+        )
+        failed = [r for r in results if isinstance(r, Exception)]
+        for r in failed:
+            logger.error("Failed to onload a worker: %s", r)
+        if failed and len(failed) == len(results):
+            raise RuntimeError(f"onload failed on ALL {len(failed)} workers")
+
     async def pause_generation(self, worker_id: str | None = None) -> None:
         """Pause generation on a specific worker, or all workers if worker_id is None."""
         if not self._gateway_addr:
@@ -1270,8 +1357,20 @@ class GatewayInferenceController:
         if worker_id is not None:
             await self._async_gateway_http_post(f"/pause_generation/{worker_id}", {})
         else:
-            for wid in self._worker_ids.values():
-                await self._async_gateway_http_post(f"/pause_generation/{wid}", {})
+            results = await asyncio.gather(
+                *[
+                    self._async_gateway_http_post(f"/pause_generation/{wid}", {})
+                    for wid in self._worker_ids.values()
+                ],
+                return_exceptions=True,
+            )
+            failed = [r for r in results if isinstance(r, Exception)]
+            for r in failed:
+                logger.error("Failed to pause generation on a worker: %s", r)
+            if failed and len(failed) == len(results):
+                raise RuntimeError(
+                    f"pause_generation failed on ALL {len(failed)} workers"
+                )
 
     async def continue_generation(self, worker_id: str | None = None) -> None:
         """Continue generation on a specific worker, or all workers if worker_id is None."""
@@ -1280,8 +1379,20 @@ class GatewayInferenceController:
         if worker_id is not None:
             await self._async_gateway_http_post(f"/continue_generation/{worker_id}", {})
         else:
-            for wid in self._worker_ids.values():
-                await self._async_gateway_http_post(f"/continue_generation/{wid}", {})
+            results = await asyncio.gather(
+                *[
+                    self._async_gateway_http_post(f"/continue_generation/{wid}", {})
+                    for wid in self._worker_ids.values()
+                ],
+                return_exceptions=True,
+            )
+            failed = [r for r in results if isinstance(r, Exception)]
+            for r in failed:
+                logger.error("Failed to continue generation on a worker: %s", r)
+            if failed and len(failed) == len(results):
+                raise RuntimeError(
+                    f"continue_generation failed on ALL {len(failed)} workers"
+                )
 
     # -- Stats -------------------------------------------------------------
 
@@ -1505,12 +1616,9 @@ class GatewayInferenceController:
         Returns ``(host, port)`` of the forked service and records the entry
         in ``_forked_services`` for cleanup.
         """
-        import requests
-
-        resp = requests.post(
+        resp = self._sync_client.post(
             f"{guard_addr}/alloc_ports",
             json={"count": 1},
-            timeout=30,
         )
         resp.raise_for_status()
         port_data = resp.json()
@@ -1519,14 +1627,13 @@ class GatewayInferenceController:
 
         cmd = list(raw_cmd) + ["--host", host, "--port", str(port)]
 
-        resp = requests.post(
+        resp = self._sync_client.post(
             f"{guard_addr}/fork",
             json={
                 "role": role,
                 "worker_index": worker_index,
                 "raw_cmd": cmd,
             },
-            timeout=30,
         )
         resp.raise_for_status()
 
@@ -1540,10 +1647,8 @@ class GatewayInferenceController:
     def _kill_forked_service(
         self, guard_addr: str, role: str, worker_index: int
     ) -> None:
-        import requests
-
         try:
-            resp = requests.post(
+            resp = self._sync_client.post(
                 f"{guard_addr}/kill_forked_worker",
                 json={"role": role, "worker_index": worker_index},
                 timeout=10,
@@ -1557,7 +1662,7 @@ class GatewayInferenceController:
                     worker_index,
                     resp.text,
                 )
-        except requests.RequestException as exc:
+        except httpx.HTTPError as exc:
             logger.error(
                 "Error killing forked service %s/%d: %s", role, worker_index, exc
             )
@@ -1571,11 +1676,9 @@ class GatewayInferenceController:
         Raises ``RuntimeError`` on HTTP errors or connection failures so that
         callers (e.g. ``pause()`` / ``resume()``) can detect and handle them.
         """
-        import requests
-
         url = f"{self._gateway_addr}{endpoint}"
         try:
-            resp = requests.post(
+            resp = self._sync_client.post(
                 url,
                 json=payload,
                 headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
@@ -1585,8 +1688,23 @@ class GatewayInferenceController:
                 raise RuntimeError(
                     f"Gateway {endpoint} returned {resp.status_code}: {resp.text}"
                 )
-        except requests.RequestException as exc:
+        except httpx.HTTPError as exc:
             raise RuntimeError(f"Failed to POST {endpoint}: {exc}") from exc
+
+    async def _get_async_client(self) -> httpx.AsyncClient:
+        """Return the shared async HTTP client, recreating it when the event loop changes.
+
+        ``run_async_task`` creates a fresh event loop per invocation via
+        ``asyncio.run()``.  TCP connections are tied to the loop that opened
+        them, so we must recreate the client when the loop changes.  Within
+        a single loop lifetime all callers (e.g. concurrent ``asyncio.gather``
+        calls) share one client and its connection pool.
+        """
+        current_loop = asyncio.get_running_loop()
+        if self._async_client is None or self._async_client_loop is not current_loop:
+            self._async_client = httpx.AsyncClient(timeout=self.config.request_timeout)
+            self._async_client_loop = current_loop
+        return self._async_client
 
     async def _async_gateway_http_post(
         self, endpoint: str, payload: dict[str, Any]
@@ -1597,19 +1715,17 @@ class GatewayInferenceController:
         callers (e.g. ``pause_generation()`` / ``continue_generation()``) can
         detect and handle them.
         """
-        import httpx
-
         url = f"{self._gateway_addr}{endpoint}"
         try:
-            async with httpx.AsyncClient(timeout=self.config.request_timeout) as client:
-                resp = await client.post(
-                    url,
-                    json=payload,
-                    headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+            client = await self._get_async_client()
+            resp = await client.post(
+                url,
+                json=payload,
+                headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
+            )
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"Gateway {endpoint} returned {resp.status_code}: {resp.text}"
                 )
-                if resp.status_code >= 400:
-                    raise RuntimeError(
-                        f"Gateway {endpoint} returned {resp.status_code}: {resp.text}"
-                    )
         except httpx.HTTPError as exc:
             raise RuntimeError(f"Failed to POST {endpoint}: {exc}") from exc

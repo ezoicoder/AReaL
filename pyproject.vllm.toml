@@ -174,7 +174,7 @@ kernels = [
 ]
 megatron = [
     "megatron-core==0.16.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "mbridge==0.15.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "mbridge @ git+https://github.com/ISEEKYAN/mbridge.git@310e8fb; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "megatron-bridge==0.3.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 cuda-train = [
@@ -190,6 +190,9 @@ cuda = [
     "torch; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torchaudio; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torchvision; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+sandbox = [
+    "daytona>=0.167.0",
 ]
 
 [project.urls]
@@ -292,6 +295,7 @@ markers = [
     "multi_gpu: mark test that uses more than one GPU",
     "sglang: mark test that requires the SGLang inference backend",
     "vllm: mark test that requires the vLLM inference backend",
+    "integration: requires external services or credentials",
 ]
 
 # =============================================================================
