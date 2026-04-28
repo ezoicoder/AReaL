@@ -183,7 +183,10 @@ class Attention(nn.Module):
         xv = xv.transpose(1, 2)
 
         cu_seqlens_k = None
-        # KV cache: concat past K/V with newly computed K/V
+        # Preserve per-step KV for cache update. Attention may still consume
+        # concatenated (past + current) KV when past_key_values is provided.
+        kv_step = (xk, xv)
+        # KV cache for attention compute path: concat past K/V with newly computed K/V
         if past_key_values is not None:
             past_k, past_v = past_key_values
             xk = torch.cat([past_k, xk], dim=2)
@@ -192,7 +195,7 @@ class Attention(nn.Module):
             cu_seqlens_k += past_k.shape[2]
             cu_seqlens_k[0] = 0
 
-        new_kv = (xk, xv) if use_cache else None
+        new_kv = kv_step if use_cache else None
 
         output = self.packed_attn(
             xq,
@@ -385,10 +388,6 @@ class Qwen2Model(BaseArchonModel):
     ) -> torch.Tensor | SimpleNamespace:
         hf_cache_mode = past_key_values is not None
         if hf_cache_mode:
-            if self.model_args.attn_type != "varlen":
-                raise ValueError(
-                    "KV-cache forward currently requires attn_type='varlen' for flash-attn."
-                )
             if past_key_values is None:
                 past_key_values = DynamicCache()
             if positions is None:
@@ -424,7 +423,11 @@ class Qwen2Model(BaseArchonModel):
 
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
-        next_cache = DynamicCache() if use_cache else None
+        if use_cache:
+            if past_key_values is not None:
+                next_cache = past_key_values
+            else:
+                next_cache = DynamicCache()
         for layer_idx, layer in enumerate(self.layers.values()):
             layer_past = None
             if past_key_values is not None and layer_idx < len(past_key_values.layers):

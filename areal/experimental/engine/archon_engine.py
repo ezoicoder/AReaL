@@ -391,8 +391,9 @@ class ArchonEngine(TrainEngine):
                 model_config=self.model_config,
                 device=self.device,
                 dtype=dta_dtype,
-                max_seq_len=self.config.dta_depth,
+                max_seq_len=self.config.mb_spec.max_tokens_per_mb,
                 block_size=self.config.dta_block_size,
+                is_critic=self.config.is_critic,
             )
             self.logger.info(f"DTA Wrapper created on device {self.device}")
 
@@ -548,8 +549,8 @@ class ArchonEngine(TrainEngine):
             self.logger.info("tree_training_mode='dta' in train_batch")
             self.logger.info(f"total_loss_weight: {total_loss_weight}")
             dta_stats = self.dta_wrapper.run_backward_with_scaled_loss(
-                input_ids_batch=input_["input_ids"],
-                attention_mask=input_["attention_mask"],
+                input_ids_batch=input_batched["input_ids"],
+                attention_mask=input_batched["attention_mask"],
                 mb_list=mb_list,
                 prepare_mb_inputs_fn=self._prepare_mb_inputs,
                 loss_fn=loss_fn,
@@ -656,13 +657,14 @@ class ArchonEngine(TrainEngine):
         """Forward pass without gradient computation."""
         assert self._initialized
 
+        input_batched, meta = self._normalize_batch_input(input_)
+
         if self.tree_training_mode == "dta":
             self.logger.info("tree_training_mode='dta' in forward_batch")
             return self.dta_wrapper.run_forward(
-                input_ids_batch=input_["input_ids"],
-                attention_mask=input_["attention_mask"],
+                input_ids_batch=input_batched["input_ids"],
+                attention_mask=input_batched["attention_mask"],
             )
-        input_batched, meta = self._normalize_batch_input(input_)
 
         if meta is not None:
             assert isinstance(input_, list)
@@ -1181,6 +1183,22 @@ class ArchonEngine(TrainEngine):
                 for model in self.model_parts:
                     model.init_weights()
 
+        # DTA-only: parallelize_fn is identity, so no tie in parallelize_*; checkpoint
+        # load materializes separate tensors per key. Re-bind after load so embed and
+        # lm_head share storage (disabled path unchanged: tie remains in parallelize_*).
+        if self.tree_training_mode == "dta":
+            for model in self.model_parts:
+                if (
+                    model.model_args.enable_weight_tying
+                    and model.output is not None
+                    and model.tok_embeddings is not None
+                ):
+                    model.output.weight = model.tok_embeddings.weight
+                    self.logger.info(
+                        "DTA: applied weight tying (output.weight = tok_embeddings.weight) "
+                        "after loading weights"
+                    )
+
         for model in self.model_parts:
             model.init_buffers(buffer_device=buffer_device)
 
@@ -1251,7 +1269,7 @@ class ArchonEngine(TrainEngine):
                 self.config.mb_spec,
                 n_mbs=n_seqs,
                 granularity=1,
-                max_tokens_per_mb=self.config.dta_depth,
+                max_tokens_per_mb=self.config.mb_spec.max_tokens_per_mb,
             )
             # Keep DTA per-rank independent: one sequence per microbatch, no
             # cross-rank synced microbatch-count alignment.

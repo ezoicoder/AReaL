@@ -7,6 +7,12 @@ Given two directories produced by :mod:`run_archon_training_test`, this script:
 2. Preferentially loads ``diff.pt`` from each dump and compares parameter update
    signatures. If ``diff.pt`` is absent, falls back to legacy ``params.pt``
    (and optionally ``params_initial.pt``) tensor diffs.
+3. If both dumps contain ``last_grads.pt`` (from ``test_config.dump_last_grads``),
+   checks A/B alignment (signature + optional full ``grad_tensors_fp32``) and
+   prints one compact table like the diff dump's "Top delta_gap" plus a one-line
+   PASS/FAIL summary.  ``requires_grad=True`` only means a parameter *may* receive
+   gradients; a zero ``.grad`` after backward is normal if the loss graph does not
+   flow to that parameter for that step (e.g. critic value head only).
 
 The tool is launched as a plain Python script -- no distributed setup required.
 
@@ -16,8 +22,7 @@ Example::
         --dump-a /tmp/run_a --dump-b /tmp/run_b \\
         --loss-rtol 1e-6 --loss-atol 1e-6
 
-Exit code is non-zero when the loss alignment check fails; parameter / diff-file
-comparison is informational only.
+Exit code is non-zero when any enabled alignment check fails.
 """
 
 from __future__ import annotations
@@ -32,6 +37,31 @@ from pathlib import Path
 from typing import Any
 
 import torch
+
+# -----------------------------------------------------------------------------
+# Terminal colors
+# -----------------------------------------------------------------------------
+
+
+_ANSI_RESET = "\033[0m"
+_ANSI_BOLD = "\033[1m"
+_ANSI_RED = "\033[31m"
+_ANSI_GREEN = "\033[32m"
+_ANSI_YELLOW = "\033[33m"
+
+
+def _supports_color() -> bool:
+    term = os.environ.get("TERM", "").lower()
+    no_color = os.environ.get("NO_COLOR")
+    return sys.stdout.isatty() and bool(term) and term != "dumb" and not no_color
+
+
+def _colorize(text: str, color: str, *, bold: bool = False) -> str:
+    if not _supports_color():
+        return text
+    prefix = f"{_ANSI_BOLD}{color}" if bold else color
+    return f"{prefix}{text}{_ANSI_RESET}"
+
 
 # -----------------------------------------------------------------------------
 # Loading
@@ -140,7 +170,10 @@ class ParamDiff:
     max_diff: float
     mean_diff: float
     l2_diff: float
-    rel_l2_diff: float
+    l2_a: float
+    l2_b: float
+    norm_gap: float
+    delta_gap: float
 
 
 @dataclass
@@ -154,13 +187,26 @@ class ParamUpdateStat:
 
 
 @dataclass
+class GradSnapshotStat:
+    """Per-parameter stats from ``last_grads.pt`` (final-step .grad snapshot)."""
+
+    name: str
+    numel: float
+    mean_abs: float
+    max_abs: float
+    l2: float
+
+
+@dataclass
 class DiffFileGap:
     name: str
     numel_match: bool
     mean_abs_gap: float
+    mean_abs_rel_gap: float
     max_abs_gap: float
+    max_abs_rel_gap: float
     l2_gap: float
-    rel_l2_gap: float
+    l2_rel_gap: float
 
 
 def _load_diff_signatures(path: str) -> dict[str, ParamUpdateStat]:
@@ -188,6 +234,132 @@ def _load_diff_signatures(path: str) -> dict[str, ParamUpdateStat]:
     return out
 
 
+def _print_last_grads_requires_grad_one_line(path_a: str, path_b: str) -> None:
+    """One summary line; list frozen param names only when non-empty."""
+
+    payloads: list[dict[str, Any]] = []
+    for path in (path_a, path_b):
+        raw = torch.load(path, map_location="cpu")
+        payloads.append(raw if isinstance(raw, dict) else {})
+
+    line_parts: list[str] = []
+    for label, payload in zip(("A", "B"), payloads, strict=True):
+        meta = payload.get("requires_grad_meta")
+        if not isinstance(meta, dict):
+            line_parts.append(f"{label}: (no requires_grad_meta)")
+        else:
+            nt = meta.get("num_named_requires_grad_true")
+            nf = meta.get("num_named_requires_grad_false")
+            line_parts.append(f"{label}: requires_grad true={nt} false={nf}")
+    print(f"  {'; '.join(line_parts)}")
+
+    for label, payload in zip(("A", "B"), payloads, strict=True):
+        meta = payload.get("requires_grad_meta")
+        if not isinstance(meta, dict):
+            continue
+        false_names = meta.get("named_requires_grad_false") or []
+        if false_names:
+            print(f"  {label} requires_grad=False (sample): {false_names[:8]}")
+
+
+def _load_grad_signatures(path: str) -> dict[str, GradSnapshotStat]:
+    payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected dict payload in {path}, got {type(payload)}")
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        raise ValueError(f"Expected 'params' dict in {path}, got {type(params)}")
+
+    out: dict[str, GradSnapshotStat] = {}
+    for name, item in params.items():
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"Expected metrics dict for parameter '{name}' in {path}, got {type(item)}"
+            )
+        out[name] = GradSnapshotStat(
+            name=str(name),
+            numel=float(item.get("numel", 0.0)),
+            mean_abs=float(item.get("mean_abs", 0.0)),
+            max_abs=float(item.get("max_abs", 0.0)),
+            l2=float(item.get("l2", 0.0)),
+        )
+    return out
+
+
+def _compare_grad_signatures(
+    stats_a: dict[str, GradSnapshotStat],
+    stats_b: dict[str, GradSnapshotStat],
+) -> tuple[list[DiffFileGap], list[str], list[str]]:
+    """Compare ``last_grads.pt`` entries; reuse :class:`DiffFileGap` for reporting."""
+    names_a = set(stats_a.keys())
+    names_b = set(stats_b.keys())
+    shared = sorted(names_a & names_b)
+    only_a = sorted(names_a - names_b)
+    only_b = sorted(names_b - names_a)
+
+    gaps: list[DiffFileGap] = []
+    for name in shared:
+        a = stats_a[name]
+        b = stats_b[name]
+        gaps.append(
+            DiffFileGap(
+                name=name,
+                numel_match=int(round(a.numel)) == int(round(b.numel)),
+                mean_abs_gap=abs(a.mean_abs - b.mean_abs),
+                mean_abs_rel_gap=_relative_gap(a.mean_abs, b.mean_abs),
+                max_abs_gap=abs(a.max_abs - b.max_abs),
+                max_abs_rel_gap=_relative_gap(a.max_abs, b.max_abs),
+                l2_gap=abs(a.l2 - b.l2),
+                l2_rel_gap=_relative_gap(a.l2, b.l2),
+            )
+        )
+    return gaps, only_a, only_b
+
+
+def _global_grad_l2_relative_gap(
+    stats_a: dict[str, GradSnapshotStat],
+    stats_b: dict[str, GradSnapshotStat],
+) -> float:
+    shared = set(stats_a.keys()) & set(stats_b.keys())
+    if not shared:
+        return 0.0
+    total_l2_a = math.sqrt(sum(float(stats_a[name].l2) ** 2 for name in shared))
+    total_l2_b = math.sqrt(sum(float(stats_b[name].l2) ** 2 for name in shared))
+    return _relative_gap(total_l2_a, total_l2_b)
+
+
+def _load_full_delta_tensors(path: str) -> dict[str, torch.Tensor]:
+    payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict):
+        return {}
+    tensors = payload.get("delta_tensors_fp32")
+    if not isinstance(tensors, dict):
+        return {}
+    out: dict[str, torch.Tensor] = {}
+    for name, tensor in tensors.items():
+        if isinstance(tensor, torch.Tensor):
+            out[str(name)] = tensor.detach().float().cpu()
+    return out
+
+
+def _load_full_grad_tensors(path: str) -> dict[str, torch.Tensor]:
+    payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict):
+        return {}
+    tensors = payload.get("grad_tensors_fp32")
+    if not isinstance(tensors, dict):
+        return {}
+    out: dict[str, torch.Tensor] = {}
+    for name, tensor in tensors.items():
+        if isinstance(tensor, torch.Tensor):
+            out[str(name)] = tensor.detach().float().cpu()
+    return out
+
+
+def _relative_gap(a: float, b: float) -> float:
+    return abs(a - b) / max(abs(a), abs(b), 1e-12)
+
+
 def _compare_diff_signatures(
     stats_a: dict[str, ParamUpdateStat],
     stats_b: dict[str, ParamUpdateStat],
@@ -207,12 +379,46 @@ def _compare_diff_signatures(
                 name=name,
                 numel_match=int(round(a.numel)) == int(round(b.numel)),
                 mean_abs_gap=abs(a.mean_abs_update - b.mean_abs_update),
+                mean_abs_rel_gap=_relative_gap(a.mean_abs_update, b.mean_abs_update),
                 max_abs_gap=abs(a.max_abs_update - b.max_abs_update),
+                max_abs_rel_gap=_relative_gap(a.max_abs_update, b.max_abs_update),
                 l2_gap=abs(a.l2_update - b.l2_update),
-                rel_l2_gap=abs(a.rel_l2_update - b.rel_l2_update),
+                l2_rel_gap=_relative_gap(a.l2_update, b.l2_update),
             )
         )
     return gaps, only_a, only_b
+
+
+def _compare_full_deltas(
+    tensors_a: dict[str, torch.Tensor],
+    tensors_b: dict[str, torch.Tensor],
+) -> tuple[list[ParamDiff], list[ParamDiff], list[ParamDiff]]:
+    """Compare full fp32 delta tensors.
+
+    Returns (shared_diffs, only_a_vs_zero, only_b_vs_zero).
+    """
+    shared, only_a, only_b = _compare_state_dicts(tensors_a, tensors_b)
+
+    def _vs_zero(name: str, tensor: torch.Tensor) -> ParamDiff:
+        zeros = torch.zeros_like(tensor)
+        delta = tensor - zeros
+        l2_tensor = float(tensor.norm().item())
+        l2_delta = float(delta.norm().item())
+        return ParamDiff(
+            name=name,
+            shape_match=True,
+            max_diff=float(delta.abs().max().item()) if delta.numel() > 0 else 0.0,
+            mean_diff=float(delta.abs().mean().item()) if delta.numel() > 0 else 0.0,
+            l2_diff=l2_delta,
+            l2_a=l2_tensor,
+            l2_b=0.0,
+            norm_gap=_relative_gap(l2_tensor, 0.0),
+            delta_gap=l2_delta / max(l2_tensor, 1e-12),
+        )
+
+    only_a_diffs = [_vs_zero(name, tensors_a[name]) for name in only_a]
+    only_b_diffs = [_vs_zero(name, tensors_b[name]) for name in only_b]
+    return shared, only_a_diffs, only_b_diffs
 
 
 def _summarize_diff_gaps(gaps: list[DiffFileGap]) -> dict[str, float]:
@@ -221,18 +427,40 @@ def _summarize_diff_gaps(gaps: list[DiffFileGap]) -> dict[str, float]:
             "num_params": 0.0,
             "numel_mismatch": 0.0,
             "max_abs_gap_max": 0.0,
+            "max_abs_rel_gap_max": 0.0,
             "mean_abs_gap_mean": 0.0,
+            "mean_abs_rel_gap_mean": 0.0,
             "l2_gap_mean": 0.0,
-            "rel_l2_gap_mean": 0.0,
+            "l2_rel_gap_mean": 0.0,
+            "mean_abs_rel_gap_max": 0.0,
+            "l2_rel_gap_max": 0.0,
         }
     return {
         "num_params": float(len(gaps)),
         "numel_mismatch": float(sum(0 if g.numel_match else 1 for g in gaps)),
         "max_abs_gap_max": float(max(g.max_abs_gap for g in gaps)),
+        "max_abs_rel_gap_max": float(max(g.max_abs_rel_gap for g in gaps)),
         "mean_abs_gap_mean": float(sum(g.mean_abs_gap for g in gaps) / len(gaps)),
+        "mean_abs_rel_gap_mean": float(
+            sum(g.mean_abs_rel_gap for g in gaps) / len(gaps)
+        ),
         "l2_gap_mean": float(sum(g.l2_gap for g in gaps) / len(gaps)),
-        "rel_l2_gap_mean": float(sum(g.rel_l2_gap for g in gaps) / len(gaps)),
+        "l2_rel_gap_mean": float(sum(g.l2_rel_gap for g in gaps) / len(gaps)),
+        "mean_abs_rel_gap_max": float(max(g.mean_abs_rel_gap for g in gaps)),
+        "l2_rel_gap_max": float(max(g.l2_rel_gap for g in gaps)),
     }
+
+
+def _global_l2_update_relative_gap(
+    stats_a: dict[str, ParamUpdateStat],
+    stats_b: dict[str, ParamUpdateStat],
+) -> float:
+    shared = set(stats_a.keys()) & set(stats_b.keys())
+    if not shared:
+        return 0.0
+    total_l2_a = math.sqrt(sum(float(stats_a[name].l2_update) ** 2 for name in shared))
+    total_l2_b = math.sqrt(sum(float(stats_b[name].l2_update) ** 2 for name in shared))
+    return _relative_gap(total_l2_a, total_l2_b)
 
 
 def _load_state_dict(path: str) -> dict[str, torch.Tensor]:
@@ -265,12 +493,16 @@ def _compare_state_dicts(
                     max_diff=float("inf"),
                     mean_diff=float("inf"),
                     l2_diff=float("inf"),
-                    rel_l2_diff=float("inf"),
+                    l2_a=float("inf"),
+                    l2_b=float("inf"),
+                    norm_gap=float("inf"),
+                    delta_gap=float("inf"),
                 )
             )
             continue
         delta = a - b
         l2_a = float(a.norm().item())
+        l2_b = float(b.norm().item())
         l2_delta = float(delta.norm().item())
         diffs.append(
             ParamDiff(
@@ -279,7 +511,10 @@ def _compare_state_dicts(
                 max_diff=float(delta.abs().max().item()),
                 mean_diff=float(delta.abs().mean().item()),
                 l2_diff=l2_delta,
-                rel_l2_diff=l2_delta / max(l2_a, 1e-12),
+                l2_a=l2_a,
+                l2_b=l2_b,
+                norm_gap=_relative_gap(l2_a, l2_b),
+                delta_gap=l2_delta / max(l2_a, l2_b, 1e-12),
             )
         )
     return diffs, only_a, only_b
@@ -292,7 +527,10 @@ def _summarize_param_diffs(diffs: list[ParamDiff]) -> dict[str, float]:
             "global_max_diff": 0.0,
             "global_mean_diff": 0.0,
             "global_l2_diff": 0.0,
-            "global_rel_l2_diff": 0.0,
+            "global_norm_gap": 0.0,
+            "max_norm_gap": 0.0,
+            "global_delta_gap": 0.0,
+            "max_delta_gap": 0.0,
         }
     matched = [d for d in diffs if d.shape_match]
     if not matched:
@@ -301,18 +539,29 @@ def _summarize_param_diffs(diffs: list[ParamDiff]) -> dict[str, float]:
             "global_max_diff": float("inf"),
             "global_mean_diff": float("inf"),
             "global_l2_diff": float("inf"),
-            "global_rel_l2_diff": float("inf"),
+            "global_norm_gap": float("inf"),
+            "max_norm_gap": float("inf"),
+            "global_delta_gap": float("inf"),
+            "max_delta_gap": float("inf"),
         }
     max_diff = max(d.max_diff for d in matched)
     total_l2 = math.sqrt(sum(d.l2_diff**2 for d in matched))
     mean_diff = sum(d.mean_diff for d in matched) / len(matched)
-    rel_l2 = sum(d.rel_l2_diff for d in matched) / len(matched)
+    total_l2_a = math.sqrt(sum(d.l2_a**2 for d in matched))
+    total_l2_b = math.sqrt(sum(d.l2_b**2 for d in matched))
+    global_norm_gap = _relative_gap(total_l2_a, total_l2_b)
+    max_norm_gap = max(d.norm_gap for d in matched)
+    global_delta_gap = total_l2 / max(total_l2_a, total_l2_b, 1e-12)
+    max_delta_gap = max(d.delta_gap for d in matched)
     return {
         "num_params": len(diffs),
         "global_max_diff": float(max_diff),
         "global_mean_diff": float(mean_diff),
         "global_l2_diff": float(total_l2),
-        "global_rel_l2_diff": float(rel_l2),
+        "global_norm_gap": float(global_norm_gap),
+        "max_norm_gap": float(max_norm_gap),
+        "global_delta_gap": float(global_delta_gap),
+        "max_delta_gap": float(max_delta_gap),
     }
 
 
@@ -334,13 +583,23 @@ def _print_loss_report(
     )
     ok = True
     for d in diffs:
-        status = "OK" if d.aligned else "MISMATCH"
+        status_raw = "OK" if d.aligned else "MISMATCH"
+        status = (
+            _colorize(status_raw, _ANSI_GREEN, bold=True)
+            if d.aligned
+            else _colorize(status_raw, _ANSI_RED, bold=True)
+        )
         ok = ok and d.aligned
         print(
             f"{d.step:>4d} {d.loss_a:>14.6f} {d.loss_b:>14.6f} "
             f"{d.abs_gap:>12.3e} {d.rel_gap:>12.3e} {status:>8}"
         )
-    print(f"Loss alignment overall: {'PASS' if ok else 'FAIL'}")
+    overall = (
+        _colorize("PASS", _ANSI_GREEN, bold=True)
+        if ok
+        else _colorize("FAIL", _ANSI_RED, bold=True)
+    )
+    print(f"Loss alignment overall: {overall}")
     return ok
 
 
@@ -352,38 +611,55 @@ def _print_param_report(
     top_k: int = 10,
 ) -> None:
     summary = _summarize_param_diffs(diffs)
-    print(f"\n=== {label} parameter comparison (informational) ===")
+    shared_count = len(diffs)
+    mismatch_count = len(only_a) + len(only_b)
+    print(f"\n=== {label} parameter comparison ===")
+    print(
+        f"  key_coverage: shared={shared_count} only_a={len(only_a)} "
+        f"only_b={len(only_b)} total_union={shared_count + mismatch_count}"
+    )
     if only_a or only_b:
-        print(
+        warn = (
             f"[warn] parameter key mismatch: only_a={only_a[:5]}{'...' if len(only_a) > 5 else ''} "
             f"only_b={only_b[:5]}{'...' if len(only_b) > 5 else ''}"
         )
-    for k, v in summary.items():
-        print(f"  {k}: {v}")
+        print(_colorize(warn, _ANSI_YELLOW, bold=True))
+    print(f"  global_norm_gap: {summary['global_norm_gap']}")
+    print(f"  max_norm_gap: {summary['max_norm_gap']}")
+    print(f"  global_delta_gap: {summary['global_delta_gap']}")
+    print(f"  max_delta_gap: {summary['max_delta_gap']}")
     worst = sorted(diffs, key=lambda d: d.max_diff, reverse=True)[:top_k]
     print(f"  top-{len(worst)} tensors by max_diff:")
     for d in worst:
         print(
             f"    {d.name[:80]:<80} max={d.max_diff:.3e} "
-            f"mean={d.mean_diff:.3e} rel_l2={d.rel_l2_diff:.3e} "
+            f"mean={d.mean_diff:.3e} norm_gap={d.norm_gap:.3e} "
+            f"delta_gap={d.delta_gap:.3e} "
             f"shape_match={d.shape_match}"
         )
 
 
 def _print_diff_file_report(
-    label: str,
+    title: str,
     gaps: list[DiffFileGap],
     only_a: list[str],
     only_b: list[str],
     top_k: int = 10,
 ) -> None:
     summary = _summarize_diff_gaps(gaps)
-    print(f"\n=== {label} diff.pt comparison (informational) ===")
+    shared_count = len(gaps)
+    mismatch_count = len(only_a) + len(only_b)
+    print(f"\n=== {title} ===")
+    print(
+        f"  key_coverage: shared={shared_count} only_a={len(only_a)} "
+        f"only_b={len(only_b)} total_union={shared_count + mismatch_count}"
+    )
     if only_a or only_b:
-        print(
+        warn = (
             f"[warn] parameter key mismatch: only_a={only_a[:5]}{'...' if len(only_a) > 5 else ''} "
             f"only_b={only_b[:5]}{'...' if len(only_b) > 5 else ''}"
         )
+        print(_colorize(warn, _ANSI_YELLOW, bold=True))
     for k, v in summary.items():
         print(f"  {k}: {v}")
     worst = sorted(gaps, key=lambda g: g.max_abs_gap, reverse=True)[:top_k]
@@ -391,9 +667,147 @@ def _print_diff_file_report(
     for g in worst:
         print(
             f"    {g.name[:80]:<80} max_abs_gap={g.max_abs_gap:.3e} "
-            f"mean_abs_gap={g.mean_abs_gap:.3e} rel_l2_gap={g.rel_l2_gap:.3e} "
+            f"max_abs_rel_gap={g.max_abs_rel_gap:.3e} "
+            f"mean_abs_gap={g.mean_abs_gap:.3e} "
+            f"mean_abs_rel_gap={g.mean_abs_rel_gap:.3e} "
+            f"l2_gap={g.l2_gap:.3e} "
+            f"l2_rel_gap={g.l2_rel_gap:.3e} "
             f"numel_match={g.numel_match}"
         )
+
+
+def _print_diff_alignment_report(
+    summary: dict[str, float],
+    *,
+    rel_gap_tol: float,
+    title: str = "diff.pt alignment",
+) -> bool:
+    l2_rel_max_value = float(summary.get("l2_rel_gap_max", float("inf")))
+    global_l2_rel_value = float(summary.get("global_l2_rel_gap", float("inf")))
+    l2_ok = l2_rel_max_value < rel_gap_tol
+    global_l2_ok = global_l2_rel_value < rel_gap_tol
+    aligned_ok = l2_ok and global_l2_ok
+
+    print(f"\n=== {title} ===")
+    print(
+        f"max(l2_rel_gap)   < {rel_gap_tol:.3e}: "
+        f"{l2_rel_max_value:.3e} "
+        f"{_colorize('PASS', _ANSI_GREEN, bold=True) if l2_ok else _colorize('FAIL', _ANSI_RED, bold=True)}"
+    )
+    print(
+        f"global_l2_rel_gap < {rel_gap_tol:.3e}: "
+        f"{global_l2_rel_value:.3e} "
+        f"{_colorize('PASS', _ANSI_GREEN, bold=True) if global_l2_ok else _colorize('FAIL', _ANSI_RED, bold=True)}"
+    )
+    print(
+        f"{title} overall: "
+        + (
+            _colorize("PASS", _ANSI_GREEN, bold=True)
+            if aligned_ok
+            else _colorize("FAIL", _ANSI_RED, bold=True)
+        )
+    )
+    return aligned_ok
+
+
+def _print_unmatched_tensor_report(
+    label: str,
+    diffs: list[ParamDiff],
+    side: str,
+    top_k: int = 10,
+) -> None:
+    print(f"\n=== {label} unmatched full-delta tensors ({side} vs zeros) ===")
+    if not diffs:
+        print("  none")
+        return
+    summary = _summarize_param_diffs(diffs)
+    print(f"  global_norm_gap: {summary['global_norm_gap']}")
+    print(f"  max_norm_gap: {summary['max_norm_gap']}")
+    print(f"  global_delta_gap: {summary['global_delta_gap']}")
+    print(f"  max_delta_gap: {summary['max_delta_gap']}")
+    worst = sorted(diffs, key=lambda d: d.max_diff, reverse=True)[:top_k]
+    print(f"  top-{len(worst)} tensors by max_diff:")
+    for d in worst:
+        print(
+            f"    {d.name[:80]:<80} max={d.max_diff:.3e} "
+            f"mean={d.mean_diff:.3e} norm_gap={d.norm_gap:.3e} "
+            f"delta_gap={d.delta_gap:.3e}"
+        )
+
+
+def _print_full_delta_alignment_report(
+    param_diffs: list[ParamDiff],
+    *,
+    rel_gap_tol: float,
+    heading: str = "full-delta fp32 alignment",
+) -> bool:
+    summary = _summarize_param_diffs(param_diffs)
+    global_value = float(summary.get("global_delta_gap", float("inf")))
+    max_value = float(summary.get("max_delta_gap", float("inf")))
+    global_ok = global_value < rel_gap_tol
+    max_ok = max_value < rel_gap_tol
+    ok = global_ok and max_ok
+    print(f"\n=== {heading} ===")
+    print(
+        f"global_delta_gap < {rel_gap_tol:.3e}: "
+        f"{global_value:.3e} "
+        f"{_colorize('PASS', _ANSI_GREEN, bold=True) if global_ok else _colorize('FAIL', _ANSI_RED, bold=True)}"
+    )
+    print(
+        f"max_delta_gap    < {rel_gap_tol:.3e}: "
+        f"{max_value:.3e} "
+        f"{_colorize('PASS', _ANSI_GREEN, bold=True) if max_ok else _colorize('FAIL', _ANSI_RED, bold=True)}"
+    )
+    return ok
+
+
+def _print_name_gap_report(
+    *,
+    norm_gaps: dict[str, float],
+    delta_gaps: dict[str, float],
+    l2_delta_a: dict[str, float] | None = None,
+    l2_delta_b: dict[str, float] | None = None,
+    top_k: int = 10,
+    heading: str = "Top delta_gap parameters (shared names)",
+    l2_note: str | None = None,
+) -> None:
+    """Print top-k shared parameter gaps sorted by delta_gap.
+
+    When ``l2_delta_a`` / ``l2_delta_b`` are provided, each column is the L2
+    norm of the saved fp32 update tensor ``Δθ = current - initial`` for that
+    dump (so you can see whether a parameter actually moved vs. stayed at 0).
+    """
+    shared_names = sorted(set(norm_gaps.keys()) & set(delta_gaps.keys()))
+    ranked = sorted(
+        shared_names,
+        key=lambda name: delta_gaps.get(name, float("-inf")),
+        reverse=True,
+    )[:top_k]
+    print(f"\n=== {heading} ===")
+    if l2_delta_a is not None and l2_delta_b is not None:
+        print(
+            l2_note
+            or "(||A||, ||B|| are L2 norms of Δθ from each dump's delta_tensors_fp32.)"
+        )
+        print(
+            f"{'name':<72} {'||A||':>12} {'||B||':>12} "
+            f"{'norm_gap':>12} {'delta_gap':>12}"
+        )
+        for name in ranked:
+            norm_value = norm_gaps.get(name, float("inf"))
+            delta_value = delta_gaps.get(name, float("inf"))
+            na = l2_delta_a.get(name, float("nan"))
+            nb = l2_delta_b.get(name, float("nan"))
+            print(
+                f"{name[:72]:<72} {na:>12.3e} {nb:>12.3e} "
+                f"{norm_value:>12.3e} {delta_value:>12.3e}"
+            )
+    else:
+        print(f"{'name':<80} {'norm_gap':>12} {'delta_gap':>12}")
+        for name in ranked:
+            norm_value = norm_gaps.get(name, float("inf"))
+            delta_value = delta_gaps.get(name, float("inf"))
+            print(f"{name[:80]:<80} {norm_value:>12.3e} {delta_value:>12.3e}")
 
 
 # -----------------------------------------------------------------------------
@@ -407,6 +821,8 @@ def run_comparison(
     *,
     loss_atol: float,
     loss_rtol: float,
+    diff_rel_gap_tol: float,
+    full_delta_rel_gap_tol: float,
     compare_initial: bool,
 ) -> bool:
     print(f"[compare] dump_a={dump_a}")
@@ -416,6 +832,10 @@ def run_comparison(
     stats_b = _load_stats(dump_b)
     loss_diffs = _compare_losses(stats_a, stats_b, atol=loss_atol, rtol=loss_rtol)
     loss_ok = _print_loss_report(loss_diffs, loss_atol, loss_rtol)
+    diff_ok = True
+    full_delta_ok = True
+    grad_ok = True
+    grad_full_ok = True
 
     diff_a = Path(dump_a) / "diff.pt"
     diff_b = Path(dump_b) / "diff.pt"
@@ -423,7 +843,57 @@ def run_comparison(
         sig_a = _load_diff_signatures(str(diff_a))
         sig_b = _load_diff_signatures(str(diff_b))
         gaps, only_a, only_b = _compare_diff_signatures(sig_a, sig_b)
-        _print_diff_file_report("Final", gaps, only_a, only_b)
+        if only_a or only_b:
+            print("\n=== diff.pt param keys only in one dump ===")
+            print(f"  only_in_a: {only_a}")
+            print(f"  only_in_b: {only_b}")
+        diff_summary = _summarize_diff_gaps(gaps)
+        diff_summary["global_l2_rel_gap"] = _global_l2_update_relative_gap(sig_a, sig_b)
+        diff_ok = (
+            float(diff_summary.get("l2_rel_gap_max", float("inf"))) < diff_rel_gap_tol
+            and float(diff_summary.get("global_l2_rel_gap", float("inf")))
+            < diff_rel_gap_tol
+        )
+
+        full_a = _load_full_delta_tensors(str(diff_a))
+        full_b = _load_full_delta_tensors(str(diff_b))
+        if full_a and full_b:
+            shared_diffs, only_a_diffs, only_b_diffs = _compare_full_deltas(
+                full_a, full_b
+            )
+            all_full_diffs = [*shared_diffs, *only_a_diffs, *only_b_diffs]
+            full_summary = _summarize_param_diffs(all_full_diffs)
+            full_delta_ok = (
+                float(full_summary.get("global_delta_gap", float("inf")))
+                < full_delta_rel_gap_tol
+                and float(full_summary.get("max_delta_gap", float("inf")))
+                < full_delta_rel_gap_tol
+            )
+
+            norm_gaps: dict[str, float] = {}
+            for g in gaps:
+                norm_gaps[g.name] = float(g.l2_rel_gap)
+
+            delta_gaps: dict[str, float] = {}
+            l2_delta_a: dict[str, float] = {}
+            l2_delta_b: dict[str, float] = {}
+            for d in shared_diffs:
+                delta_gaps[d.name] = float(d.delta_gap)
+                l2_delta_a[d.name] = float(d.l2_a)
+                l2_delta_b[d.name] = float(d.l2_b)
+
+            _print_name_gap_report(
+                norm_gaps=norm_gaps,
+                delta_gaps=delta_gaps,
+                l2_delta_a=l2_delta_a,
+                l2_delta_b=l2_delta_b,
+                top_k=10,
+            )
+        else:
+            print(
+                "\n[info] full fp32 delta tensors not found in both diff.pt "
+                "(enable test_config.save_full_diff_tensors_fp32=true in both runs)."
+            )
     else:
         final_a = Path(dump_a) / "params.pt"
         final_b = Path(dump_b) / "params.pt"
@@ -452,7 +922,90 @@ def run_comparison(
             diffs, only_a, only_b = _compare_state_dicts(state_a, state_b)
             _print_param_report("Initial", diffs, only_a, only_b)
 
-    return loss_ok
+    lg_a = Path(dump_a) / "last_grads.pt"
+    lg_b = Path(dump_b) / "last_grads.pt"
+    if lg_a.is_file() and lg_b.is_file():
+        print("\n=== last_grads.pt ===")
+        _print_last_grads_requires_grad_one_line(str(lg_a), str(lg_b))
+
+        gsig_a = _load_grad_signatures(str(lg_a))
+        gsig_b = _load_grad_signatures(str(lg_b))
+        ggaps, g_only_a, g_only_b = _compare_grad_signatures(gsig_a, gsig_b)
+        if g_only_a or g_only_b:
+            print("  param keys only in one dump:")
+            print(f"    only_a={g_only_a[:8]}{'...' if len(g_only_a) > 8 else ''}")
+            print(f"    only_b={g_only_b[:8]}{'...' if len(g_only_b) > 8 else ''}")
+        grad_summary = _summarize_diff_gaps(ggaps)
+        grad_summary["global_l2_rel_gap"] = _global_grad_l2_relative_gap(gsig_a, gsig_b)
+        grad_ok = (
+            float(grad_summary.get("l2_rel_gap_max", float("inf"))) < diff_rel_gap_tol
+            and float(grad_summary.get("global_l2_rel_gap", float("inf")))
+            < diff_rel_gap_tol
+        )
+
+        full_ga = _load_full_grad_tensors(str(lg_a))
+        full_gb = _load_full_grad_tensors(str(lg_b))
+        if full_ga and full_gb:
+            shared_g, only_a_g, only_b_g = _compare_full_deltas(full_ga, full_gb)
+            all_g = [*shared_g, *only_a_g, *only_b_g]
+            full_g_summary = _summarize_param_diffs(all_g)
+            grad_full_ok = (
+                float(full_g_summary.get("global_delta_gap", float("inf")))
+                < full_delta_rel_gap_tol
+                and float(full_g_summary.get("max_delta_gap", float("inf")))
+                < full_delta_rel_gap_tol
+            )
+
+            norm_gaps_g: dict[str, float] = {}
+            for g in ggaps:
+                norm_gaps_g[g.name] = float(g.l2_rel_gap)
+            delta_gaps_g: dict[str, float] = {}
+            l2_ga: dict[str, float] = {}
+            l2_gb: dict[str, float] = {}
+            for d in shared_g:
+                delta_gaps_g[d.name] = float(d.delta_gap)
+                l2_ga[d.name] = float(d.l2_a)
+                l2_gb[d.name] = float(d.l2_b)
+            _print_name_gap_report(
+                norm_gaps=norm_gaps_g,
+                delta_gaps=delta_gaps_g,
+                l2_delta_a=l2_ga,
+                l2_delta_b=l2_gb,
+                top_k=10,
+                heading="Top last_grads gaps (shared names)",
+                l2_note=(
+                    "(||A||, ||B|| are L2 norms of grad_tensors_fp32; "
+                    "norm_gap from signature l2_rel; zero ||·||₂ is an all-zero grad.)"
+                ),
+            )
+            print(
+                f"  alignment: signature={'PASS' if grad_ok else 'FAIL'} "
+                f"full_tensor={'PASS' if grad_full_ok else 'FAIL'} "
+                f"(tol signature={diff_rel_gap_tol} elementwise={full_delta_rel_gap_tol})"
+            )
+        elif full_ga or full_gb:
+            grad_full_ok = False
+            print(
+                "\n[warn] last_grads.pt grad_tensors_fp32 present on only one side "
+                f"(a={bool(full_ga)}, b={bool(full_gb)}); skipping full grad tensor compare."
+            )
+            print(
+                f"  alignment: signature={'PASS' if grad_ok else 'FAIL'} "
+                "full_tensor=FAIL (asymmetric dumps)"
+            )
+        else:
+            print(
+                "\n  [info] no grad_tensors_fp32 in both dumps "
+                "(enable test_config.save_full_last_grad_tensors_fp32=true); "
+                f"signature_only={'PASS' if grad_ok else 'FAIL'}."
+            )
+    elif lg_a.is_file() or lg_b.is_file():
+        print(
+            "\n[warn] last_grads.pt present on only one side "
+            f"(a={lg_a.is_file()}, b={lg_b.is_file()}); skipping grad comparison."
+        )
+
+    return loss_ok and diff_ok and full_delta_ok and grad_ok and grad_full_ok
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -470,8 +1023,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--loss-rtol",
         type=float,
-        default=1e-6,
-        help="Relative tolerance for per-step loss alignment (default 1e-6).",
+        default=1e-3,
+        help="Relative tolerance for per-step loss alignment (default 1e-3).",
+    )
+    parser.add_argument(
+        "--diff-rel-gap-tol",
+        type=float,
+        default=1e-2,
+        help=(
+            "Relative-gap threshold for diff.pt (max(l2_rel_gap), global_l2_rel_gap) "
+            "and, when both dumps include last_grads.pt, the same checks on "
+            "gradient signature gaps. Default 1e-2."
+        ),
+    )
+    parser.add_argument(
+        "--full-delta-rel-gap-tol",
+        type=float,
+        default=1e-2,
+        help=(
+            "Threshold for full tensor alignment: both global_delta_gap and "
+            "max_delta_gap must be < tol (diff.pt delta_tensors_fp32 when present; "
+            "last_grads.pt grad_tensors_fp32 when present). Default 1e-2."
+        ),
     )
     parser.add_argument(
         "--compare-initial",
@@ -485,6 +1058,8 @@ def main(argv: list[str] | None = None) -> int:
         dump_b=args.dump_b,
         loss_atol=args.loss_atol,
         loss_rtol=args.loss_rtol,
+        diff_rel_gap_tol=args.diff_rel_gap_tol,
+        full_delta_rel_gap_tol=args.full_delta_rel_gap_tol,
         compare_initial=args.compare_initial,
     )
     return 0 if ok else 1

@@ -32,7 +32,7 @@ def _leafization(input_ids: list[torch.LongTensor], attachs: list[dict]):
         lcp = _lcp_torch(seq_L, seq_R)
         L = min(seq_L.numel(), seq_R.numel())
         if lcp < L and seq_L[lcp] > seq_R[lcp]:
-            raise ValueError("Input_ids not sorted in lexicographic order.")
+            raise ValueError("input_ids not sorted in lexicographic order.")
         lcp_lens.append(lcp)
 
     # Merge fully overlapping prefixes by keeping only the longest sequence.
@@ -65,9 +65,8 @@ class TokenTrie:
         sorted: bool = False,
     ):
         if attachs is not None:
-            assert len(inputs) == len(attachs), (
-                "Length of inputs and attachs must match."
-            )
+            if len(inputs) != len(attachs):
+                raise ValueError("Length of inputs and attachs must match.")
         else:
             attachs = [{} for _ in range(len(inputs))]
 

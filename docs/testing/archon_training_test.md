@@ -97,7 +97,6 @@ actor:
     lr_scheduler_type: constant
     gradient_clipping: 1.0
   tree_training_mode: dta        # {disabled, sparse, dta}
-  dta_depth: 16384
   dta_block_size: 2048
   packing_algorithm: ffd         # rollout {ffd, kk, dta}；与 mb_spec.packing_algorithm 不同
 

@@ -36,15 +36,18 @@ class DTAWrapper:
         dtype: torch.dtype,
         max_seq_len: int,
         block_size: int,
+        is_critic: bool = False,
     ) -> None:
         self.model = model
         self.device = device
         self.block_size = block_size
+        self.is_critic = is_critic
         self._engine = DTAEngine(
             model_config=model_config,
             device=device,
             dtype=dtype,
             max_seq_len=max_seq_len,
+            is_critic=is_critic,
         )
 
     @torch.no_grad()
@@ -116,21 +119,36 @@ class DTAWrapper:
                 loss_scale = loss_scale.item()
             per_seq_input_data.append({"original": ctx.mb_input, "scale": loss_scale})
 
-        def scaled_loss_fn(
-            logprobs: torch.Tensor,
-            entropy: torch.Tensor,
-            seq_input_data: dict[str, Any],
-            **extra_kwargs: Any,
-        ) -> torch.Tensor:
-            # Keep current behavior: DTA engine expects one extra position.
-            logprobs = torch.cat([logprobs, logprobs.new_zeros(1)], dim=0)
-            loss_val = loss_fn(
-                logprobs,
-                entropy,
-                seq_input_data["original"],
-                **extra_kwargs,
-            )
-            return loss_val * seq_input_data["scale"]
+        if self.is_critic:
+
+            def scaled_loss_fn(
+                values: torch.Tensor,
+                seq_input_data: dict[str, Any],
+                **extra_kwargs: Any,
+            ) -> torch.Tensor:
+                loss_val = loss_fn(
+                    values,
+                    seq_input_data["original"],
+                    **extra_kwargs,
+                )
+                return loss_val * seq_input_data["scale"]
+        else:
+
+            def scaled_loss_fn(
+                logprobs: torch.Tensor,
+                entropy: torch.Tensor,
+                seq_input_data: dict[str, Any],
+                **extra_kwargs: Any,
+            ) -> torch.Tensor:
+                # Keep current behavior: DTA engine expects one extra position.
+                logprobs = torch.cat([logprobs, logprobs.new_zeros(1)], dim=0)
+                loss_val = loss_fn(
+                    logprobs,
+                    entropy,
+                    seq_input_data["original"],
+                    **extra_kwargs,
+                )
+                return loss_val * seq_input_data["scale"]
 
         return self.run_backward(
             input_ids_batch=input_ids_batch,

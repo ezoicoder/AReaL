@@ -8,7 +8,7 @@ from dataclasses import MISSING as dataclass_missing
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
 import uvloop
 import yaml
@@ -1133,8 +1133,8 @@ class TrainEngineConfig:
         metadata={"help": "peft method type. Only LoRA is supported for now."},
     )
 
-    # Tree training
-    tree_training_mode: Literal["disabled", "sparse", "dta"] = field(
+    # Tree training (str, not Literal: OmegaConf.structured rejects Literal here)
+    tree_training_mode: str = field(
         default="disabled",
         metadata={
             "help": (
@@ -1156,13 +1156,6 @@ class TrainEngineConfig:
             )
         },
     )
-
-    dta_depth: int = field(
-        default=16384,
-        metadata={
-            "help": "Depth for Dynamic Tree Attention. Only effective when tree_training_mode='dta'."
-        },
-    )
     dta_block_size: int = field(
         default=2048,
         metadata={
@@ -1173,7 +1166,7 @@ class TrainEngineConfig:
             )
         },
     )
-    packing_algorithm: Literal["ffd", "kk", "dta"] = field(
+    packing_algorithm: str = field(
         default="ffd",
         metadata={
             "help": (
@@ -1269,12 +1262,11 @@ class TrainEngineConfig:
                 f"packing_algorithm (rollout) must be one of {valid_rollout_packing}, "
                 f"got '{self.packing_algorithm}'"
             )
-        if self.tree_training_mode == "dta" and (
-            self.dta_block_size == 0 or self.dta_block_size < -1
-        ):
-            raise ValueError(
-                f"dta_block_size must be -1 or a positive integer when tree_training_mode='dta', got {self.dta_block_size}."
-            )
+        if self.tree_training_mode == "dta":
+            if self.dta_block_size == 0 or self.dta_block_size < -1:
+                raise ValueError(
+                    f"dta_block_size must be -1 or a positive integer when tree_training_mode='dta', got {self.dta_block_size}."
+                )
 
         if self.enable_tree_training:
             warnings.warn(
@@ -1665,6 +1657,21 @@ class PPOActorConfig(TrainEngineConfig):
                     "SAPO is not compatible with `use_decoupled_loss=True`. "
                     "Please set `actor.use_decoupled_loss=false` in your configuration."
                 )
+
+        if self.packing_algorithm == "dta":
+            for norm_name in ["adv_norm", "reward_norm"]:
+                norm_config = getattr(self, norm_name)
+                if norm_config is not None:
+                    if (
+                        norm_config.mean_level == "group"
+                        or norm_config.std_level == "group"
+                    ):
+                        raise ValueError(
+                            f"{norm_name} uses 'group' level normalization, which is incompatible "
+                            "with packing_algorithm='dta'. DTA requires sequence-level independence, "
+                            "but 'group' normalization relies on contiguous group slices. Please use "
+                            "'batch' level normalization or set packing_algorithm='ffd'."
+                        )
 
         super().__post_init__()
 

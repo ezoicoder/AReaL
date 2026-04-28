@@ -76,6 +76,23 @@ class TestOnlyConfig:
     save_params: bool = False
     save_initial_params: bool = False
     seed: int = 42
+    entropy_coef: float = 0.0
+    entropy_mode: str = "sum"
+    save_full_diff_tensors_fp32: bool = False
+    # After the final training step, write ``last_grads.pt`` (per-param grad stats).
+    # With ``disable_optimizer=true``, grads are cleared inside the patched step, so
+    # the runner captures them in that hook on the last step only.
+    dump_last_grads: bool = False
+    # When ``dump_last_grads``, also store full CPU fp32 tensors under
+    # ``grad_tensors_fp32`` (like ``delta_tensors_fp32`` in diff.pt). Set false to
+    # save disk/memory (stats-only).
+    save_full_last_grad_tensors_fp32: bool = True
+    is_critic: bool = False
+    # After load, take at most this many sequences per .pt (0 = no cap).
+    max_sequences_per_pt: int = 0
+    # After ``ArchonLMEngine.initialize`` (HF load + buffers), export weights with
+    # ``ArchonEngine.save`` / ``save_model_to_hf`` into this directory. ``None`` = skip.
+    save_hf_checkpoint_dir: str | None = None
 
     def __post_init__(self) -> None:
         if self.step is None or int(self.step) < 0:
@@ -85,6 +102,21 @@ class TestOnlyConfig:
         if not self.data_dir:
             raise ValueError(
                 "test_config.data_dir is required and must be a non-empty path."
+            )
+        if float(self.entropy_coef) < 0:
+            raise ValueError(
+                f"test_config.entropy_coef must be >= 0, got {self.entropy_coef}."
+            )
+        valid_entropy_modes = {"mean", "sum"}
+        if self.entropy_mode not in valid_entropy_modes:
+            raise ValueError(
+                f"test_config.entropy_mode must be one of "
+                f"{sorted(valid_entropy_modes)}, got '{self.entropy_mode}'."
+            )
+        if int(self.max_sequences_per_pt) < 0:
+            raise ValueError(
+                "test_config.max_sequences_per_pt must be >= 0 "
+                f"(0 = no cap), got {self.max_sequences_per_pt}."
             )
 
 

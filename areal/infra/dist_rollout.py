@@ -104,8 +104,6 @@ def _dta_allocate(
     config = SimpleNamespace(K=n_groups, mode="backward", block_size=None)
     group_indices = LB_by_DFS_and_TM(token_seqs, _TreeTokenOnlyTimeModel(), config)
 
-    print(f"len of group_indices:{len(group_indices)}")
-
     n_tree_tokens_after = 0.0
     for group in group_indices:
         if not group:
@@ -188,6 +186,11 @@ def redistribute_trajectories(
 
     n_groups = dist.get_world_size(group)
     if packing_algorithm == "dta":
+        # Unpack group-level trajectories into sequence-level for DTA
+        from areal.utils.data import unpack_groups_to_sequences
+
+        all_data = unpack_groups_to_sequences(all_data)
+
         dta_result = _dta_allocate(all_data, n_groups)
         group_indices = dta_result.group_indices
         dta_metrics = dta_result.metrics

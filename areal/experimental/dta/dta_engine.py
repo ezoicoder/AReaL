@@ -7,12 +7,14 @@
 
 from bisect import bisect_left, bisect_right
 from math import ceil
+from typing import NoReturn
 
 import torch
 import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
+from areal.utils.logging import getLogger
 
 NO_BLOCK_SIZE_LIMIT = int(1e9)
 
@@ -74,6 +76,7 @@ class DTAEngine:
         dtype: torch.dtype,
         max_seq_len: int,
         forward_only: bool = False,
+        is_critic: bool = False,
     ):
         """
         Initialize DTAEngine with model config, device and buffer sizes.
@@ -85,6 +88,7 @@ class DTAEngine:
         self.device = device
         self.dtype = dtype
         self.max_seq_len = max_seq_len
+        self.is_critic = is_critic
 
         # ------------------------------------------------------------------------
         # Initialize static stack buffers
@@ -94,33 +98,43 @@ class DTAEngine:
         # Token buffer
         self.tokens = torch.zeros((max_seq_len), device=self.device, dtype=torch.long)
 
-        # Entropy buffer
-        if not forward_only:
-            self.entropy = torch.zeros(
+        if self.is_critic:
+            # Value buffer for critic
+            self.values = torch.zeros(
                 (max_seq_len), device=self.device, dtype=torch.float32
             )
-            self.grad_entropy = torch.zeros(
-                (max_seq_len), device=self.device, dtype=dtype
-            )
+            if not forward_only:
+                self.grad_values = torch.zeros(
+                    (max_seq_len), device=self.device, dtype=dtype
+                )
+        else:
+            # Entropy buffer
+            if not forward_only:
+                self.entropy = torch.zeros(
+                    (max_seq_len), device=self.device, dtype=torch.float32
+                )
+                self.grad_entropy = torch.zeros(
+                    (max_seq_len), device=self.device, dtype=dtype
+                )
 
-        # Logprob buffer
-        self.logprobs = torch.zeros(
-            (max_seq_len), device=self.device, dtype=torch.float32
-        )
-        if not forward_only:
-            self.grad_logprobs = torch.zeros(
-                (max_seq_len), device=self.device, dtype=dtype
+            # Logprob buffer
+            self.logprobs = torch.zeros(
+                (max_seq_len), device=self.device, dtype=torch.float32
             )
+            if not forward_only:
+                self.grad_logprobs = torch.zeros(
+                    (max_seq_len), device=self.device, dtype=dtype
+                )
 
-        # Fork position logits buffer (store logits only at fork positions, others are None)
-        self.forkpos_list = []  # List of all fork positions
-        self.forkpos_logits: list[torch.Tensor | None] = [
-            None
-        ] * max_seq_len  # Logits at fork positions for computing logprobs
-        if not forward_only:
-            self.grad_forkpos_logits: list[torch.Tensor | None] = [
+            # Fork position logits buffer (store logits only at fork positions, others are None)
+            self.forkpos_list = []  # List of all fork positions
+            self.forkpos_logits: list[torch.Tensor | None] = [
                 None
-            ] * max_seq_len  # Gradients of logits at fork positions
+            ] * max_seq_len  # Logits at fork positions for computing logprobs
+            if not forward_only:
+                self.grad_forkpos_logits: list[torch.Tensor | None] = [
+                    None
+                ] * max_seq_len  # Gradients of logits at fork positions
 
         # Attachments buffer
         self.attachs = []  # List of sequences retained in the stack, including (attachments, length)
@@ -162,6 +176,13 @@ class DTAEngine:
 
         self.ret_logprobs = []
 
+        self._dta_log = getLogger("DTA")
+
+    def _dta_fail(self, message: str) -> NoReturn:
+        text = f"[DTA] {message}"
+        self._dta_log.error("%s", text)
+        raise RuntimeError(text)
+
     def get_forkpos(self, start: int, end: int) -> list[int]:
         """
         Yield fork positions within the interval [start, end).
@@ -189,9 +210,11 @@ class DTAEngine:
         """
 
         B = new_tokens.numel()
-        assert self.cur_len + B <= self.max_seq_len, (
-            f"Exceeds max_seq_len: cur_len={self.cur_len}, new_tokens={B}, max={self.max_seq_len}"
-        )
+        if self.cur_len + B > self.max_seq_len:
+            self._dta_fail(
+                "Exceeds max_seq_len: "
+                f"cur_len={self.cur_len}, new_tokens={B}, max={self.max_seq_len}"
+            )
         if B == 0:
             for attachment, length in attach_list:
                 seq_id = attachment["_sequence_batch_id"]
@@ -227,27 +250,14 @@ class DTAEngine:
         )
 
         # Compute logprobs and entropy for new tokens
-        logits = out.logits  # [1, B, vocab]
-        logprobs = gather_logprobs(
-            logits=logits,
-            labels=new_tokens[1:].unsqueeze(0),
-        )
+        logits = out.logits  # [1, B, vocab] or [1, B, 1]
 
         # -------------------------------------------------------------
-        # 3. Write tokens, computed logprobs, and KV cache into stack
+        # 3. Write tokens, computed logprobs/values, and KV cache into stack
         # -------------------------------------------------------------
 
         # Write tokens into stack
         self.tokens[start:end] = new_tokens
-
-        # Write logprobs into stack
-        self.logprobs[start : end - 1] = logprobs.squeeze(0)
-        # Fill the logprob of the first token using self.forkpos_logits[start]
-        if start > 0:
-            pre_logits = self.forkpos_logits[start - 1].float()
-            first_token = new_tokens[0].item()
-            pre_logprob = F.log_softmax(pre_logits, dim=-1)[first_token].item()
-            self.logprobs[start - 1] = pre_logprob
 
         # Write KV cache into stack
         new_cache = out.past_key_values
@@ -259,23 +269,53 @@ class DTAEngine:
                 :, :, start:end, :
             ]
 
-        # Write logits into stack (fork positions only)
-        forkpos_slice = self.get_forkpos(start, end)
-        for i in forkpos_slice:
-            self.forkpos_logits[i] = logits[0, i - start].detach().clone()
+        if self.is_critic:
+            values = logits.squeeze(0).squeeze(-1)
+            self.values[start:end] = values
 
-        # -------------------------------------------------------------
-        # 4. Store logprobs for sequences ending in attach_list
-        # -------------------------------------------------------------
-        for attachment, length in attach_list:
-            seq_id = attachment["_sequence_batch_id"]
-            if length == 0:
-                self.returns[seq_id] = torch.empty(
-                    0, device=self.device, dtype=torch.float32
-                )
-                continue
-            logprobs = self.logprobs[: length - 1]
-            self.returns[seq_id] = logprobs.clone()
+            # -------------------------------------------------------------
+            # 4. Store values for sequences ending in attach_list
+            # -------------------------------------------------------------
+            for attachment, length in attach_list:
+                seq_id = attachment["_sequence_batch_id"]
+                if length == 0:
+                    self.returns[seq_id] = torch.empty(
+                        0, device=self.device, dtype=torch.float32
+                    )
+                    continue
+                self.returns[seq_id] = self.values[:length].clone()
+        else:
+            logprobs = gather_logprobs(
+                logits=logits,
+                labels=new_tokens[1:].unsqueeze(0),
+            )
+
+            # Write logprobs into stack
+            self.logprobs[start : end - 1] = logprobs.squeeze(0)
+            # Fill the logprob of the first token using self.forkpos_logits[start]
+            if start > 0:
+                pre_logits = self.forkpos_logits[start - 1].float()
+                first_token = new_tokens[0].item()
+                pre_logprob = F.log_softmax(pre_logits, dim=-1)[first_token].item()
+                self.logprobs[start - 1] = pre_logprob
+
+            # Write logits into stack (fork positions only)
+            forkpos_slice = self.get_forkpos(start, end)
+            for i in forkpos_slice:
+                self.forkpos_logits[i] = logits[0, i - start].detach().clone()
+
+            # -------------------------------------------------------------
+            # 4. Store logprobs for sequences ending in attach_list
+            # -------------------------------------------------------------
+            for attachment, length in attach_list:
+                seq_id = attachment["_sequence_batch_id"]
+                if length == 0:
+                    self.returns[seq_id] = torch.empty(
+                        0, device=self.device, dtype=torch.float32
+                    )
+                    continue
+                logprobs = self.logprobs[: length - 1]
+                self.returns[seq_id] = logprobs.clone()
 
         self.cur_len += B
 
@@ -302,13 +342,7 @@ class DTAEngine:
         )
 
         # Compute logprobs & entropy for new tokens
-        logits = out.logits  # [1, B, vocab]
-        logprobs, entropy = gather_logprobs_entropy(
-            logits=logits,
-            labels=self.tokens[start + 1 : end].unsqueeze(0),
-        )
-        self.logprobs[start : end - 1] = logprobs.squeeze(0)
-        self.entropy[start:end] = entropy.squeeze(0)
+        logits = out.logits  # [1, B, vocab] or [1, B, 1]
 
         # Write new KV cache into stack
         new_cache = out.past_key_values
@@ -320,10 +354,21 @@ class DTAEngine:
                 :, :, start:end, :
             ]
 
-        # Write logits into stack (fork positions only)
-        forkpos_slice = self.get_forkpos(start, end)
-        for i in forkpos_slice:
-            self.forkpos_logits[i] = logits[0, i - start].detach().clone()
+        if self.is_critic:
+            values = logits.squeeze(0).squeeze(-1)
+            self.values[start:end] = values
+        else:
+            logprobs, entropy = gather_logprobs_entropy(
+                logits=logits,
+                labels=self.tokens[start + 1 : end].unsqueeze(0),
+            )
+            self.logprobs[start : end - 1] = logprobs.squeeze(0)
+            self.entropy[start:end] = entropy.squeeze(0)
+
+            # Write logits into stack (fork positions only)
+            forkpos_slice = self.get_forkpos(start, end)
+            for i in forkpos_slice:
+                self.forkpos_logits[i] = logits[0, i - start].detach().clone()
 
     @torch.no_grad()
     def push(
@@ -340,9 +385,11 @@ class DTAEngine:
         """
 
         B = new_tokens.numel()
-        assert self.cur_len + B <= self.max_seq_len, (
-            f"Exceeds max_seq_len: cur_len={self.cur_len}, new_tokens={B}, max={self.max_seq_len}"
-        )
+        if self.cur_len + B > self.max_seq_len:
+            self._dta_fail(
+                "Exceeds max_seq_len: "
+                f"cur_len={self.cur_len}, new_tokens={B}, max={self.max_seq_len}"
+            )
 
         start, end = self.cur_len, self.cur_len + B
 
@@ -358,7 +405,7 @@ class DTAEngine:
             self.build_cache(start, cache_len)
 
         # Update the previous token's logprob.
-        if start > 0:
+        if not self.is_critic and start > 0:
             pre_logits = self.forkpos_logits[start - 1].float()
             first_token = new_tokens[0].item()
             pre_logprob = F.log_softmax(pre_logits, dim=-1)[first_token].item()
@@ -380,9 +427,8 @@ class DTAEngine:
         Returns:
             The total loss computed over sequences ending within the popped segment.
         """
-        assert 0 <= start < self.cur_len, (
-            f"Invalid start={start}, cur_len={self.cur_len}"
-        )
+        if not (0 <= start < self.cur_len):
+            self._dta_fail(f"Invalid pop start: start={start}, cur_len={self.cur_len}")
 
         end = self.cur_len
         _ = end - start
@@ -420,21 +466,24 @@ class DTAEngine:
         block_cache = out.past_key_values
 
         # ---------------------------------------------------------------------------------
-        # 3. Compute suffix logprobs & entropy
+        # 3. Compute suffix logprobs & entropy or values
         # ---------------------------------------------------------------------------------
-        suf_logprobs, suf_entropy = gather_logprobs_entropy(
-            logits=logits, labels=tokens_to_pop[1:].unsqueeze(0)
-        )
-        suf_entropy = suf_entropy.squeeze(0)
-        suf_logprobs = suf_logprobs.squeeze(0)
-
-        # Compute logprob for connection to previous token if exists
-        if start > 0:
-            mid_logits = (
-                self.forkpos_logits[start - 1].float().detach().requires_grad_(True)
+        if self.is_critic:
+            suf_values = logits.squeeze(0).squeeze(-1)
+        else:
+            suf_logprobs, suf_entropy = gather_logprobs_entropy(
+                logits=logits, labels=tokens_to_pop[1:].unsqueeze(0)
             )
-            mid_label = self.tokens[start].item()
-            mid_logprob = F.log_softmax(mid_logits, dim=-1)[mid_label].unsqueeze(0)
+            suf_entropy = suf_entropy.squeeze(0)
+            suf_logprobs = suf_logprobs.squeeze(0)
+
+            # Compute logprob for connection to previous token if exists
+            if start > 0:
+                mid_logits = (
+                    self.forkpos_logits[start - 1].float().detach().requires_grad_(True)
+                )
+                mid_label = self.tokens[start].item()
+                mid_logprob = F.log_softmax(mid_logits, dim=-1)[mid_label].unsqueeze(0)
 
         # ---------------------------------------------------------------------------------
         # 4. Compute loss for sequences ending in this block
@@ -446,29 +495,45 @@ class DTAEngine:
         ]
 
         if attachs_in_block:
-            # Concatenate full logprobs and entropy, with requires_grad=True
-            if start > 0:
-                pre_entropy = self.entropy[:start].detach().requires_grad_(True)
-                entropys = torch.cat([pre_entropy, suf_entropy], dim=0)
-                if start > 1:
-                    pre_logprobs = (
-                        self.logprobs[: start - 1].detach().requires_grad_(True)
-                    )
-                    logprobs = torch.cat(
-                        [pre_logprobs, mid_logprob, suf_logprobs], dim=0
-                    )
+            if self.is_critic:
+                if start > 0:
+                    pre_values = self.values[:start].detach().requires_grad_(True)
+                    values = torch.cat([pre_values, suf_values], dim=0)
                 else:
-                    logprobs = torch.cat([mid_logprob, suf_logprobs], dim=0)
-            else:
-                entropys = suf_entropy
-                logprobs = suf_logprobs
+                    values = suf_values
 
-            # Compute loss
-            loss = 0.0
-            for attachment, length in attachs_in_block:
-                if length == 0:
-                    continue
-                loss += loss_fn(logprobs[: length - 1], entropys[:length], attachment)
+                # Compute loss
+                loss = 0.0
+                for attachment, length in attachs_in_block:
+                    if length == 0:
+                        continue
+                    loss += loss_fn(values[:length], attachment)
+            else:
+                # Concatenate full logprobs and entropy, with requires_grad=True
+                if start > 0:
+                    pre_entropy = self.entropy[:start].detach().requires_grad_(True)
+                    entropys = torch.cat([pre_entropy, suf_entropy], dim=0)
+                    if start > 1:
+                        pre_logprobs = (
+                            self.logprobs[: start - 1].detach().requires_grad_(True)
+                        )
+                        logprobs = torch.cat(
+                            [pre_logprobs, mid_logprob, suf_logprobs], dim=0
+                        )
+                    else:
+                        logprobs = torch.cat([mid_logprob, suf_logprobs], dim=0)
+                else:
+                    entropys = suf_entropy
+                    logprobs = suf_logprobs
+
+                # Compute loss
+                loss = 0.0
+                for attachment, length in attachs_in_block:
+                    if length == 0:
+                        continue
+                    loss += loss_fn(
+                        logprobs[: length - 1], entropys[:length], attachment
+                    )
 
         # ---------------------------------------------------------------------------------
         # 5. Backward with gradient injection from popped tokens
@@ -493,23 +558,27 @@ class DTAEngine:
                 ]
             )
 
-        # Logprobs & entropy gradients from popped tokens
-        roots.extend([suf_logprobs, suf_entropy])
-        grads.extend(
-            [self.grad_logprobs[start : end - 1], self.grad_entropy[start:end]]
-        )
-        if start > 0:
-            roots.append(mid_logprob)
-            grad_mid_logprob = self.grad_logprobs[start - 1].unsqueeze(0)
-            grads.append(grad_mid_logprob)
+        if self.is_critic:
+            roots.append(suf_values)
+            grads.append(self.grad_values[start:end])
+        else:
+            # Logprobs & entropy gradients from popped tokens
+            roots.extend([suf_logprobs, suf_entropy])
+            grads.extend(
+                [self.grad_logprobs[start : end - 1], self.grad_entropy[start:end]]
+            )
+            if start > 0:
+                roots.append(mid_logprob)
+                grad_mid_logprob = self.grad_logprobs[start - 1].unsqueeze(0)
+                grads.append(grad_mid_logprob)
 
-        # Fork position logits gradients
-        forkpos_slice = self.get_forkpos(start, end)
-        for i in forkpos_slice:
-            if self.grad_forkpos_logits[i] is not None:
-                fork_logits = logits[0, i - start]
-                roots.append(fork_logits)
-                grads.append(self.grad_forkpos_logits[i])
+            # Fork position logits gradients
+            forkpos_slice = self.get_forkpos(start, end)
+            for i in forkpos_slice:
+                if self.grad_forkpos_logits[i] is not None:
+                    fork_logits = logits[0, i - start]
+                    roots.append(fork_logits)
+                    grads.append(self.grad_forkpos_logits[i])
 
         # roots: loss, (KV, logprobs, entropy, forkpos logits) in tokens_to_pop
         torch.autograd.backward(roots, grads)
@@ -526,18 +595,22 @@ class DTAEngine:
                 self.grad_kv[1][layer_idx][:, :, :start, :] += v.grad
 
         if start > 0:
-            # gradients to forkpos logits
-            if mid_logits.grad is not None:
-                if self.grad_forkpos_logits[start - 1] is None:
-                    self.grad_forkpos_logits[start - 1] = mid_logits.grad.clone()
-                else:
-                    self.grad_forkpos_logits[start - 1] += mid_logits.grad
-            if attachs_in_block:
-                # gradients to prefix logprobs & entropy
-                if pre_entropy.grad is not None:
-                    self.grad_entropy[:start] += pre_entropy.grad
-                if start > 1 and pre_logprobs.grad is not None:
-                    self.grad_logprobs[: start - 1] += pre_logprobs.grad
+            if self.is_critic:
+                if attachs_in_block and pre_values.grad is not None:
+                    self.grad_values[:start] += pre_values.grad
+            else:
+                # gradients to forkpos logits
+                if mid_logits.grad is not None:
+                    if self.grad_forkpos_logits[start - 1] is None:
+                        self.grad_forkpos_logits[start - 1] = mid_logits.grad.clone()
+                    else:
+                        self.grad_forkpos_logits[start - 1] += mid_logits.grad
+                if attachs_in_block:
+                    # gradients to prefix logprobs & entropy
+                    if pre_entropy.grad is not None:
+                        self.grad_entropy[:start] += pre_entropy.grad
+                    if start > 1 and pre_logprobs.grad is not None:
+                        self.grad_logprobs[: start - 1] += pre_logprobs.grad
 
         # ---------------------------------------------------------------------------------
         # 7. Cleanup: truncate and clear buffers
@@ -551,13 +624,16 @@ class DTAEngine:
             self.grad_kv[0][layer_idx][:, :, start:end, :].zero_()
             self.grad_kv[1][layer_idx][:, :, start:end, :].zero_()
 
-        self.grad_logprobs[0 if start == 0 else start - 1 : end - 1].zero_()
-        self.grad_entropy[start:end].zero_()
+        if self.is_critic:
+            self.grad_values[start:end].zero_()
+        else:
+            self.grad_logprobs[0 if start == 0 else start - 1 : end - 1].zero_()
+            self.grad_entropy[start:end].zero_()
 
-        forkpos_slice = self.get_forkpos(start, end)
-        for i in forkpos_slice:
-            self.forkpos_logits[i] = None
-            self.grad_forkpos_logits[i] = None
+            forkpos_slice = self.get_forkpos(start, end)
+            for i in forkpos_slice:
+                self.forkpos_logits[i] = None
+                self.grad_forkpos_logits[i] = None
 
         self.cur_len = start
 
@@ -612,7 +688,8 @@ class DTAEngine:
             token_trie.lcp_lens,
         )
 
-        self.forkpos_list = _get_forkpos(None, lcp_lens, None)
+        if not self.is_critic:
+            self.forkpos_list = _get_forkpos(None, lcp_lens, None)
 
         for i in range(len(inputs)):
             input_ids = inputs[i].to(self.device)
@@ -629,7 +706,8 @@ class DTAEngine:
             self.push_forward_only(new_tokens, attach_list)
 
         self.cur_len = 0
-        self.forkpos_logits = [None] * self.max_seq_len  # Clear forkpos_logits
+        if not self.is_critic:
+            self.forkpos_logits = [None] * self.max_seq_len  # Clear forkpos_logits
 
         return self.returns
 
@@ -666,7 +744,8 @@ class DTAEngine:
 
         # Precompute fork positions and block boundaries
         lens = [ids.size(0) for ids in inputs]
-        self.forkpos_list = _get_forkpos(lens, lcp_lens, block_size)
+        if not self.is_critic:
+            self.forkpos_list = _get_forkpos(lens, lcp_lens, block_size)
 
         # Process each sequence
         for i in range(len(inputs)):

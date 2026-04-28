@@ -413,6 +413,46 @@ def split_and_unpad_tensor(
     return result
 
 
+def unpack_groups_to_sequences(
+    item_list: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Flatten grouped trajectories into fully independent sequence-level dicts.
+
+    For example, if an item in item_list has shape [8, seq_len, ...] for 8 samples
+    (group_size=8), it will be split into 8 separate dictionaries, each with
+    shape [1, seq_len, ...]. This is required for algorithms like DTA that operate
+    on individual sequences rather than groups.
+
+    Args:
+        item_list: List of trajectory dictionaries.
+
+    Returns:
+        A new list where every dictionary represents a single sequence.
+    """
+    flat_item_list = []
+    for item in item_list:
+        attn_mask = item.get("attention_mask")
+        if (
+            attn_mask is not None
+            and isinstance(attn_mask, torch.Tensor)
+            and attn_mask.ndim >= 2
+        ):
+            n_seqs = attn_mask.shape[0]
+            if n_seqs > 1:
+                splits = split_and_unpad_tensor(
+                    item, n_trajs=n_seqs, traj_group_sizes=1
+                )
+                if isinstance(splits, list):
+                    flat_item_list.extend(splits)
+                else:
+                    flat_item_list.append(splits)
+            else:
+                flat_item_list.append(item)
+        else:
+            flat_item_list.append(item)
+    return flat_item_list
+
+
 @dataclass
 class TrajBatchMeta:
     """Metadata for reversing concat_batch: traj counts, group sizes, seqlens."""
@@ -763,6 +803,8 @@ def split_padded_tensor_dict_into_mb_list(
         group (Optional[dist.ProcessGroup]): Process group for distributed synchronization.
         one_seq_per_mb (bool): If True, each micro-batch contains exactly one sequence
             and skips cross-rank synchronized micro-batch count alignment.
+            Requires every row's valid token count ``<= mb_spec.max_tokens_per_mb``
+            and ``granularity=1`` (errors in this path mention ``one_seq_per_mb``).
 
     Returns:
         MicroBatchList: A structure containing the split micro-batches and metadata.
@@ -780,6 +822,20 @@ def split_padded_tensor_dict_into_mb_list(
         raise RuntimeError(f"Batch size {bs} cannot divide granularity {granularity}.")
     max_seqlen = data["attention_mask"].shape[1]
     seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
+    if one_seq_per_mb:
+        if granularity != 1:
+            raise RuntimeError(
+                f"split_padded_tensor_dict_into_mb_list: one_seq_per_mb=True requires "
+                f"granularity=1, but got granularity={granularity}."
+            )
+        cap = mb_spec.max_tokens_per_mb
+        for i, L in enumerate(seq_lens):
+            if L > cap:
+                raise RuntimeError(
+                    f"split_padded_tensor_dict_into_mb_list: one_seq_per_mb=True, "
+                    f"but sequence at index {i} has {L} valid tokens, which exceeds "
+                    f"max_tokens_per_mb={cap}."
+                )
     input_lens = (
         data["attention_mask"]
         .view(bs // granularity, granularity, -1)
@@ -808,11 +864,6 @@ def split_padded_tensor_dict_into_mb_list(
 
     # split
     if one_seq_per_mb:
-        if granularity != 1:
-            raise RuntimeError(
-                "one_seq_per_mb=True requires granularity=1, "
-                f"but got granularity={granularity}."
-            )
         group_indices = [[i] for i in range(bs)]
     else:
         group_indices = allocate_balanced_mbs_synced(mb_spec, input_lens, group=group)

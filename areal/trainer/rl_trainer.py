@@ -45,8 +45,10 @@ from areal.infra import (
 from areal.infra.data_service import DataController
 from areal.infra.data_service.controller.config import DataServiceConfig
 from areal.infra.data_service.rdataset import RDataset
+from areal.infra.rpc.rtensor import RTensor
 from areal.infra.utils.concurrent import call_maybe_async
 from areal.utils import logging, perf_tracer, seeding, stats_tracker
+from areal.utils.data import unpack_groups_to_sequences
 from areal.utils.dataloader import create_dataloader
 from areal.utils.environ import is_single_controller
 from areal.utils.evaluator import Evaluator
@@ -567,6 +569,9 @@ class PPOTrainer:
                     group_size=config.gconfig.n_samples,
                     dynamic_bs=self.config.dynamic_bs,
                 )
+                if config.actor.packing_algorithm == "dta":
+                    rollout_batch = RTensor.localize(rollout_batch)
+                    rollout_batch = unpack_groups_to_sequences(rollout_batch)
             if self._should_offload_rollout:
                 self._offload_rollout()
 
@@ -582,6 +587,15 @@ class PPOTrainer:
                     ),
                 ):
                     values = self.critic.compute_values(rollout_batch)
+                    if config.actor.packing_algorithm == "dta":
+                        assert isinstance(values, list), (
+                            f"values must return list under DTA, got {type(values)}"
+                        )
+                        assert len(values) == len(rollout_batch), (
+                            "values length mismatch under DTA: "
+                            f"len(rollout_batch)={len(rollout_batch)}, "
+                            f"len(values)={len(values)}"
+                        )
                     for traj, v in zip(rollout_batch, values):
                         traj["values"] = v
                     self.critic.get_device_stats().log("critic values")
@@ -599,6 +613,16 @@ class PPOTrainer:
                     ),
                 ):
                     ref_logps = self.ref.compute_logp(rollout_batch)
+                    if config.actor.packing_algorithm == "dta":
+                        assert isinstance(ref_logps, list), (
+                            "ref_logps must return list under DTA, "
+                            f"got {type(ref_logps)}"
+                        )
+                        assert len(ref_logps) == len(rollout_batch), (
+                            "ref_logps length mismatch under DTA: "
+                            f"len(rollout_batch)={len(rollout_batch)}, "
+                            f"len(ref_logps)={len(ref_logps)}"
+                        )
                     for traj, logp in zip(rollout_batch, ref_logps):
                         traj["ref_logp"] = logp
                     self.ref.get_device_stats().log("ref logp")
@@ -617,6 +641,16 @@ class PPOTrainer:
                     ),
                 ):
                     teacher_logps = self.teacher.compute_logp(rollout_batch)
+                    if config.actor.packing_algorithm == "dta":
+                        assert isinstance(teacher_logps, list), (
+                            "teacher_logps must return list under DTA, "
+                            f"got {type(teacher_logps)}"
+                        )
+                        assert len(teacher_logps) == len(rollout_batch), (
+                            "teacher_logps length mismatch under DTA: "
+                            f"len(rollout_batch)={len(rollout_batch)}, "
+                            f"len(teacher_logps)={len(teacher_logps)}"
+                        )
                     for traj, logp in zip(rollout_batch, teacher_logps):
                         traj["teacher_logp"] = logp
                         traj["rl_loss_weight"] = self.config.teacher.rl_loss_weight
@@ -639,6 +673,16 @@ class PPOTrainer:
                     ),
                 ):
                     prox_logps = self.actor.compute_logp(rollout_batch)
+                    if config.actor.packing_algorithm == "dta":
+                        assert isinstance(prox_logps, list), (
+                            "prox_logps must return list under DTA, "
+                            f"got {type(prox_logps)}"
+                        )
+                        assert len(prox_logps) == len(rollout_batch), (
+                            "prox_logps length mismatch under DTA: "
+                            f"len(rollout_batch)={len(rollout_batch)}, "
+                            f"len(prox_logps)={len(prox_logps)}"
+                        )
                     for traj, logp in zip(rollout_batch, prox_logps):
                         traj["prox_logp"] = logp
                     self.actor.get_device_stats().log("recompute logp")
@@ -1166,6 +1210,8 @@ class PPOTrainer:
         current_platform.synchronize()
 
     def _add_throughput_metrics(self, stats: dict[str, float]) -> None:
+        # TODO(agent): Not enabled yet, will be implemented in the future.
+        return
         if "ppo_actor/update/n_tokens" not in stats:
             raise ValueError(
                 "Missing required metric `ppo_actor/update/n_tokens` for throughput computation."
