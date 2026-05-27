@@ -104,7 +104,11 @@ def _compute_mb_tree_stats(
     attn_mask = input_data["attention_mask"]
     total_original = int(attn_mask.sum().item())
     if total_original == 0:
-        return {"mb_tree_tokens": 0, "mb_n_trees": 0, "mb_compressed_ratio": float("inf")}
+        return {
+            "mb_tree_tokens": 0,
+            "mb_n_trees": 0,
+            "mb_compressed_ratio": float("inf"),
+        }
 
     if use_trie_partition:
         tries, n_tokens = _build_tries_from_trie_partition(
@@ -127,6 +131,8 @@ def _compute_mb_tree_stats(
 def _load_tree_data(
     data_path: str,
     prefix_len: int = -1,
+    truncate_seqs_to_max_tokens_per_mb: bool = False,
+    max_tokens_per_mb: int | None = None,
 ) -> tuple[dict, int, int]:
     """Load a .pt file and prepare input data for benchmarking.
 
@@ -137,15 +143,30 @@ def _load_tree_data(
     device = current_platform.device_type
     device_obj = device if isinstance(device, torch.device) else torch.device(device)
 
+    def _maybe_truncate_seq(tensor: torch.Tensor) -> torch.Tensor:
+        if not truncate_seqs_to_max_tokens_per_mb:
+            return tensor
+        if max_tokens_per_mb is None or max_tokens_per_mb <= 0:
+            return tensor
+        return tensor[:max_tokens_per_mb]
+
     if isinstance(raw, dict) and "input_data" in raw:
         input_data = raw["input_data"]
         result = {}
+        original_input_ids = input_data.get("input_ids")
         for field_name, value in input_data.items():
             if isinstance(value, torch.Tensor):
                 if prefix_len != -1 and value.size(0) >= prefix_len:
-                    result[field_name] = value[:prefix_len].to(device_obj)
-                else:
-                    result[field_name] = value.to(device_obj)
+                    value = value[:prefix_len]
+                if (
+                    truncate_seqs_to_max_tokens_per_mb
+                    and max_tokens_per_mb is not None
+                    and max_tokens_per_mb > 0
+                    and isinstance(original_input_ids, torch.Tensor)
+                    and value.shape == original_input_ids.shape
+                ):
+                    value = value[:, :max_tokens_per_mb]
+                result[field_name] = value.to(device_obj)
             else:
                 result[field_name] = value
         attn_mask = result.get("attention_mask")
@@ -157,6 +178,7 @@ def _load_tree_data(
         seqs = list(raw)
         if prefix_len != -1 and len(seqs) > prefix_len:
             seqs = seqs[:prefix_len]
+        seqs = [_maybe_truncate_seq(seq) for seq in seqs]
         total_tokens = sum(t.numel() for t in seqs)
         n_seqs = len(seqs)
         input_data, _ = _build_input_from_token_lists(seqs, device_obj)
@@ -178,11 +200,17 @@ def run_single_benchmark(
     use_dfn_mask: bool,
     use_trie_partition: bool,
     cut_f1_tail: bool,
+    truncate_seqs_to_max_tokens_per_mb: bool,
     master_port: str,
     gpu_id: int = 0,
 ) -> dict:
     """Run benchmark for a single .pt file. Returns a result dict."""
-    input_data, total_tokens, n_seqs = _load_tree_data(data_path, prefix_len)
+    input_data, total_tokens, n_seqs = _load_tree_data(
+        data_path,
+        prefix_len,
+        truncate_seqs_to_max_tokens_per_mb=truncate_seqs_to_max_tokens_per_mb,
+        max_tokens_per_mb=max_tokens_per_mb,
+    )
     compression_ratio = _compute_compression_ratio(input_data)
 
     enable_tree = method == "flex"
@@ -229,6 +257,7 @@ def run_single_benchmark(
         "elapsed_s": round(elapsed, 4),
         "n_seqs": n_seqs,
         "total_tokens": total_tokens,
+        "truncated_to_max_tokens_per_mb": truncate_seqs_to_max_tokens_per_mb,
     }
     result.update(mb_stats)
     return result
@@ -254,7 +283,9 @@ def _worker(gpu_id: int, pt_files: list[str], args, result_queue):
     # --- Warmup for flex (triggers torch.compile / flex_attention compilation) ---
     if args.method == "flex" and pt_files:
         warmup_file = pt_files[0]
-        print(f"[GPU {gpu_id}] Warmup: {Path(warmup_file).name} (compiling flex kernels)...")
+        print(
+            f"[GPU {gpu_id}] Warmup: {Path(warmup_file).name} (compiling flex kernels)..."
+        )
         t_warm = time.time()
         try:
             run_single_benchmark(
@@ -267,6 +298,9 @@ def _worker(gpu_id: int, pt_files: list[str], args, result_queue):
                 use_dfn_mask=not args.disable_dfn_mask,
                 use_trie_partition=args.use_trie_partition,
                 cut_f1_tail=not args.no_cut_f1_tail,
+                truncate_seqs_to_max_tokens_per_mb=(
+                    args.truncate_seqs_to_max_tokens_per_mb
+                ),
                 master_port=str(base_port + 99),
                 gpu_id=gpu_id,
             )
@@ -291,6 +325,9 @@ def _worker(gpu_id: int, pt_files: list[str], args, result_queue):
                 use_dfn_mask=not args.disable_dfn_mask,
                 use_trie_partition=args.use_trie_partition,
                 cut_f1_tail=not args.no_cut_f1_tail,
+                truncate_seqs_to_max_tokens_per_mb=(
+                    args.truncate_seqs_to_max_tokens_per_mb
+                ),
                 master_port=port,
                 gpu_id=gpu_id,
             )
@@ -345,7 +382,9 @@ def main():
     )
     parser.add_argument("--output", required=True, help="Output JSONL file path")
     parser.add_argument(
-        "--model-path", default=None, help="Model cgheckpoint path (default: Qwen2.5-0.5B)"
+        "--model-path",
+        default=None,
+        help="Model cgheckpoint path (default: Qwen2.5-0.5B)",
     )
     parser.add_argument("--max-tokens-per-mb", type=int, default=24576)
     parser.add_argument(
@@ -369,6 +408,13 @@ def main():
         "the prefix needed for the next pop (useful for ablation)",
     )
     parser.add_argument(
+        "--truncate-seqs-to-max-tokens-per-mb",
+        action="store_true",
+        default=False,
+        help="Truncate each sequence to max_tokens_per_mb before packing. "
+        "This matches DynamicTreeAttn benchmark preprocessing for long samples.",
+    )
+    parser.add_argument(
         "--num-gpus",
         type=int,
         default=None,
@@ -390,12 +436,15 @@ def main():
 
     print(f"Found {len(pt_files)} .pt files in {data_dir}")
     print(f"Method: {args.method}, GPUs: {num_gpus}")
-    print(f"max_tokens_per_mb={args.max_tokens_per_mb}, "
-          f"dfn_mask={'OFF' if args.disable_dfn_mask else 'ON'}, "
-          f"trie_partition={'ON' if args.use_trie_partition else 'OFF'}, "
-          f"gradient_ckpt={'OFF' if args.disable_gradient_checkpointing else 'ON'}, "
-          f"cut_f1_tail={'OFF' if args.no_cut_f1_tail else 'ON'}, "
-          f"prefix_len={args.prefix_len}")
+    print(
+        f"max_tokens_per_mb={args.max_tokens_per_mb}, "
+        f"dfn_mask={'OFF' if args.disable_dfn_mask else 'ON'}, "
+        f"trie_partition={'ON' if args.use_trie_partition else 'OFF'}, "
+        f"gradient_ckpt={'OFF' if args.disable_gradient_checkpointing else 'ON'}, "
+        f"cut_f1_tail={'OFF' if args.no_cut_f1_tail else 'ON'}, "
+        f"truncate_seqs={'ON' if args.truncate_seqs_to_max_tokens_per_mb else 'OFF'}, "
+        f"prefix_len={args.prefix_len}"
+    )
 
     chunks: list[list[str]] = [[] for _ in range(num_gpus)]
     for i, f in enumerate(pt_files):
@@ -438,11 +487,13 @@ def main():
     successful = [r for r in all_results if "error" not in r]
     failed = [r for r in all_results if "error" in r]
     if successful:
-        avg_tp = sum(r["throughput"] for r in successful) / len(successful)
+        total_tokens = sum(r["total_tokens"] for r in successful)
+        total_elapsed = sum(r["elapsed_s"] for r in successful)
+        throughput = total_tokens / total_elapsed if total_elapsed > 0 else 0.0
         avg_mem = sum(r["peak_memory_gb"] for r in successful) / len(successful)
         avg_cr = sum(r["compressed_ratio"] for r in successful) / len(successful)
         print(f"\nSummary ({len(successful)} succeeded, {len(failed)} failed):")
-        print(f"  Avg throughput:     {avg_tp:,.0f} tok/s")
+        print(f"  Throughput:         {throughput:,.0f} tok/s")
         print(f"  Avg peak memory:    {avg_mem:.2f} GB")
         print(f"  Avg compression:    {avg_cr:.3f}x")
         with_mb = [r for r in successful if "mb_compressed_ratio" in r]
@@ -450,8 +501,10 @@ def main():
             avg_mb_cr = sum(r["mb_compressed_ratio"] for r in with_mb) / len(with_mb)
             avg_mb_trees = sum(r["mb_n_trees"] for r in with_mb) / len(with_mb)
             avg_mb_tok = sum(r["mb_tree_tokens"] for r in with_mb) / len(with_mb)
-            print(f"  Avg mb compression: {avg_mb_cr:.3f}x "
-                  f"(avg {avg_mb_trees:.1f} trees, {avg_mb_tok:,.0f} tree tok)")
+            print(
+                f"  Avg mb compression: {avg_mb_cr:.3f}x "
+                f"(avg {avg_mb_trees:.1f} trees, {avg_mb_tok:,.0f} tree tok)"
+            )
     if failed:
         print(f"\nFailed files ({len(failed)}):")
         for r in failed:
